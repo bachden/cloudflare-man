@@ -7,6 +7,13 @@ export type User = {
 export type AppSettings = {
   publicBaseUrl: string;
   configured: boolean;
+  mcp: {
+    enabled: boolean;
+    endpoint: string;
+    tokenHint: string | null;
+    rotatedAt: string | null;
+    lastUsedAt: string | null;
+  };
 };
 
 export type Zone = {

@@ -4,7 +4,7 @@ export type AuthUser = {
   id: string;
   username: string;
   mustChangePassword: boolean;
-  sessionId: string;
+  sessionId: string | null;
 };
 
 export type DatabaseClient = PoolClient;
@@ -14,4 +14,3 @@ declare module "fastify" {
     authUser?: AuthUser;
   }
 }
-

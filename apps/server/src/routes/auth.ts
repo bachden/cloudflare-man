@@ -2,7 +2,7 @@ import bcrypt from "bcryptjs";
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
 import { writeAudit } from "../lib/audit.js";
-import { createSession, requireAuth, SESSION_COOKIE, sessionCookieOptions } from "../lib/auth.js";
+import { createSession, requireAuth, requireSessionAuth, SESSION_COOKIE, sessionCookieOptions } from "../lib/auth.js";
 import { pool, withTransaction } from "../lib/database.js";
 import { hashToken } from "../lib/security.js";
 
@@ -41,14 +41,14 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
     }
   }));
 
-  app.post("/api/auth/logout", { preHandler: requireAuth }, async (request, reply) => {
+  app.post("/api/auth/logout", { preHandler: requireSessionAuth }, async (request, reply) => {
     const token = request.cookies[SESSION_COOKIE];
     if (token) await pool.query("DELETE FROM sessions WHERE token_hash = $1", [hashToken(token)]);
     reply.clearCookie(SESSION_COOKIE, sessionCookieOptions());
     return reply.code(204).send();
   });
 
-  app.post("/api/auth/change-password", { preHandler: requireAuth }, async (request, reply) => {
+  app.post("/api/auth/change-password", { preHandler: requireSessionAuth }, async (request, reply) => {
     const body = changePasswordSchema.parse(request.body);
     const result = await pool.query("SELECT password_hash FROM users WHERE id = $1", [request.authUser!.id]);
     if (!(await bcrypt.compare(body.currentPassword, result.rows[0].password_hash))) {
@@ -75,4 +75,3 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
     return { success: true };
   });
 }
-

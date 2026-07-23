@@ -32,6 +32,7 @@ The onboarding flow is:
 - Browser-based RDP through Cloudflare Access, including private network routes and infrastructure targets.
 - RDP gateway readiness checks with retries for Cloudflare propagation delays.
 - Paginated store inventory and bulk refresh for the visible page.
+- Streamable HTTP MCP server with full control-plane read and write tools for AI agents.
 - Local administrator authentication with forced default-password change.
 
 ## Architecture
@@ -186,7 +187,7 @@ Set a route type to **Command agent** to expose the enrollment-installed script 
 
 After the store is created:
 
-1. Open the store details and select **Issue install URL**.
+1. Open the store details and select **New enrollment**.
 2. Copy the PowerShell URL for Windows or the shell URL for Unix-like systems.
 3. Run PowerShell as Administrator, or run the shell command as root.
 4. If a previous enrollment is detected, confirm cleanup and override only when the existing tunnel should be replaced.
@@ -238,6 +239,38 @@ https://rdp.example.com/rdp/<virtual-network-id>/<target-ip>/<port>
 The Windows host must permit TLS in its RDP security layer. The installer configures the standard Windows RDP service and firewall rule; the Windows user's credentials are still required inside the browser session.
 
 If Cloudflare is still propagating a newly-created RDP hostname, the UI keeps retrying the gateway check. A later **Refresh** or **Retry RDP** action is safe because provisioning is idempotent.
+
+## MCP server
+
+Cloudflare Man can expose its control-plane capabilities to AI agents over the MCP Streamable HTTP transport. Open **Settings**, enable **MCP server**, and save the generated token immediately. The full token is shown only when it is first issued or rotated; PostgreSQL stores only its SHA-256 hash.
+
+The endpoint follows the configured public base URL:
+
+```text
+https://cloudflare-man.example.com/mcp
+```
+
+Configure an MCP client with the endpoint and bearer token. Client configuration formats vary, but a common HTTP configuration is:
+
+```json
+{
+  "mcpServers": {
+    "cloudflare-man": {
+      "type": "http",
+      "url": "https://cloudflare-man.example.com/mcp",
+      "headers": {
+        "Authorization": "Bearer ${CLOUDFLARE_MAN_MCP_TOKEN}"
+      }
+    }
+  }
+}
+```
+
+The server exposes read and write tools for dashboard data, account pools, zones, stores, connectivity, route WAF policies, enrollments, logs, endpoint verification, RDP retries, the script library, command execution, audit history, and public URL settings. These tools call the same internal API handlers as the web UI, so validation, Cloudflare side effects, deletion preflight checks, and audit logging remain consistent.
+
+Every tool result contains both human-readable JSON and `structuredContent`. The structured payload includes the original response under `data` and a `references` array containing every `id` and `*Id` found in the tool input or response. Agents can therefore carry exact account, zone, store, tunnel, publication, route, enrollment, script, version, and execution identifiers into subsequent calls without matching display names.
+
+MCP bearer tokens have full administrator access. Rotating a token immediately invalidates the old value, and disabling the MCP server rejects all MCP requests. Keep the token in a secret store or environment variable, never in source control or agent prompts that may be retained externally.
 
 ## Local control-plane tunnel
 

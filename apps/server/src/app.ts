@@ -12,6 +12,7 @@ import { accountRoutes } from "./routes/accounts.js";
 import { authRoutes } from "./routes/auth.js";
 import { dashboardRoutes } from "./routes/dashboard.js";
 import { enrollmentRoutes } from "./routes/enrollment.js";
+import { mcpRoutes } from "./routes/mcp.js";
 import { settingsRoutes } from "./routes/settings.js";
 import { scriptRoutes } from "./routes/scripts.js";
 import { storeRoutes } from "./routes/stores.js";
@@ -30,7 +31,7 @@ export async function buildApp() {
     const hostname = request.hostname.toLowerCase();
     if (["localhost", "127.0.0.1", "::1"].includes(hostname)) return;
     if (request.url === "/health" || request.url.startsWith("/api/auth/") || request.url.startsWith("/api/settings")) return;
-    if (!request.url.startsWith("/api/") && !request.url.startsWith("/e/")) return;
+    if (!request.url.startsWith("/api/") && !request.url.startsWith("/e/") && !request.url.startsWith("/mcp")) return;
     const publicHostname = new URL(await getPublicBaseUrl()).hostname.toLowerCase();
     if (hostname !== publicHostname) {
       return reply.code(421).send({ error: "Host is not allowed" });
@@ -51,6 +52,7 @@ export async function buildApp() {
   await enrollmentRoutes(app);
   await dashboardRoutes(app);
   await settingsRoutes(app);
+  await mcpRoutes(app);
 
   const webRoot = join(dirname(fileURLToPath(import.meta.url)), "../../web/dist");
   if (config.NODE_ENV === "production") {
@@ -58,7 +60,7 @@ export async function buildApp() {
       await access(join(webRoot, "index.html"));
       await app.register(fastifyStatic, { root: webRoot, prefix: "/" });
       app.setNotFoundHandler(async (request, reply) => {
-        if (request.url.startsWith("/api/") || request.url.startsWith("/e/")) {
+        if (request.url.startsWith("/api/") || request.url.startsWith("/e/") || request.url.startsWith("/mcp")) {
           return reply.code(404).send({ error: "Not found" });
         }
         return reply.type("text/html").sendFile("index.html");

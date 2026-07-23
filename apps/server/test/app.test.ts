@@ -10,6 +10,7 @@ let storeId = "";
 let enrollmentToken = "";
 let enrollmentId = "";
 let scriptVersionId = "";
+let mcpToken = "";
 
 before(async () => {
   const database = await import("../src/lib/database.js");
@@ -17,7 +18,7 @@ before(async () => {
   await database.runMigrations();
   await database.seedRootUser();
   await pool.query(`
-    TRUNCATE audit_logs, store_command_executions, managed_script_versions, managed_scripts, app_settings, enrollments, stores, zones, cloudflare_accounts, sessions RESTART IDENTITY CASCADE
+    TRUNCATE audit_logs, store_command_executions, managed_script_versions, managed_scripts, mcp_access, app_settings, enrollments, stores, zones, cloudflare_accounts, sessions RESTART IDENTITY CASCADE
   `);
   const { buildApp } = await import("../src/app.js");
   app = await buildApp();
@@ -54,6 +55,108 @@ test("updates the public base URL used by enrollment URLs", async () => {
   assert.equal(allowedHost.statusCode, 200, allowedHost.body);
   const blockedHost = await app.inject({ method: "GET", url: "/api/accounts", headers: { host: "unexpected.example.test", cookie: sessionCookie } });
   assert.equal(blockedHost.statusCode, 421, blockedHost.body);
+});
+
+test("enables MCP and exposes structured tools with reusable identifiers", async () => {
+  const initial = await app.inject({ method: "GET", url: "/api/settings", headers: { cookie: sessionCookie } });
+  assert.equal(initial.statusCode, 200, initial.body);
+  assert.equal(initial.json().settings.mcp.enabled, false);
+  assert.equal(initial.json().settings.mcp.endpoint, "https://cfman.example.test/mcp");
+
+  const enabled = await app.inject({
+    method: "PATCH",
+    url: "/api/settings/mcp",
+    headers: { cookie: sessionCookie },
+    payload: { enabled: true }
+  });
+  assert.equal(enabled.statusCode, 200, enabled.body);
+  assert.equal(enabled.json().settings.enabled, true);
+  mcpToken = enabled.json().token;
+  assert.match(mcpToken, /^cfman_mcp_/);
+
+  const unauthorized = await app.inject({
+    method: "POST",
+    url: "/mcp",
+    headers: { authorization: "Bearer invalid", accept: "application/json, text/event-stream" },
+    payload: { jsonrpc: "2.0", id: 1, method: "tools/list", params: {} }
+  });
+  assert.equal(unauthorized.statusCode, 401, unauthorized.body);
+
+  const mcpRequest = (payload: unknown) => app.inject({
+    method: "POST",
+    url: "/mcp",
+    headers: {
+      authorization: `Bearer ${mcpToken}`,
+      accept: "application/json, text/event-stream",
+      "mcp-protocol-version": "2025-11-25"
+    },
+    payload
+  });
+  const initialized = await mcpRequest({
+    jsonrpc: "2.0",
+    id: 2,
+    method: "initialize",
+    params: { protocolVersion: "2025-11-25", capabilities: {}, clientInfo: { name: "cloudflare-man-test", version: "1.0.0" } }
+  });
+  assert.equal(initialized.statusCode, 200, initialized.body);
+  assert.equal(initialized.json().result.serverInfo.name, "cloudflare-man");
+
+  const listed = await mcpRequest({ jsonrpc: "2.0", id: 3, method: "tools/list", params: {} });
+  assert.equal(listed.statusCode, 200, listed.body);
+  assert.ok(listed.json().result.tools.some((tool: { name: string }) => tool.name === "cfman_list_accounts"));
+
+  const created = await mcpRequest({
+    jsonrpc: "2.0",
+    id: 4,
+    method: "tools/call",
+    params: {
+      name: "cfman_create_account",
+      arguments: { name: "MCP Follow-up Account", providerMode: "mock", initialZoneName: "mcp-follow-up.example" }
+    }
+  });
+  assert.equal(created.statusCode, 200, created.body);
+  const createdResult = created.json().result;
+  assert.equal(createdResult.isError, undefined);
+  const createdAccountId = createdResult.structuredContent.data.id as string;
+  assert.deepEqual(createdResult.structuredContent.references, [{ path: "response.id", value: createdAccountId }]);
+
+  const deleted = await mcpRequest({ jsonrpc: "2.0", id: 5, method: "tools/call", params: { name: "cfman_delete_account", arguments: { accountId: createdAccountId } } });
+  assert.equal(deleted.statusCode, 200, deleted.body);
+  assert.equal(deleted.json().result.structuredContent.data.success, true, JSON.stringify(deleted.json()));
+  assert.deepEqual(deleted.json().result.structuredContent.references, [{ path: "input.accountId", value: createdAccountId }]);
+
+  const called = await mcpRequest({ jsonrpc: "2.0", id: 6, method: "tools/call", params: { name: "cfman_get_store", arguments: { storeId: "00000000-0000-4000-8000-000000000001" } } });
+  assert.equal(called.statusCode, 200, called.body);
+  const toolResult = called.json().result;
+  assert.equal(toolResult.isError, true);
+  assert.deepEqual(toolResult.structuredContent.references, [
+    { path: "input.storeId", value: "00000000-0000-4000-8000-000000000001" }
+  ]);
+});
+
+test("rotating or disabling MCP immediately invalidates its bearer token", async () => {
+  const rotated = await app.inject({ method: "POST", url: "/api/settings/mcp/rotate", headers: { cookie: sessionCookie } });
+  assert.equal(rotated.statusCode, 200, rotated.body);
+  const rotatedToken = rotated.json().token as string;
+  assert.notEqual(rotatedToken, mcpToken);
+
+  const oldToken = await app.inject({
+    method: "POST",
+    url: "/mcp",
+    headers: { authorization: `Bearer ${mcpToken}`, accept: "application/json, text/event-stream" },
+    payload: { jsonrpc: "2.0", id: 7, method: "tools/list", params: {} }
+  });
+  assert.equal(oldToken.statusCode, 401, oldToken.body);
+
+  const disabled = await app.inject({ method: "PATCH", url: "/api/settings/mcp", headers: { cookie: sessionCookie }, payload: { enabled: false } });
+  assert.equal(disabled.statusCode, 200, disabled.body);
+  const disabledToken = await app.inject({
+    method: "POST",
+    url: "/mcp",
+    headers: { authorization: `Bearer ${rotatedToken}`, accept: "application/json, text/event-stream" },
+    payload: { jsonrpc: "2.0", id: 8, method: "tools/list", params: {} }
+  });
+  assert.equal(disabledToken.statusCode, 401, disabledToken.body);
 });
 
 test("creates a mock account with its first zone", async () => {
