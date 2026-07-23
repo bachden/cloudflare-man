@@ -9,7 +9,7 @@ import { CopyButton } from "../components/CopyButton";
 import { Modal } from "../components/Modal";
 import { PageHeader } from "../components/PageHeader";
 import { StatusBadge } from "../components/StatusBadge";
-import type { AppSettings, EnrollmentResult, Store, StoreEnrollment } from "../types";
+import type { AppSettings, EnrollmentResult, Store, StoreCommandExecution, StoreEnrollment } from "../types";
 
 type StoreListResponse = {
   stores: Store[];
@@ -82,7 +82,8 @@ function StoreModal({ store, onClose, onEditConnectivity }: { store: Store | nul
   const { data: detailData } = useQuery({
     queryKey: ["store-detail", store?.id],
     queryFn: () => api.get<{ store: Store }>(`/api/stores/${store!.id}`),
-    enabled: Boolean(store)
+    enabled: Boolean(store),
+    refetchInterval: (query) => query.state.data?.store.commandExecutions?.some((execution) => execution.status === "running") ? 2000 : false
   });
   const currentStore = detailData?.store ?? store;
   const { data: logData, isLoading: logsLoading } = useQuery({
@@ -131,9 +132,10 @@ function StoreModal({ store, onClose, onEditConnectivity }: { store: Store | nul
           <div><span>Tunnel</span><StatusBadge status={currentStore.tunnelStatus} /></div>
           <div><span>RDP</span><StatusBadge status={currentStore.rdpStatus} /></div>
         </div>
-        <section className="publication-summary"><header><h3>Published endpoints</h3><span>{currentStore.publications.length} hostname{currentStore.publications.length === 1 ? "" : "s"}</span></header>{currentStore.publications.map((publication) => <div className="publication-summary-item" key={publication.id}><div><code>{publication.hostname}</code><StatusBadge status={publication.status} />{currentStore.tunnelStatus === "healthy" && <a className="copy-icon" href={`https://${publication.hostname}`} target="_blank" rel="noreferrer" title="Open endpoint"><ExternalLink size={14} /></a>}</div>{publication.routes.map((route) => <div className="publication-route" key={route.id}><code>{route.path}</code><span>→</span><code>{route.serviceUrl}</code></div>)}</div>)}</section>
+        <section className="publication-summary"><header><h3>Published endpoints</h3><span>{currentStore.publications.length} hostname{currentStore.publications.length === 1 ? "" : "s"}</span></header>{currentStore.publications.map((publication) => <div className="publication-summary-item" key={publication.id}><div><code>{publication.hostname}</code><StatusBadge status={publication.status} />{currentStore.tunnelStatus === "healthy" && <a className="copy-icon" href={`https://${publication.hostname}`} target="_blank" rel="noreferrer" title="Open endpoint"><ExternalLink size={14} /></a>}</div>{publication.routes.map((route) => <div className="publication-route" key={route.id}><code>{route.path}</code><span>→</span><code>{route.kind === "command_agent" ? "Cloudflare Man command agent" : route.serviceUrl}</code></div>)}</div>)}</section>
         {currentStore.rdpLastError && <div className="inline-alert">{currentStore.rdpLastError}</div>}
         <EnrollmentHistory enrollments={currentStore.enrollments ?? []} onViewLog={setLogEnrollment} />
+        {currentStore.commandAgent && <CommandExecutionPanel store={currentStore} />}
         {enrollment ? <EnrollmentCommands result={enrollment} /> : <div className="detail-actions">
           <button className="button button-secondary" onClick={() => onEditConnectivity(currentStore)}><Settings2 size={15} />Edit connectivity</button>
           <button className="button button-primary" onClick={() => mutation.mutate()} disabled={mutation.isPending}><TerminalSquare size={16} />{mutation.isPending ? "Issuing..." : "Issue install URL"}</button>
@@ -153,7 +155,57 @@ function StoreModal({ store, onClose, onEditConnectivity }: { store: Store | nul
 }
 
 function EnrollmentHistory({ enrollments, onViewLog }: { enrollments: StoreEnrollment[]; onViewLog: (enrollment: StoreEnrollment) => void }) {
-  return <section className="enrollment-history"><header><h3>Enrollment history</h3><span>{enrollments.length} attempt{enrollments.length === 1 ? "" : "s"}</span></header>{enrollments.length ? <div className="enrollment-history-list">{enrollments.map((enrollment) => <div className="enrollment-history-row" key={enrollment.id}><div className="enrollment-history-date"><strong>{new Date(enrollment.createdAt).toLocaleString()}</strong><code>{enrollment.id}</code></div><div><StatusBadge status={enrollment.status} />{enrollment.unenrollStatus !== "not_required" && <StatusBadge status={`unenroll_${enrollment.unenrollStatus}`} />}</div><div className="enrollment-history-meta"><span>{enrollment.logCount} log{enrollment.logCount === 1 ? "" : "s"}</span><button className="icon-button" title="View log" aria-label="View enrollment log" onClick={() => onViewLog(enrollment)}><ScrollText size={15} /></button></div></div>)}</div> : <div className="quiet-empty">No enrollment links have been issued for this store.</div>}</section>;
+  return <section className="enrollment-history"><header><h3>Enrollment history</h3><span>{enrollments.length} attempt{enrollments.length === 1 ? "" : "s"}</span></header>{enrollments.length ? <div className="enrollment-history-list">{enrollments.map((enrollment) => {
+    const installScripts = enrollment.scripts.filter((script) => script.kind === "install");
+    const cleanupScripts = enrollment.scripts.filter((script) => script.kind === "unenroll");
+    const host = enrollment.hostInfo;
+    const hostLabel = [host.machineName, host.osName, host.osVersion && `v${host.osVersion}`, host.osBuild && `build ${host.osBuild}`, host.architecture].filter(Boolean).join(" · ");
+    return <div className="enrollment-history-row" key={enrollment.id}>
+      <div className="enrollment-history-date"><strong>{new Date(enrollment.createdAt).toLocaleString()}</strong><code>{enrollment.id}</code>{enrollment.platform && <span>Ran on {enrollment.platform === "windows" ? "Windows" : "Unix"}</span>}{hostLabel && <span className="enrollment-host-info">{hostLabel}</span>}</div>
+      <div className="enrollment-script-statuses"><div><StatusBadge status={enrollment.status} />{enrollment.unenrollStatus !== "not_required" && <StatusBadge status={`unenroll_${enrollment.unenrollStatus}`} />}</div><div className="enrollment-script-row"><span>Install</span>{installScripts.map((script) => <span key={`${script.kind}-${script.platform}`}><small>{script.platform}</small><StatusBadge status={script.status} /></span>)}</div>{cleanupScripts.length > 0 && <div className="enrollment-script-row"><span>Unenroll</span>{cleanupScripts.map((script) => <span key={`${script.kind}-${script.platform}`}><small>{script.platform}</small><StatusBadge status={script.status} /></span>)}</div>}</div>
+      <div className="enrollment-history-meta"><span>{enrollment.logCount} log{enrollment.logCount === 1 ? "" : "s"}</span><button className="icon-button" title="View log" aria-label="View enrollment log" onClick={() => onViewLog(enrollment)}><ScrollText size={15} /></button></div>
+    </div>;
+  })}</div> : <div className="quiet-empty">No enrollment links have been issued for this store.</div>}</section>;
+}
+
+type CommandExecutionResult = {
+  executionId: string;
+  endpoint: string;
+  success: boolean;
+  exitCode: number | null;
+  stdout: string;
+  stderr: string;
+  durationMs: number;
+};
+
+function CommandExecutionPanel({ store }: { store: Store }) {
+  const queryClient = useQueryClient();
+  const [script, setScript] = useState("");
+  const [timeoutSeconds, setTimeoutSeconds] = useState(60);
+  const [result, setResult] = useState<CommandExecutionResult | null>(null);
+  const execute = useMutation({
+    mutationFn: () => api.post<CommandExecutionResult>(`/api/stores/${store.id}/commands/execute`, {
+      script,
+      timeoutMs: timeoutSeconds * 1_000
+    }),
+    onSuccess: async (response) => {
+      setResult(response);
+      await queryClient.invalidateQueries({ queryKey: ["store-detail", store.id] });
+      if (response.success) toast.success("Script completed successfully");
+      else toast.error(`Script exited with code ${response.exitCode ?? "timeout"}`);
+    },
+    onError: async (error) => { await queryClient.invalidateQueries({ queryKey: ["store-detail", store.id] }); toast.error(error instanceof Error ? error.message : "Unable to execute script"); }
+  });
+  const agent = store.commandAgent!;
+  const executions = store.commandExecutions ?? [];
+  return <section className="command-agent-panel">
+    <header><div><h3>Command agent</h3><code>{agent.endpoint}</code></div><StatusBadge status={agent.status} /></header>
+    {agent.lastError && <div className="inline-alert">{agent.lastError}</div>}
+    <label className="field command-script-field"><span className="field-label">Store script</span><textarea className="mono-input" value={script} onChange={(event) => setScript(event.target.value)} placeholder="Write-Output 'Store ready'" spellCheck={false} /></label>
+    <div className="command-agent-controls"><label className="field"><span className="field-label">Timeout (seconds)</span><input type="number" min={1} max={300} value={timeoutSeconds} onChange={(event) => setTimeoutSeconds(Math.min(300, Math.max(1, Number(event.target.value) || 1)))} /></label><button className="button button-primary" type="button" disabled={!script.trim() || execute.isPending} onClick={() => execute.mutate()}><TerminalSquare size={15} />{execute.isPending ? "Executing..." : "Execute script"}</button></div>
+    {result && <div className="command-result"><header><StatusBadge status={result.success ? "completed" : "failed"} /><span>Exit {result.exitCode ?? "timeout"} · {result.durationMs} ms</span></header>{result.stdout && <div><strong>stdout</strong><pre>{result.stdout}</pre></div>}{result.stderr && <div><strong>stderr</strong><pre>{result.stderr}</pre></div>}{!result.stdout && !result.stderr && <div className="quiet-empty">The script produced no output.</div>}</div>}
+    <div className="command-execution-history"><header><h4>Execution history</h4><span>{executions.length} run{executions.length === 1 ? "" : "s"}</span></header>{executions.length ? executions.map((execution: StoreCommandExecution) => <details className="command-execution" key={execution.id}><summary><span><StatusBadge status={execution.status} /><code>{new Date(execution.startedAt).toLocaleString()}</code></span><span>{execution.elapsedMs !== null ? `${execution.elapsedMs} ms` : execution.status === "running" ? "running" : "-"}</span></summary><div className="command-execution-body"><code>{execution.script}</code>{execution.error && <div className="inline-alert">{execution.error}</div>}{execution.stdout && <div><strong>stdout</strong><pre>{execution.stdout}</pre></div>}{execution.stderr && <div><strong>stderr</strong><pre>{execution.stderr}</pre></div>}{!execution.stdout && !execution.stderr && !execution.error && <div className="quiet-empty">The script produced no output.</div>}</div></details>) : <div className="quiet-empty">No scripts have been executed for this store.</div>}</div>
+  </section>;
 }
 
 function EditConnectivityModal({ store, onClose }: { store: Store | null; onClose: () => void }) {
@@ -165,7 +217,7 @@ function EditConnectivityModal({ store, onClose }: { store: Store | null; onClos
     setPublications(store?.publications.map((publication) => ({
       key: publication.id,
       suffix: publication.suffix,
-      routes: publication.routes.map((route) => ({ key: route.id, path: route.path, serviceUrl: route.serviceUrl }))
+      routes: publication.routes.map((route) => ({ key: route.id, path: route.path, serviceUrl: route.serviceUrl, kind: route.kind ?? "service" }))
     })) ?? []);
   }, [store]);
   const mutation = useMutation({

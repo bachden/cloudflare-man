@@ -38,6 +38,7 @@ export type StoreRoute = {
   id: string;
   path: string;
   serviceUrl: string;
+  kind: "service" | "command_agent";
 };
 
 export type StorePublication = {
@@ -74,11 +75,22 @@ export type Store = {
   rdpLastError: string | null;
   publications: StorePublication[];
   enrollments?: StoreEnrollment[];
+  commandExecutions?: StoreCommandExecution[];
+  commandAgent?: {
+    enabled: boolean;
+    hostname: string;
+    path: string;
+    endpoint: string;
+    status: "pending" | "ready" | "failed";
+    lastSeenAt: string | null;
+    lastError: string | null;
+  } | null;
 };
 
 export type StoreEnrollment = {
   id: string;
   status: string;
+  platform: "windows" | "unix" | null;
   createdAt: string;
   expiresAt: string;
   claimedAt: string | null;
@@ -88,6 +100,36 @@ export type StoreEnrollment = {
   unenrollRequestedAt: string | null;
   unenrolledAt: string | null;
   logCount: number;
+  hostInfo: {
+    osName?: string;
+    osVersion?: string;
+    osBuild?: string;
+    architecture?: string;
+    machineName?: string;
+  };
+  scripts: Array<{
+    kind: "install" | "unenroll";
+    platform: "windows" | "unix";
+    status: "available" | "running" | "completed" | "failed" | "staled_ignored";
+    startedAt: string | null;
+    finishedAt: string | null;
+    lastError: string | null;
+  }>;
+};
+
+export type StoreCommandExecution = {
+  id: string;
+  script: string;
+  timeoutMs: number;
+  status: "running" | "succeeded" | "failed" | "timed_out";
+  startedAt: string;
+  finishedAt: string | null;
+  elapsedMs: number | null;
+  exitCode: number | null;
+  stdout: string;
+  stderr: string;
+  error: string | null;
+  requestedBy: string | null;
 };
 
 export type EnrollmentResult = {

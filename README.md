@@ -12,7 +12,7 @@ The onboarding flow is:
 2. `cloudflare-man` provisions a managed tunnel, DNS records, and ingress configuration through the Cloudflare API.
 3. The operator issues a one-time enrollment URL.
 4. The store administrator runs the generated PowerShell installer as Administrator, or the shell installer as root.
-5. The installer claims the tunnel, installs `cloudflared`, enables Windows Remote Desktop, and sends structured installation logs back to the server.
+5. The installer claims the tunnel, installs `cloudflared`, starts the local command agent, enables Windows Remote Desktop, and sends structured installation logs back to the server.
 6. The server provisions browser RDP resources and retries endpoint checks while Cloudflare resources propagate.
 
 ## Features
@@ -24,7 +24,10 @@ The onboarding flow is:
 - Managed Cloudflare Tunnel creation and configuration.
 - One-time PowerShell and POSIX enrollment URLs.
 - Existing-install detection with explicit cleanup and override confirmation.
+- Authenticated PowerShell or shell execution through a designated store connectivity route.
 - Server-side enrollment logs and audit logs.
+- Enrollment host inventory (OS name/version/build, architecture, and machine name) captured per attempt.
+- Windows and Unix installer tracking; once one platform claims a link, the other is marked `staled - ignored`.
 - Browser-based RDP through Cloudflare Access, including private network routes and infrastructure targets.
 - RDP gateway readiness checks with retries for Cloudflare propagation delays.
 - Paginated store inventory and bulk refresh for the visible page.
@@ -175,6 +178,8 @@ In **Stores**, create a store and define one or more publications. Each publicat
 - One or more ordered ingress paths.
 - An HTTP or HTTPS service URL reachable from the store host.
 
+Set a route type to **Command agent** to expose the enrollment-installed script runner on that hostname and path. Only one command agent route is allowed per store. The route's local service URL is managed automatically as `http://127.0.0.1:47831`.
+
 After the store is created:
 
 1. Open the store details and select **Issue install URL**.
@@ -195,6 +200,14 @@ Connectivity is editable after onboarding. Saving the connectivity editor update
 - The store's primary hostname and origin URL.
 
 Ingress routes are evaluated in order. The root path is kept last so more specific paths are evaluated first.
+
+## Store command agent
+
+The enrollment installer registers the command agent as a Windows scheduled task, Linux systemd service, or macOS launch daemon. The agent listens only on `127.0.0.1:47831`; Cloudflare Tunnel publishes it through the connectivity route marked **Command agent**.
+
+Open a store's details to run a PowerShell script on Windows or a shell script on Unix-like systems. Requests are authenticated with a per-store random token. The token is encrypted in PostgreSQL, written only into the protected local agent script, and never returned to the browser. Executions are limited to 64 KiB and a five-minute timeout, and completion metadata is written to the audit log.
+
+The command agent runs as `SYSTEM` or root because store administration scripts may need to manage services and machine configuration. Every execution is persisted with `running`, `succeeded`, `failed`, or `timed_out` status, elapsed time, exit code, stdout, stderr, and error details. Treat access to the cloudflare-man administrator account as privileged infrastructure access.
 
 ## Browser RDP
 
@@ -225,6 +238,7 @@ The `ops/cloudflared` directory contains a macOS launchd example for publishing 
 - `.env` is intentionally ignored and must never be committed.
 - Cloudflare API tokens are encrypted at rest using `ENCRYPTION_KEY`.
 - Enrollment tokens are stored as SHA-256 hashes and are single-use/expiry-bound.
+- Store command-agent tokens are generated independently and encrypted at rest.
 - Enrollment and audit events are persisted in PostgreSQL.
 - Store installer logs are capped and accepted through a rate-limited public endpoint.
 - Use HTTPS for `PUBLIC_BASE_URL` in any shared or production environment.
@@ -253,4 +267,3 @@ Cloudflare DNS and tunnel configuration are eventually consistent. Wait briefly,
 ### Browser RDP shows a Cloudflare DNS error
 
 Confirm that the RDP hostname has a proxied DNS record, the Access application uses a public hostname, the infrastructure target is attached to the same virtual network as the tunnel route, and the tunnel is healthy. Do not point the hostname at the Windows private IP.
-

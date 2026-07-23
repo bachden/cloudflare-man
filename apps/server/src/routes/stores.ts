@@ -9,9 +9,21 @@ import { provisionBrowserRdp } from "../lib/rdp.js";
 import { verifyStoreEndpoints } from "../lib/store-verification.js";
 import { createOpaqueToken, hashToken } from "../lib/security.js";
 import { selectZone, slugifyLabel } from "../lib/stores.js";
+import { createCommandExecution, executeStoreScript, getCommandAgentConfig, ensureCommandAgentToken, COMMAND_AGENT_SERVICE_URL } from "../lib/command-agent.js";
 
 const serviceUrlSchema = z.string().url().refine((value) => value.startsWith("http://") || value.startsWith("https://"), {
   message: "Service URL must use HTTP or HTTPS"
+});
+
+const routeKindSchema = z.enum(["service", "command_agent"]);
+const routeSchema = z.object({
+  kind: routeKindSchema.default("service"),
+  path: z.string().trim().min(1).max(200).regex(/^\//, "Path must start with /").transform(normalizePath),
+  serviceUrl: serviceUrlSchema.optional()
+}).superRefine((route, context) => {
+  if (route.kind === "service" && !route.serviceUrl) {
+    context.addIssue({ code: "custom", path: ["serviceUrl"], message: "A service URL is required" });
+  }
 });
 
 function normalizePath(value: string): string {
@@ -26,13 +38,11 @@ const publicationSchema = z.object({
     /^(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,28}[a-zA-Z0-9])?)?$/,
     "Suffix can contain letters, numbers, and inner hyphens"
   ).transform((value) => value.toLowerCase()),
-  routes: z.array(z.object({
-    path: z.string().trim().min(1).max(200).regex(/^\//, "Path must start with /").transform(normalizePath),
-    serviceUrl: serviceUrlSchema
-  })).min(1).max(20)
+  routes: z.array(routeSchema).min(1).max(20)
 });
 
 const publicationsSchema = z.array(publicationSchema).min(1).max(20).superRefine((publications, context) => {
+  let commandAgentRoutes = 0;
   const suffixes = new Set<string>();
   publications.forEach((publication, publicationIndex) => {
     if (suffixes.has(publication.suffix)) {
@@ -41,12 +51,16 @@ const publicationsSchema = z.array(publicationSchema).min(1).max(20).superRefine
     suffixes.add(publication.suffix);
     const paths = new Set<string>();
     publication.routes.forEach((route, routeIndex) => {
+      if (route.kind === "command_agent") commandAgentRoutes += 1;
       if (paths.has(route.path)) {
         context.addIssue({ code: "custom", path: [publicationIndex, "routes", routeIndex, "path"], message: "Each path must be unique within its subdomain" });
       }
       paths.add(route.path);
     });
   });
+  if (commandAgentRoutes > 1) {
+    context.addIssue({ code: "custom", message: "Only one command agent route can be configured per store" });
+  }
 });
 
 const createStoreSchema = z.object({
@@ -79,6 +93,11 @@ const enrollmentSchema = z.object({
   expiresInHours: z.number().int().min(1).max(168).default(24)
 });
 
+const executeScriptSchema = z.object({
+  script: z.string().min(1).max(65_536).refine((value) => value.trim().length > 0, "A script is required"),
+  timeoutMs: z.number().int().min(1_000).max(300_000).default(60_000)
+});
+
 async function enrollmentUrls(token: string) {
   const publicBaseUrl = await getPublicBaseUrl();
   return {
@@ -106,7 +125,8 @@ const publicationsJson = `COALESCE((
       SELECT jsonb_agg(jsonb_build_object(
         'id', r.id,
         'path', r.path,
-        'serviceUrl', r.service_url
+        'serviceUrl', r.service_url,
+        'kind', r.route_kind
       ) ORDER BY r.sort_order, r.created_at)
       FROM store_routes r WHERE r.publication_id = p.id
     ), '[]'::jsonb)
@@ -118,11 +138,13 @@ const enrollmentsJson = `COALESCE((
   SELECT jsonb_agg(jsonb_build_object(
     'id', e.id,
     'status', e.status,
+    'platform', CASE WHEN e.platform = 'windows' THEN 'windows' WHEN e.platform IS NOT NULL THEN 'unix' ELSE null END,
     'createdAt', e.created_at,
     'expiresAt', e.expires_at,
     'claimedAt', e.claimed_at,
     'installedAt', e.installed_at,
     'lastError', e.last_error,
+    'hostInfo', e.host_info,
     'unenrollStatus', CASE
       WHEN e.unenrolled_at IS NOT NULL THEN 'unenrolled'
       WHEN e.unenroll_last_error IS NOT NULL THEN 'failed'
@@ -131,9 +153,64 @@ const enrollmentsJson = `COALESCE((
     END,
     'unenrollRequestedAt', e.unenroll_requested_at,
     'unenrolledAt', e.unenrolled_at,
-    'logCount', (SELECT count(*)::int FROM enrollment_logs l WHERE l.enrollment_id = e.id)
+    'logCount', (SELECT count(*)::int FROM enrollment_logs l WHERE l.enrollment_id = e.id),
+    'scripts', COALESCE((
+      SELECT jsonb_agg(jsonb_build_object(
+        'kind', es.script_kind,
+        'platform', es.platform,
+        'status', es.status,
+        'startedAt', es.started_at,
+        'finishedAt', es.finished_at,
+        'lastError', es.last_error
+      ) ORDER BY es.script_kind, es.platform)
+      FROM enrollment_scripts es WHERE es.enrollment_id = e.id
+    ), '[]'::jsonb)
   ) ORDER BY e.created_at DESC)
   FROM enrollments e WHERE e.store_id = s.id
+), '[]'::jsonb)`;
+
+const commandAgentJson = `(
+  SELECT jsonb_build_object(
+    'enabled', true,
+    'hostname', p.hostname,
+    'path', r.path,
+    'endpoint', CASE WHEN r.path = '/' THEN 'https://' || p.hostname || '/exec'
+                     ELSE 'https://' || p.hostname || r.path || '/exec' END,
+    'status', ca.status,
+    'lastSeenAt', ca.last_seen_at,
+    'lastError', ca.last_error
+  )
+    FROM store_publications p
+    JOIN store_routes r ON r.publication_id = p.id AND r.route_kind = 'command_agent'
+    JOIN store_command_agents ca ON ca.store_id = s.id
+   WHERE p.store_id = s.id
+   ORDER BY p.created_at, r.sort_order, r.created_at
+   LIMIT 1
+)`;
+
+const commandExecutionsJson = `COALESCE((
+  SELECT jsonb_agg(jsonb_build_object(
+    'id', ce.id,
+    'script', ce.script,
+    'timeoutMs', ce.timeout_ms,
+    'status', ce.status,
+    'startedAt', ce.started_at,
+    'finishedAt', ce.finished_at,
+    'elapsedMs', ce.elapsed_ms,
+    'exitCode', ce.exit_code,
+    'stdout', ce.stdout,
+    'stderr', ce.stderr,
+    'error', ce.error,
+    'requestedBy', ce.username
+  ) ORDER BY ce.created_at DESC)
+  FROM LATERAL (
+    SELECT ce.*, u.username
+      FROM store_command_executions ce
+      LEFT JOIN users u ON u.id = ce.requested_by
+     WHERE ce.store_id = s.id
+     ORDER BY ce.created_at DESC
+     LIMIT 50
+  ) ce
 ), '[]'::jsonb)`;
 
 function preparePublications(
@@ -144,6 +221,10 @@ function preparePublications(
   const baseLabel = slugifyLabel(storeCode);
   return publications.map((publication) => ({
     ...publication,
+    routes: publication.routes.map((route) => ({
+      ...route,
+      serviceUrl: route.kind === "command_agent" ? COMMAND_AGENT_SERVICE_URL : route.serviceUrl!
+    })),
     hostname: `${publication.suffix ? `${baseLabel}-${publication.suffix}` : baseLabel}.${zoneName}`
   }));
 }
@@ -206,7 +287,9 @@ export async function storeRoutes(app: FastifyInstance): Promise<void> {
              s.last_connected_at AS "lastConnectedAt", s.last_verified_at AS "lastVerifiedAt", s.last_error AS "lastError",
              s.created_at AS "createdAt", a.id AS "accountId", a.name AS "accountName", z.id AS "zoneId", z.name AS "zoneName",
              ${publicationsJson} AS publications,
-             ${enrollmentsJson} AS enrollments
+             ${enrollmentsJson} AS enrollments,
+             ${commandAgentJson} AS "commandAgent",
+             ${commandExecutionsJson} AS "commandExecutions"
         FROM stores s
         JOIN cloudflare_accounts a ON a.id = s.account_id
         JOIN zones z ON z.id = s.zone_id
@@ -234,11 +317,41 @@ export async function storeRoutes(app: FastifyInstance): Promise<void> {
     return { logs: result.rows };
   });
 
+  app.post("/api/stores/:id/commands/execute", { preHandler: requireAuth }, async (request, reply) => {
+    const { id } = z.object({ id: z.string().uuid() }).parse(request.params);
+    const body = executeScriptSchema.parse(request.body);
+    const agent = await getCommandAgentConfig(id);
+    if (!agent) return reply.code(409).send({ error: "No command agent route is configured for this store" });
+    const executionId = await createCommandExecution(id, request.authUser!.id, body.script, body.timeoutMs);
+    try {
+      const result = await executeStoreScript(id, body.script, body.timeoutMs, executionId);
+      if (!result) return reply.code(409).send({ error: "No command agent route is configured for this store" });
+      await writeAudit({
+        actorUserId: request.authUser!.id,
+        action: "store.command_executed",
+        entityType: "store",
+        entityId: id,
+        details: { endpoint: agent.endpoint, executionId, timeoutMs: body.timeoutMs, success: result.success, exitCode: result.exitCode }
+      });
+      return { executionId, endpoint: agent.endpoint, ...result };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Command agent execution failed";
+      await writeAudit({
+        actorUserId: request.authUser!.id,
+        action: "store.command_executed",
+        entityType: "store",
+        entityId: id,
+        details: { endpoint: agent.endpoint, executionId, timeoutMs: body.timeoutMs, success: false, error: message }
+      });
+      return reply.code(502).send({ error: message, executionId });
+    }
+  });
+
   app.post("/api/stores", { preHandler: requireAuth }, async (request, reply) => {
     const body = createStoreSchema.parse(request.body);
     const storeId = await withTransaction(async (client) => {
       const allocation = await selectZone(client, body.zoneId);
-      const publications = body.publications ?? [{ suffix: "", routes: [{ path: "/", serviceUrl: body.originUrl! }] }];
+      const publications = body.publications ?? [{ suffix: "", routes: [{ kind: "service" as const, path: "/", serviceUrl: body.originUrl! }] }];
       const prepared = body.publications
         ? preparePublications(body.storeCode, allocation.zoneName, publications)
         : publications.map((publication) => ({ ...publication, hostname: `${slugifyLabel(`${body.tenantCode}-${body.storeCode}`)}.${allocation.zoneName}` }));
@@ -260,9 +373,9 @@ export async function storeRoutes(app: FastifyInstance): Promise<void> {
         );
         for (const [index, route] of publication.routes.entries()) {
           await client.query(
-            `INSERT INTO store_routes(publication_id, path, service_url, sort_order)
-             VALUES ($1, $2, $3, $4)`,
-            [inserted.rows[0].id, route.path, route.serviceUrl, index]
+            `INSERT INTO store_routes(publication_id, path, service_url, route_kind, sort_order)
+             VALUES ($1, $2, $3, $4, $5)`,
+            [inserted.rows[0].id, route.path, route.serviceUrl, route.kind ?? "service", index]
           );
         }
       }
@@ -288,7 +401,8 @@ export async function storeRoutes(app: FastifyInstance): Promise<void> {
              s.rdp_url AS "rdpUrl", s.rdp_last_error AS "rdpLastError",
              s.last_connected_at AS "lastConnectedAt", s.last_verified_at AS "lastVerifiedAt", s.last_error AS "lastError",
              s.created_at AS "createdAt", a.id AS "accountId", a.name AS "accountName", z.id AS "zoneId", z.name AS "zoneName",
-             ${publicationsJson} AS publications
+             ${publicationsJson} AS publications,
+             ${commandAgentJson} AS "commandAgent"
         FROM stores s JOIN cloudflare_accounts a ON a.id = s.account_id JOIN zones z ON z.id = s.zone_id
        WHERE s.id = $1
     `, [storeId]);
@@ -332,9 +446,9 @@ export async function storeRoutes(app: FastifyInstance): Promise<void> {
         );
         for (const [index, route] of publication.routes.entries()) {
           await client.query(
-            `INSERT INTO store_routes(publication_id, path, service_url, sort_order)
-             VALUES ($1, $2, $3, $4)`,
-            [inserted.rows[0].id, route.path, route.serviceUrl, index]
+            `INSERT INTO store_routes(publication_id, path, service_url, route_kind, sort_order)
+             VALUES ($1, $2, $3, $4, $5)`,
+            [inserted.rows[0].id, route.path, route.serviceUrl, route.kind, index]
           );
         }
       }
@@ -378,6 +492,7 @@ export async function storeRoutes(app: FastifyInstance): Promise<void> {
     const issued = await withTransaction(async (client) => {
       const store = await client.query("SELECT id, tunnel_status FROM stores WHERE id = $1 FOR UPDATE", [id]);
       if (!store.rowCount) throw new Error("Store not found");
+      await ensureCommandAgentToken(client, id);
       const previous: Array<{ enrollmentId: string; createdAt: string; expiresAt: Date; rawToken: string }> = [];
       if (["healthy", "degraded", "connector_online"].includes(store.rows[0].tunnel_status)) {
         const active = await client.query(
@@ -399,6 +514,13 @@ export async function storeRoutes(app: FastifyInstance): Promise<void> {
               WHERE id = $3`,
             [hashToken(cleanupToken), expiresAt, row.id]
           );
+          await client.query(
+            `INSERT INTO enrollment_scripts(enrollment_id, script_kind, platform, status)
+             VALUES ($1, 'unenroll', 'windows', 'available'), ($1, 'unenroll', 'unix', 'available')
+             ON CONFLICT (enrollment_id, script_kind, platform) DO UPDATE SET
+               status = 'available', started_at = null, finished_at = null, last_error = null, updated_at = now()`,
+            [row.id]
+          );
           previous.push({ enrollmentId: row.id, createdAt: row.created_at, expiresAt, rawToken: cleanupToken });
         }
       }
@@ -410,6 +532,11 @@ export async function storeRoutes(app: FastifyInstance): Promise<void> {
         `INSERT INTO enrollments(store_id, token_hash, expires_at, created_by)
          VALUES ($1, $2, $3, $4) RETURNING id`,
         [id, hashToken(rawToken), expiresAt, request.authUser!.id]
+      );
+      await client.query(
+        `INSERT INTO enrollment_scripts(enrollment_id, script_kind, platform, status)
+         VALUES ($1, 'install', 'windows', 'available'), ($1, 'install', 'unix', 'available')`,
+        [result.rows[0].id]
       );
       await client.query(
         "UPDATE stores SET onboarding_status = 'url_issued', last_error = null, updated_at = now() WHERE id = $1",

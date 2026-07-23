@@ -27,7 +27,7 @@
 * { box-sizing: border-box; letter-spacing: 0; }
 html, body, #root { margin: 0; min-width: 320px; min-height: 100%; }
 body { min-height: 100vh; background: #f4f6f4; }
-button, input, select { font: inherit; }
+button, input, select, textarea { font: inherit; }
 button, a { -webkit-tap-highlight-color: transparent; }
 button { border: 0; }
 a { color: inherit; text-decoration: none; }
@@ -284,6 +284,40 @@ tbody tr:hover td { background: #fbfcfb; }
 .enrollment-log header strong { color: var(--ink); font-size: 9px; text-transform: uppercase; }
 .enrollment-log time { margin-left: auto; color: var(--muted); font-size: 8px; }
 .enrollment-log p { margin: 7px 0 0; color: #435047; font-size: 10px; line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; }
+.command-agent-panel { display: flex; flex-direction: column; gap: 12px; padding-top: 14px; border-top: 1px solid var(--line); }
+.command-agent-panel > header { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.command-agent-panel > header > div { min-width: 0; display: flex; flex-direction: column; gap: 4px; }
+.command-agent-panel > header h3 { font-size: 11px; }
+.command-agent-panel > header code { color: var(--muted); font-size: 9px; overflow-wrap: anywhere; }
+.command-agent-panel > .inline-alert { margin: 0; }
+.command-script-field textarea { min-height: 140px; width: 100%; padding: 11px 12px; resize: vertical; color: #d9eee2; background: #18221d; border: 1px solid #26382f; border-radius: 5px; outline: 0; font-size: 10px; line-height: 1.55; }
+.command-script-field textarea:focus { border-color: #409678; box-shadow: 0 0 0 3px rgba(8,127,91,.12); }
+.command-agent-controls { display: flex; align-items: flex-end; justify-content: flex-end; gap: 9px; }
+.command-agent-controls .field { width: 130px; }
+.command-result { display: flex; flex-direction: column; gap: 9px; padding: 11px; background: #f7f9f7; border: 1px solid var(--line); border-radius: 5px; }
+.command-result > header { display: flex; align-items: center; gap: 9px; }
+.command-result > header span { color: var(--muted); font-size: 9px; }
+.command-result > div { display: flex; flex-direction: column; gap: 4px; }
+.command-result strong { color: var(--muted); font-size: 8px; text-transform: uppercase; }
+.command-result pre { max-height: 240px; margin: 0; padding: 10px; overflow: auto; color: #d9eee2; background: #18221d; border-radius: 4px; font-size: 9px; line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; }
+.command-execution-history { display: flex; flex-direction: column; gap: 8px; border-top: 1px solid var(--line); padding-top: 12px; }
+.command-execution-history > header { display: flex; align-items: center; justify-content: space-between; }
+.command-execution-history h4 { margin: 0; color: var(--muted); font-size: 9px; text-transform: uppercase; letter-spacing: .08em; }
+.command-execution-history > header span { color: var(--muted); font-size: 9px; }
+.command-execution { border: 1px solid var(--line); border-radius: 4px; background: #fbfcfb; }
+.command-execution summary { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 9px 10px; cursor: pointer; list-style: none; font-size: 9px; color: var(--muted); }
+.command-execution summary::-webkit-details-marker { display: none; }
+.command-execution summary > span { display: inline-flex; align-items: center; gap: 9px; min-width: 0; }
+.command-execution summary code { overflow-wrap: anywhere; }
+.command-execution-body { display: flex; flex-direction: column; gap: 8px; padding: 0 10px 10px; }
+.command-execution-body > code { padding: 8px; color: var(--muted); background: #f0f3f0; border-radius: 3px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.command-execution-body pre { max-height: 180px; margin: 0; padding: 9px; overflow: auto; color: #d9eee2; background: #18221d; border-radius: 4px; font-size: 9px; line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; }
+.enrollment-script-statuses { display: flex; flex-direction: column; gap: 5px; }
+.enrollment-script-row { display: flex; align-items: center; flex-wrap: wrap; gap: 5px; color: var(--muted); font-size: 9px; }
+.enrollment-script-row > span:first-child { min-width: 44px; text-transform: uppercase; letter-spacing: .05em; }
+.enrollment-script-row > span:not(:first-child) { display: inline-flex; align-items: center; gap: 4px; }
+.enrollment-script-row small { color: var(--muted); font-size: 8px; }
+.enrollment-host-info { color: var(--muted); font-size: 9px; overflow-wrap: anywhere; }
 .publication-summary { display: flex; flex-direction: column; border-top: 1px solid var(--line); }
 .publication-summary > header { min-height: 42px; display: flex; align-items: center; justify-content: space-between; }
 .publication-summary > header h3 { font-size: 11px; }
@@ -346,7 +380,7 @@ tbody tr:hover td { background: #fbfcfb; }
 .route-editor-heading > span { display: inline-flex; align-items: center; gap: 6px; color: #4d5a52; font-size: 9px; font-weight: 800; text-transform: uppercase; }
 .route-editor-heading > button { display: inline-flex; align-items: center; gap: 4px; padding: 4px 6px; color: var(--green); background: transparent; border-radius: 4px; cursor: pointer; font-size: 9px; font-weight: 750; }
 .route-editor-heading > button:hover { background: var(--green-soft); }
-.route-editor-row { display: grid; grid-template-columns: 24px minmax(130px, .4fr) minmax(240px, 1fr) 34px; gap: 9px; align-items: end; position: relative; }
+.route-editor-row { display: grid; grid-template-columns: 24px minmax(120px, .34fr) minmax(125px, .3fr) minmax(220px, 1fr) 34px; gap: 9px; align-items: end; position: relative; }
 .route-editor-row-dragging { z-index: 5; padding: 7px; margin: -7px; background: white; border: 1px solid var(--line-strong); border-radius: 5px; box-shadow: var(--shadow); }
 .route-drag-handle { width: 24px; height: 38px; display: grid; place-items: center; color: #829087; background: transparent; border-radius: 4px; cursor: grab; touch-action: none; }
 .route-drag-handle:hover, .route-drag-handle:focus-visible { color: var(--green); background: var(--green-soft); outline: none; }
@@ -475,6 +509,8 @@ tbody tr:hover td { background: #fbfcfb; }
   .detail-list > div:nth-last-child(-n+2) { border-bottom: 1px solid var(--line); }
   .detail-list > div:last-child { border-bottom: 0; }
   .detail-status { flex-direction: column; gap: 10px; }
+  .enrollment-history-row { grid-template-columns: 1fr; gap: 8px; }
+  .enrollment-history-meta { justify-content: flex-start; }
   .connectivity-scope { grid-template-columns: 1fr; }
   .connectivity-scope > div { border-right: 0; border-bottom: 1px solid var(--line); }
   .connectivity-scope > div:last-child { border-bottom: 0; }

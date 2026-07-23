@@ -207,6 +207,14 @@ test("allocates a store and issues bootstrap URLs", async () => {
   assert.match(scriptResponse.body, /api\/public\/enrollments\/logs/);
   assert.match(scriptResponse.body, /Cleanup and override it\? \[y\/N\]/);
   assert.match(scriptResponse.body, /overrideExisting/);
+  assert.match(scriptResponse.body, /command-agent\.py/);
+  assert.match(scriptResponse.body, /ThreadingHTTPServer/);
+  assert.match(scriptResponse.body, /cloudflare-man-command-agent\.service/);
+  assert.match(scriptResponse.body, /Restart=always/);
+  assert.match(scriptResponse.body, /systemctl enable --now cloudflared\.service/);
+  assert.match(scriptResponse.body, /osName/);
+  assert.match(scriptResponse.body, /osVersion/);
+  assert.match(scriptResponse.body, /machineName/);
 
   const windowsScript = await app.inject({ method: "GET", url: `/e/${enrollmentToken}/install.ps1` });
   assert.equal(windowsScript.statusCode, 200);
@@ -219,6 +227,13 @@ test("allocates a store and issues bootstrap URLs", async () => {
   assert.match(windowsScript.body, /Send-InstallLog/);
   assert.match(windowsScript.body, /Read-Host "Cleanup and override/);
   assert.match(windowsScript.body, /overrideExisting/);
+  assert.match(windowsScript.body, /CloudflareManCommandAgent/);
+  assert.match(windowsScript.body, /New-ScheduledTaskAction/);
+  assert.match(windowsScript.body, /X-Cloudflare-Man-Agent-Token/);
+  assert.match(windowsScript.body, /sc\.exe failure cloudflared/);
+  assert.match(windowsScript.body, /RestartCount 999/);
+  assert.match(windowsScript.body, /Get-CimInstance Win32_OperatingSystem/);
+  assert.match(windowsScript.body, /platform = "windows"/);
 });
 
 test("paginates and refreshes the visible store list", async () => {
@@ -275,7 +290,7 @@ test("keeps installer preflight failures retryable", async () => {
   const report = await app.inject({
     method: "POST",
     url: "/api/public/enrollments/report",
-    payload: { token: enrollmentToken, status: "failed", error: "Run PowerShell as Administrator." }
+    payload: { token: enrollmentToken, platform: "windows", status: "failed", error: "Run PowerShell as Administrator." }
   });
   assert.equal(report.statusCode, 200, report.body);
   const retryable = await pool.query("SELECT status, last_error FROM enrollments WHERE id = $1", [enrollmentId]);
@@ -307,6 +322,7 @@ test("claim is atomic and provisions a tunnel once", async () => {
   });
   assert.equal(claimResponse.statusCode, 200, claimResponse.body);
   assert.match(claimResponse.json().tunnelToken, /^mock-/);
+  assert.match(claimResponse.json().agentToken, /^[A-Za-z0-9_-]{40,}$/);
 
   const retryClaim = await app.inject({
     method: "POST",
@@ -331,6 +347,11 @@ test("claim is atomic and provisions a tunnel once", async () => {
   assert.equal(approvedOverride.statusCode, 200, approvedOverride.body);
   const overridden = await pool.query("SELECT install_id FROM enrollments WHERE id = $1", [enrollmentId]);
   assert.equal(overridden.rows[0].install_id, "installer-b");
+  const claimedScripts = await pool.query("SELECT platform, status FROM enrollment_scripts WHERE enrollment_id = $1 AND script_kind = 'install' ORDER BY platform", [enrollmentId]);
+  assert.deepEqual(claimedScripts.rows, [
+    { platform: "unix", status: "staled_ignored" },
+    { platform: "windows", status: "running" }
+  ]);
 });
 
 test("updates all ingress routes on an existing tunnel", async () => {
@@ -347,6 +368,10 @@ test("updates all ingress routes on an existing tunnel", async () => {
             { path: "/api", serviceUrl: "http://localhost:8081" },
             { path: "/admin", serviceUrl: "http://localhost:8082" }
           ]
+        },
+        {
+          suffix: "ops",
+          routes: [{ kind: "command_agent", path: "/agent" }]
         }
       ]
     }
@@ -355,10 +380,12 @@ test("updates all ingress routes on an existing tunnel", async () => {
   assert.equal(response.json().applied, true);
   const publications = await pool.query("SELECT suffix, hostname, status FROM store_publications WHERE store_id = $1 ORDER BY created_at", [storeId]);
   const routes = await pool.query("SELECT path, service_url FROM store_routes WHERE publication_id IN (SELECT id FROM store_publications WHERE store_id = $1) ORDER BY path", [storeId]);
-  assert.deepEqual(publications.rows.map((publication) => publication.suffix), ["", "pos"]);
+  assert.deepEqual(publications.rows.map((publication) => publication.suffix), ["", "pos", "ops"]);
   assert.equal(publications.rows[1].hostname, "0001-pos.stores-a.example");
   assert.ok(publications.rows.every((publication) => publication.status === "active"));
-  assert.deepEqual(routes.rows.map((route) => route.path), ["/", "/admin", "/api"]);
+  assert.deepEqual(routes.rows.map((route) => route.path), ["/", "/admin", "/agent", "/api"]);
+  const agentRoute = await pool.query("SELECT route_kind, service_url FROM store_routes WHERE path = '/agent'");
+  assert.deepEqual(agentRoute.rows[0], { route_kind: "command_agent", service_url: "http://127.0.0.1:47831" });
 });
 
 test("installer report activates a mock store", async () => {
@@ -367,11 +394,18 @@ test("installer report activates a mock store", async () => {
     url: "/api/public/enrollments/report",
     payload: {
       token: enrollmentToken,
+      platform: "windows",
       status: "installed",
       version: "cloudflared test",
       rdpEnabled: true,
       rdpTargetIp: "192.168.10.25",
-      rdpPort: 3389
+      rdpPort: 3389,
+      agentReady: true,
+      osName: "Microsoft Windows 11 Pro",
+      osVersion: "10.0.26100",
+      osBuild: "26100",
+      architecture: "amd64",
+      machineName: "STORE-WIN-01"
     }
   });
   assert.equal(report.statusCode, 200, report.body);
@@ -382,6 +416,19 @@ test("installer report activates a mock store", async () => {
   assert.equal(result.rows[0].rdp_status, "ready");
   assert.equal(result.rows[0].rdp_target_ip, "192.168.10.25/32");
   assert.match(result.rows[0].rdp_url, /^https:\/\/rdp\.stores-a\.example\/rdp\//);
+  const enrollmentInfo = await pool.query("SELECT host_info FROM enrollments WHERE id = $1", [enrollmentId]);
+  assert.deepEqual(enrollmentInfo.rows[0].host_info, {
+    osName: "Microsoft Windows 11 Pro",
+    osVersion: "10.0.26100",
+    osBuild: "26100",
+    architecture: "amd64",
+    machineName: "STORE-WIN-01"
+  });
+  const installedScripts = await pool.query("SELECT platform, status FROM enrollment_scripts WHERE enrollment_id = $1 AND script_kind = 'install' ORDER BY platform", [enrollmentId]);
+  assert.deepEqual(installedScripts.rows, [
+    { platform: "unix", status: "staled_ignored" },
+    { platform: "windows", status: "completed" }
+  ]);
 
   const retry = await app.inject({
     method: "POST",
@@ -390,6 +437,67 @@ test("installer report activates a mock store", async () => {
   });
   assert.equal(retry.statusCode, 200, retry.body);
   assert.equal(retry.json().ready, true);
+});
+
+test("executes a script through the configured store command agent", async () => {
+  const detail = await app.inject({ method: "GET", url: `/api/stores/${storeId}`, headers: { cookie: sessionCookie } });
+  assert.equal(detail.statusCode, 200, detail.body);
+  assert.equal(detail.json().store.commandAgent.endpoint, "https://0001-ops.stores-a.example/agent/exec");
+  assert.equal(detail.json().store.commandAgent.status, "ready");
+
+  const originalFetch = globalThis.fetch;
+  let executionCall = 0;
+  globalThis.fetch = async (input, init) => {
+    assert.equal(String(input), "https://0001-ops.stores-a.example/agent/exec");
+    const headers = new Headers(init?.headers);
+    assert.match(headers.get("X-Cloudflare-Man-Agent-Token") ?? "", /^[A-Za-z0-9_-]{40,}$/);
+    assert.deepEqual(JSON.parse(String(init?.body)), { script: executionCall === 0 ? "Write-Output 'ready'" : "exit 2", timeoutMs: 30000 });
+    executionCall += 1;
+    return new Response(JSON.stringify(executionCall === 1
+      ? { success: true, exitCode: 0, stdout: "ready\n", stderr: "", durationMs: 25 }
+      : { success: false, exitCode: 2, stdout: "partial\n", stderr: "failed\n", durationMs: 12 }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" }
+    });
+  };
+  try {
+    const response = await app.inject({
+      method: "POST",
+      url: `/api/stores/${storeId}/commands/execute`,
+      headers: { cookie: sessionCookie },
+      payload: { script: "Write-Output 'ready'", timeoutMs: 30000 }
+    });
+    assert.equal(response.statusCode, 200, response.body);
+    assert.deepEqual({ ...response.json(), executionId: undefined }, {
+      endpoint: "https://0001-ops.stores-a.example/agent/exec",
+      success: true,
+      exitCode: 0,
+      stdout: "ready\n",
+      stderr: "",
+      durationMs: 25,
+      executionId: undefined
+    });
+    assert.match(response.json().executionId, /^[0-9a-f-]{36}$/);
+    const failed = await app.inject({
+      method: "POST",
+      url: `/api/stores/${storeId}/commands/execute`,
+      headers: { cookie: sessionCookie },
+      payload: { script: "exit 2", timeoutMs: 30000 }
+    });
+    assert.equal(failed.statusCode, 200, failed.body);
+    assert.equal(failed.json().success, false);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+  const audit = await pool.query("SELECT details FROM audit_logs WHERE action = 'store.command_executed' AND entity_id = $1", [storeId]);
+  assert.equal(audit.rowCount, 2);
+  assert.equal(audit.rows[0].details.success, true);
+  const executions = await pool.query("SELECT status, elapsed_ms, stdout, stderr FROM store_command_executions WHERE store_id = $1 ORDER BY created_at", [storeId]);
+  assert.equal(executions.rows.length, 2);
+  assert.deepEqual({ status: executions.rows[0].status, stdout: executions.rows[0].stdout, stderr: executions.rows[0].stderr }, { status: "succeeded", stdout: "ready\n", stderr: "" });
+  assert.equal(typeof executions.rows[0].elapsed_ms, "number");
+  assert.deepEqual({ status: executions.rows[1].status, stdout: executions.rows[1].stdout, stderr: executions.rows[1].stderr }, { status: "failed", stdout: "partial\n", stderr: "failed\n" });
+  assert.equal(typeof executions.rows[1].elapsed_ms, "number");
 });
 
 test("tracks enrollment history and issues cleanup for a running tunnel", async () => {
@@ -414,6 +522,15 @@ test("tracks enrollment history and issues cleanup for a running tunnel", async 
   assert.equal(cleanupPowerShell.statusCode, 200, cleanupPowerShell.body);
   assert.match(cleanupPowerShell.body, /Run PowerShell as Administrator/);
 
+  const cleanupClaim = await app.inject({
+    method: "POST",
+    url: "/api/public/enrollments/unenroll/claim",
+    payload: { token: cleanupToken, platform: "unix" }
+  });
+  assert.equal(cleanupClaim.statusCode, 200, cleanupClaim.body);
+  const staleCleanupPowerShell = await app.inject({ method: "GET", url: `/e/${cleanupToken}/unenroll.ps1` });
+  assert.equal(staleCleanupPowerShell.statusCode, 410, staleCleanupPowerShell.body);
+
   const detail = await app.inject({ method: "GET", url: `/api/stores/${storeId}`, headers: { cookie: sessionCookie } });
   assert.equal(detail.statusCode, 200, detail.body);
   assert.equal(detail.json().store.enrollments.length, 2);
@@ -428,12 +545,17 @@ test("tracks enrollment history and issues cleanup for a running tunnel", async 
   const cleanupReport = await app.inject({
     method: "POST",
     url: "/api/public/enrollments/unenroll/report",
-    payload: { token: cleanupToken, status: "unenrolled" }
+    payload: { token: cleanupToken, platform: "unix", status: "unenrolled" }
   });
   assert.equal(cleanupReport.statusCode, 200, cleanupReport.body);
   const oldEnrollment = await pool.query("SELECT unenrolled_at, unenroll_last_error FROM enrollments WHERE id = $1", [enrollmentId]);
   assert.ok(oldEnrollment.rows[0].unenrolled_at);
   assert.equal(oldEnrollment.rows[0].unenroll_last_error, null);
+  const cleanupScripts = await pool.query("SELECT platform, status FROM enrollment_scripts WHERE enrollment_id = $1 AND script_kind = 'unenroll' ORDER BY platform", [enrollmentId]);
+  assert.deepEqual(cleanupScripts.rows, [
+    { platform: "unix", status: "completed" },
+    { platform: "windows", status: "staled_ignored" }
+  ]);
 
   const logs = await app.inject({
     method: "GET",

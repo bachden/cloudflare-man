@@ -3,8 +3,9 @@ import { CloudflareClient, type CloudflareIngressRule } from "./cloudflare.js";
 import { pool } from "./database.js";
 import { decryptSecret } from "./security.js";
 import { slugifyLabel } from "./stores.js";
+import { COMMAND_AGENT_SERVICE_URL } from "./command-agent.js";
 
-type PublicationRoute = { path: string; serviceUrl: string; sortOrder: number };
+type PublicationRoute = { path: string; serviceUrl: string; routeKind: "service" | "command_agent"; sortOrder: number };
 type Publication = { id: string; hostname: string; dnsRecordId: string | null; routes: PublicationRoute[] };
 type StoreConnectivity = {
   id: string;
@@ -54,7 +55,8 @@ function ingressRules(publications: Publication[]): CloudflareIngressRule[] {
 
 async function loadPublications(storeId: string): Promise<Publication[]> {
   const publicationRows = await pool.query(
-    `SELECT p.id, p.hostname, p.dns_record_id, r.path, r.service_url, r.sort_order
+    `SELECT p.id, p.hostname, p.dns_record_id, r.path, r.service_url, r.sort_order,
+              r.route_kind
        FROM store_publications p
        JOIN store_routes r ON r.publication_id = p.id
       WHERE p.store_id = $1
@@ -69,7 +71,12 @@ async function loadPublications(storeId: string): Promise<Publication[]> {
       dnsRecordId: row.dns_record_id,
       routes: []
     };
-    publication.routes.push({ path: row.path, serviceUrl: row.service_url, sortOrder: row.sort_order });
+    publication.routes.push({
+      path: row.path,
+      serviceUrl: row.route_kind === "command_agent" ? COMMAND_AGENT_SERVICE_URL : row.service_url,
+      routeKind: row.route_kind,
+      sortOrder: row.sort_order
+    });
     byPublication.set(row.id, publication);
   }
   return [...byPublication.values()];

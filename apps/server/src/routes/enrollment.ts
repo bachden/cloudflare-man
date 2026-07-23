@@ -8,6 +8,7 @@ import { provisionStore } from "../lib/provisioning.js";
 import { provisionBrowserRdp } from "../lib/rdp.js";
 import { hashToken } from "../lib/security.js";
 import { scheduleStoreVerification } from "../lib/store-verification.js";
+import { ensureCommandAgentToken } from "../lib/command-agent.js";
 
 const tokenParams = z.object({ token: z.string().min(30).max(200) });
 const claimSchema = z.object({
@@ -15,18 +16,29 @@ const claimSchema = z.object({
   platform: z.enum(["windows", "linux", "darwin", "unix"]),
   architecture: z.string().max(40).optional(),
   machineName: z.string().max(200).optional(),
+  osName: z.string().max(200).optional(),
+  osVersion: z.string().max(100).optional(),
+  osBuild: z.string().max(100).optional(),
   installId: z.string().max(200).optional(),
   overrideExisting: z.boolean().default(false)
 });
 const reportSchema = z.object({
   token: z.string().min(30).max(200),
+  platform: z.enum(["windows", "unix"]).optional(),
   status: z.enum(["installed", "failed"]),
   version: z.string().max(80).optional(),
   error: z.string().max(2000).optional(),
   rdpEnabled: z.boolean().optional(),
   rdpTargetIp: z.string().refine((value) => isIP(value) === 4, "RDP target must be an IPv4 address").optional(),
   rdpPort: z.number().int().min(1).max(65535).optional(),
-  rdpError: z.string().max(2000).optional()
+  rdpError: z.string().max(2000).optional(),
+  agentReady: z.boolean().optional(),
+  agentError: z.string().max(2000).optional(),
+  osName: z.string().max(200).optional(),
+  osVersion: z.string().max(100).optional(),
+  osBuild: z.string().max(100).optional(),
+  architecture: z.string().max(40).optional(),
+  machineName: z.string().max(200).optional()
 });
 const logSchema = z.object({
   token: z.string().min(30).max(200),
@@ -40,13 +52,15 @@ const logSchema = z.object({
 });
 const unenrollReportSchema = z.object({
   token: z.string().min(30).max(200),
+  platform: z.enum(["windows", "unix"]),
   status: z.enum(["unenrolled", "failed"]),
   error: z.string().max(2000).optional()
 });
 
 async function findEnrollment(token: string) {
   const result = await pool.query(
-    `SELECT e.id, e.store_id, e.status, e.expires_at, e.install_id, e.claimed_at, e.claimed_by, e.platform, s.hostname
+    `SELECT e.id, e.store_id, e.status, e.expires_at, e.install_id, e.claimed_at, e.claimed_by, e.platform,
+            e.host_info, s.hostname
        FROM enrollments e JOIN stores s ON s.id = e.store_id
       WHERE e.token_hash = $1`,
     [hashToken(token)]
@@ -64,13 +78,197 @@ async function findUnenrollment(token: string) {
   return result.rows[0];
 }
 
+async function findEnrollmentScript(enrollmentId: string, scriptKind: "install" | "unenroll", platform: "windows" | "unix") {
+  const result = await pool.query(
+    `SELECT status, started_at, finished_at, last_error
+       FROM enrollment_scripts
+      WHERE enrollment_id = $1 AND script_kind = $2 AND platform = $3`,
+    [enrollmentId, scriptKind, platform]
+  );
+  return result.rows[0];
+}
+
+function normalizeScriptPlatform(platform: string | null | undefined): "windows" | "unix" | null {
+  if (!platform) return null;
+  return platform === "windows" ? "windows" : "unix";
+}
+
 function noStore(reply: FastifyReply): void {
   reply.header("Cache-Control", "no-store, private");
   reply.header("X-Robots-Tag", "noindex, nofollow");
   reply.header("Referrer-Policy", "no-referrer");
 }
 
-function shellScript(token: string, hostname: string, publicBaseUrl: string): string {
+async function commandAgentToken(storeId: string): Promise<string> {
+  return ensureCommandAgentToken(pool, storeId);
+}
+
+export function unixAgentProgram(agentToken: string): string {
+  return `#!/usr/bin/env python3
+import json
+import subprocess
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+TOKEN = "${agentToken}"
+MAX_SCRIPT_BYTES = 65536
+PORT = 47831
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, format, *args):
+        return
+
+    def respond(self, status, payload):
+        body = json.dumps(payload).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        if self.path.endswith("/health") and self.headers.get("X-Cloudflare-Man-Agent-Token") == TOKEN:
+            self.respond(200, {"ready": True})
+        elif self.path.endswith("/health"):
+            self.respond(401, {"error": "Invalid command agent token"})
+        else:
+            self.respond(404, {"error": "Not found"})
+
+    def do_POST(self):
+        if not self.path.endswith("/exec"):
+            self.respond(404, {"error": "Not found"})
+            return
+        if self.headers.get("X-Cloudflare-Man-Agent-Token") != TOKEN:
+            self.respond(401, {"error": "Invalid command agent token"})
+            return
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            if length <= 0 or length > MAX_SCRIPT_BYTES + 4096:
+                self.respond(413, {"error": "Request is too large"})
+                return
+            payload = json.loads(self.rfile.read(length).decode("utf-8"))
+            script = payload.get("script")
+            timeout_ms = int(payload.get("timeoutMs", 60000))
+            if not isinstance(script, str) or not script.strip():
+                self.respond(400, {"error": "A script is required"})
+                return
+            if len(script.encode("utf-8")) > MAX_SCRIPT_BYTES:
+                self.respond(413, {"error": "Script is too large"})
+                return
+            timeout_ms = max(1000, min(timeout_ms, 300000))
+            started = time.monotonic()
+            try:
+                process = subprocess.run(
+                    ["/bin/sh", "-lc", script],
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout_ms / 1000,
+                    check=False
+                )
+                payload = {
+                    "success": process.returncode == 0,
+                    "exitCode": process.returncode,
+                    "stdout": process.stdout[-20000:],
+                    "stderr": process.stderr[-20000:],
+                    "durationMs": round((time.monotonic() - started) * 1000)
+                }
+            except subprocess.TimeoutExpired as error:
+                payload = {
+                    "success": False,
+                    "exitCode": None,
+                    "stdout": (error.stdout or "")[-20000:] if isinstance(error.stdout, str) else "",
+                    "stderr": (error.stderr or "")[-20000:] if isinstance(error.stderr, str) else "",
+                    "durationMs": round((time.monotonic() - started) * 1000),
+                    "error": "Script timed out"
+                }
+            self.respond(200, payload)
+        except Exception as error:
+            self.respond(400, {"error": str(error)[:2000]})
+
+ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
+`;
+}
+
+export function windowsAgentProgram(agentToken: string): string {
+  return `$ErrorActionPreference = "Stop"
+$Token = "${agentToken}"
+$Port = 47831
+$Listener = New-Object System.Net.HttpListener
+$Listener.Prefixes.Add("http://127.0.0.1:$Port/")
+$Listener.Start()
+
+function Send-JsonResponse($Context, [int]$StatusCode, $Payload) {
+  $json = $Payload | ConvertTo-Json -Compress -Depth 5
+  $bytes = [Text.Encoding]::UTF8.GetBytes($json)
+  $Context.Response.StatusCode = $StatusCode
+  $Context.Response.ContentType = "application/json"
+  $Context.Response.ContentLength64 = $bytes.Length
+  $Context.Response.OutputStream.Write($bytes, 0, $bytes.Length)
+  $Context.Response.Close()
+}
+
+while ($true) {
+  $context = $Listener.GetContext()
+  try {
+    $path = $context.Request.Url.AbsolutePath
+    if ($context.Request.HttpMethod -eq "GET" -and $path.EndsWith("/health") -and $context.Request.Headers["X-Cloudflare-Man-Agent-Token"] -eq $Token) {
+      Send-JsonResponse $context 200 @{ ready = $true }
+      continue
+    }
+    if ($context.Request.HttpMethod -eq "GET" -and $path.EndsWith("/health")) {
+      Send-JsonResponse $context 401 @{ error = "Invalid command agent token" }
+      continue
+    }
+    if ($context.Request.HttpMethod -ne "POST" -or -not $path.EndsWith("/exec")) {
+      Send-JsonResponse $context 404 @{ error = "Not found" }
+      continue
+    }
+    if ($context.Request.Headers["X-Cloudflare-Man-Agent-Token"] -ne $Token) {
+      Send-JsonResponse $context 401 @{ error = "Invalid command agent token" }
+      continue
+    }
+    $reader = New-Object IO.StreamReader($context.Request.InputStream, $context.Request.ContentEncoding)
+    $body = $reader.ReadToEnd()
+    $reader.Close()
+    if ($body.Length -gt 70000) { Send-JsonResponse $context 413 @{ error = "Request is too large" }; continue }
+    $request = $body | ConvertFrom-Json
+    $script = [string]$request.script
+    if ([string]::IsNullOrWhiteSpace($script)) { Send-JsonResponse $context 400 @{ error = "A script is required" }; continue }
+    if ($script.Length -gt 65536) { Send-JsonResponse $context 413 @{ error = "Script is too large" }; continue }
+    $timeoutMs = [Math]::Min([Math]::Max([int]$request.timeoutMs, 1000), 300000)
+    $started = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+    $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($script))
+    $psi = New-Object Diagnostics.ProcessStartInfo
+    $psi.FileName = "powershell.exe"
+    $psi.Arguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand $encoded"
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $process = New-Object Diagnostics.Process
+    $process.StartInfo = $psi
+    [void]$process.Start()
+    $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+    $stderrTask = $process.StandardError.ReadToEndAsync()
+    if (-not $process.WaitForExit($timeoutMs)) {
+      $process.Kill()
+      $process.WaitForExit()
+      $stdout = $stdoutTask.Result
+      $stderr = $stderrTask.Result
+      Send-JsonResponse $context 200 @{ success = $false; exitCode = $null; stdout = $stdout.Substring(0, [Math]::Min($stdout.Length, 20000)); stderr = $stderr.Substring(0, [Math]::Min($stderr.Length, 20000)); durationMs = ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() - $started); error = "Script timed out" }
+      continue
+    }
+    $stdout = $stdoutTask.Result
+    $stderr = $stderrTask.Result
+    Send-JsonResponse $context 200 @{ success = ($process.ExitCode -eq 0); exitCode = $process.ExitCode; stdout = $stdout.Substring(0, [Math]::Min($stdout.Length, 20000)); stderr = $stderr.Substring(0, [Math]::Min($stderr.Length, 20000)); durationMs = ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() - $started) }
+  } catch {
+    try { Send-JsonResponse $context 400 @{ error = $_.Exception.Message } } catch { }
+  }
+}
+`;
+}
+
+export function shellScript(token: string, hostname: string, publicBaseUrl: string, agentToken: string): string {
   const claimUrl = `${publicBaseUrl}/api/public/enrollments/claim`;
   const reportUrl = `${publicBaseUrl}/api/public/enrollments/report`;
   return `#!/usr/bin/env bash
@@ -82,8 +280,14 @@ CLAIM_URL='${claimUrl}'
 REPORT_URL='${reportUrl}'
 LOG_URL='${publicBaseUrl}/api/public/enrollments/logs'
 ASSIGNED_HOSTNAME='${hostname}'
+AGENT_TOKEN='${agentToken}'
 REPORT_SENT=0
 TEMP_DIR=""
+OS_DISPLAY_NAME="unknown"
+OS_VERSION="unknown"
+OS_BUILD="unknown"
+MACHINE_ARCH="unknown"
+MACHINE_NAME="unknown"
 
 send_log() {
   level="$1"
@@ -105,7 +309,7 @@ report_failure() {
     send_log "error" "installer" "Installer exited with code $exit_code"
     curl --silent --show-error --fail --retry 2 --retry-all-errors -X POST "$REPORT_URL" \\
       -H 'Content-Type: application/json' \\
-      --data "{\\"token\\":\\"$ENROLLMENT_TOKEN\\",\\"status\\":\\"failed\\",\\"error\\":\\"installer exited with code $exit_code\\"}" >/dev/null || true
+      --data "{\\"token\\":\\"$ENROLLMENT_TOKEN\\",\\"status\\":\\"failed\\",\\"platform\\":\\"unix\\",\\"error\\":\\"installer exited with code $exit_code\\",\\"osName\\":\\"$OS_DISPLAY_NAME\\",\\"osVersion\\":\\"$OS_VERSION\\",\\"osBuild\\":\\"$OS_BUILD\\",\\"architecture\\":\\"$MACHINE_ARCH\\",\\"machineName\\":\\"$MACHINE_NAME\\"}" >/dev/null || true
   fi
   exit "$exit_code"
 }
@@ -122,6 +326,23 @@ OS_NAME="$(uname -s | tr '[:upper:]' '[:lower:]')"
 MACHINE_ARCH="$(uname -m)"
 MACHINE_NAME="$(hostname 2>/dev/null | tr -cd 'A-Za-z0-9._-' | cut -c1-200)"
 [ -n "$MACHINE_NAME" ] || MACHINE_NAME="unknown"
+OS_VERSION="$(uname -r)"
+OS_BUILD="$OS_VERSION"
+if [ "$OS_NAME" = "darwin" ]; then
+  OS_DISPLAY_NAME="macOS"
+  OS_VERSION="$(sw_vers -productVersion 2>/dev/null || printf '%s' "$OS_VERSION")"
+  OS_BUILD="$(sw_vers -buildVersion 2>/dev/null || printf '%s' "$OS_BUILD")"
+elif [ "$OS_NAME" = "linux" ]; then
+  OS_DISPLAY_NAME="Linux"
+  if [ -r /etc/os-release ]; then
+    . /etc/os-release
+    OS_DISPLAY_NAME="\${PRETTY_NAME:-Linux}"
+    OS_VERSION="\${VERSION_ID:-$OS_VERSION}"
+    OS_BUILD="\${BUILD_ID:-$OS_BUILD}"
+  fi
+else
+  OS_DISPLAY_NAME="$OS_NAME"
+fi
 case "$MACHINE_ARCH" in
   x86_64|amd64) CF_ARCH="amd64" ;;
   arm64|aarch64) CF_ARCH="arm64" ;;
@@ -164,6 +385,16 @@ if [ "$EXISTING_ENROLLMENT" -eq 1 ]; then
         CLEANUP_OUTPUT="$(cloudflared service uninstall 2>&1 || true)"
         if [ -n "$CLEANUP_OUTPUT" ]; then log_message "info" "cleanup" "$CLEANUP_OUTPUT"; fi
       fi
+      if command -v systemctl >/dev/null 2>&1; then
+        systemctl disable --now cloudflare-man-command-agent.service >/dev/null 2>&1 || true
+        rm -f /etc/systemd/system/cloudflare-man-command-agent.service
+        systemctl daemon-reload >/dev/null 2>&1 || true
+      fi
+      if command -v launchctl >/dev/null 2>&1; then
+        launchctl bootout system/dev.cloudflare-man.command-agent >/dev/null 2>&1 || true
+        rm -f /Library/LaunchDaemons/dev.cloudflare-man.command-agent.plist
+      fi
+      pkill -f "cloudflare-man/command-agent.py" >/dev/null 2>&1 || true
       rm -rf "$STATE_DIR"
       OVERRIDE_EXISTING=true
       ;;
@@ -175,6 +406,7 @@ if [ "$EXISTING_ENROLLMENT" -eq 1 ]; then
   esac
 fi
 mkdir -p "$STATE_DIR"
+chmod 700 "$STATE_DIR"
 INSTALL_ID="$(cat /proc/sys/kernel/random/uuid 2>/dev/null || uuidgen 2>/dev/null || printf '%s-%s' "$(date +%s)" "$$")"
 printf '%s' "$INSTALL_ID" > "$INSTALL_ID_FILE"
 chmod 600 "$INSTALL_ID_FILE"
@@ -199,8 +431,11 @@ if ! command -v cloudflared >/dev/null 2>&1; then
 fi
 
 log_message "info" "claim" "Claiming enrollment and provisioning the Cloudflare tunnel"
-CLAIM_BODY="$(printf '{\\"token\\":\\"%s\\",\\"platform\\":\\"%s\\",\\"architecture\\":\\"%s\\",\\"machineName\\":\\"%s\\",\\"installId\\":\\"%s\\",\\"overrideExisting\\":%s}' "$ENROLLMENT_TOKEN" "$OS_NAME" "$MACHINE_ARCH" "$MACHINE_NAME" "$INSTALL_ID" "$OVERRIDE_EXISTING")"
-TUNNEL_TOKEN="$(curl --silent --show-error --fail --retry 3 --retry-all-errors -X POST "$CLAIM_URL" -H 'Content-Type: application/json' -H 'Accept: text/plain' --data "$CLAIM_BODY")"
+CLAIM_BODY="$(printf '{\\"token\\":\\"%s\\",\\"platform\\":\\"%s\\",\\"architecture\\":\\"%s\\",\\"machineName\\":\\"%s\\",\\"osName\\":\\"%s\\",\\"osVersion\\":\\"%s\\",\\"osBuild\\":\\"%s\\",\\"installId\\":\\"%s\\",\\"overrideExisting\\":%s}' "$ENROLLMENT_TOKEN" "$OS_NAME" "$MACHINE_ARCH" "$MACHINE_NAME" "$OS_DISPLAY_NAME" "$OS_VERSION" "$OS_BUILD" "$INSTALL_ID" "$OVERRIDE_EXISTING")"
+CLAIM_RESPONSE="$(curl --silent --show-error --fail --retry 3 --retry-all-errors -X POST "$CLAIM_URL" -H 'Content-Type: application/json' -H 'Accept: text/plain' --data "$CLAIM_BODY")"
+TUNNEL_TOKEN="$(printf '%s\\n' "$CLAIM_RESPONSE" | sed -n '1p')"
+CLAIM_AGENT_TOKEN="$(printf '%s\\n' "$CLAIM_RESPONSE" | sed -n '2p')"
+[ -n "$CLAIM_AGENT_TOKEN" ] && AGENT_TOKEN="$CLAIM_AGENT_TOKEN"
 log_message "info" "claim" "Enrollment claimed successfully"
 log_message "info" "service" "Installing the cloudflared service"
 if ! SERVICE_OUTPUT="$(cloudflared service install "$TUNNEL_TOKEN" 2>&1)"; then
@@ -208,9 +443,95 @@ if ! SERVICE_OUTPUT="$(cloudflared service install "$TUNNEL_TOKEN" 2>&1)"; then
   exit 1
 fi
 if [ -n "$SERVICE_OUTPUT" ]; then log_message "info" "service" "$SERVICE_OUTPUT"; fi
+if [ "$OS_NAME" = "linux" ] && command -v systemctl >/dev/null 2>&1; then
+  mkdir -p /etc/systemd/system/cloudflared.service.d
+  cat > /etc/systemd/system/cloudflared.service.d/10-cloudflare-man-restart.conf <<EOF
+[Unit]
+StartLimitIntervalSec=0
+[Service]
+Restart=always
+RestartSec=5
+EOF
+  systemctl daemon-reload
+  systemctl enable --now cloudflared.service
+  systemctl restart cloudflared.service
+elif [ "$OS_NAME" = "darwin" ] && command -v launchctl >/dev/null 2>&1; then
+  CLOUDFLARED_PLIST="/Library/LaunchDaemons/com.cloudflare.cloudflared.plist"
+  if [ ! -f "$CLOUDFLARED_PLIST" ] || ! command -v plutil >/dev/null 2>&1; then
+    log_message "error" "service" "The cloudflared launchd service was not created"
+    exit 1
+  fi
+  plutil -replace RunAtLoad -bool true "$CLOUDFLARED_PLIST" || plutil -insert RunAtLoad -bool true "$CLOUDFLARED_PLIST"
+  plutil -replace KeepAlive -bool true "$CLOUDFLARED_PLIST" || plutil -insert KeepAlive -bool true "$CLOUDFLARED_PLIST"
+  launchctl bootout system/com.cloudflare.cloudflared >/dev/null 2>&1 || true
+  launchctl bootstrap system "$CLOUDFLARED_PLIST"
+  launchctl enable system/com.cloudflare.cloudflared
+else
+  log_message "error" "service" "A supported service manager (systemd or launchd) is required"
+  exit 1
+fi
 VERSION="$(cloudflared --version | head -n 1)"
+AGENT_READY=false
+AGENT_ERROR=""
+AGENT_SCRIPT="$STATE_DIR/command-agent.py"
+if ! command -v python3 >/dev/null 2>&1; then
+  AGENT_ERROR="python3 is required to run the cloudflare-man command agent"
+  log_message "error" "command-agent" "$AGENT_ERROR"
+  exit 1
+fi
+PYTHON_BIN="$(command -v python3)"
+log_message "info" "command-agent" "Installing the local command agent"
+cat > "$AGENT_SCRIPT" <<'PYTHON'
+${unixAgentProgram(agentToken)}
+PYTHON
+chmod 700 "$AGENT_SCRIPT"
+if [ "$OS_NAME" = "linux" ] && command -v systemctl >/dev/null 2>&1; then
+  cat > /etc/systemd/system/cloudflare-man-command-agent.service <<EOF
+[Unit]
+Description=cloudflare-man command agent
+After=network.target
+StartLimitIntervalSec=0
+[Service]
+Type=simple
+ExecStart=$PYTHON_BIN $AGENT_SCRIPT
+Restart=always
+RestartSec=3
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+  systemctl enable --now cloudflare-man-command-agent.service
+elif [ "$OS_NAME" = "darwin" ] && command -v launchctl >/dev/null 2>&1; then
+  cat > /Library/LaunchDaemons/dev.cloudflare-man.command-agent.plist <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>Label</key><string>dev.cloudflare-man.command-agent</string>
+<key>ProgramArguments</key><array><string>$PYTHON_BIN</string><string>$AGENT_SCRIPT</string></array>
+<key>RunAtLoad</key><true/><key>KeepAlive</key><true/>
+<key>StandardOutPath</key><string>/var/log/cloudflare-man-command-agent.log</string>
+<key>StandardErrorPath</key><string>/var/log/cloudflare-man-command-agent.error.log</string>
+</dict></plist>
+EOF
+  launchctl bootout system/dev.cloudflare-man.command-agent >/dev/null 2>&1 || true
+  launchctl bootstrap system /Library/LaunchDaemons/dev.cloudflare-man.command-agent.plist
+  launchctl enable system/dev.cloudflare-man.command-agent
+else
+  log_message "error" "command-agent" "A supported service manager (systemd or launchd) is required"
+  exit 1
+fi
+for attempt in 1 2 3 4 5 6 7 8 9 10; do
+  if curl --silent --show-error --fail --max-time 2 -H "X-Cloudflare-Man-Agent-Token: $AGENT_TOKEN" http://127.0.0.1:47831/health >/dev/null 2>&1; then AGENT_READY=true; break; fi
+  sleep 1
+done
+if [ "$AGENT_READY" != true ]; then
+  AGENT_ERROR="The local command agent did not become ready"
+  log_message "error" "command-agent" "$AGENT_ERROR"
+  exit 1
+fi
+log_message "info" "command-agent" "Local command agent is ready"
 log_message "info" "report" "Reporting successful installation"
-curl --silent --show-error --fail --retry 3 --retry-all-errors -X POST "$REPORT_URL" -H 'Content-Type: application/json' --data "{\\"token\\":\\"$ENROLLMENT_TOKEN\\",\\"status\\":\\"installed\\",\\"version\\":\\"$VERSION\\"}" >/dev/null
+curl --silent --show-error --fail --retry 3 --retry-all-errors -X POST "$REPORT_URL" -H 'Content-Type: application/json' --data "{\\"token\\":\\"$ENROLLMENT_TOKEN\\",\\"status\\":\\"installed\\",\\"platform\\":\\"unix\\",\\"version\\":\\"$VERSION\\",\\"agentReady\\":$AGENT_READY,\\"osName\\":\\"$OS_DISPLAY_NAME\\",\\"osVersion\\":\\"$OS_VERSION\\",\\"osBuild\\":\\"$OS_BUILD\\",\\"architecture\\":\\"$MACHINE_ARCH\\",\\"machineName\\":\\"$MACHINE_NAME\\"}" >/dev/null
 REPORT_SENT=1
 printf '%s' "$ASSIGNED_HOSTNAME" > "$HOSTNAME_FILE"
 chmod 600 "$HOSTNAME_FILE"
@@ -220,15 +541,21 @@ echo "Store tunnel installed: $ASSIGNED_HOSTNAME"
 `;
 }
 
-function powerShellScript(token: string, hostname: string, publicBaseUrl: string): string {
+export function powerShellScript(token: string, hostname: string, publicBaseUrl: string, agentToken: string): string {
   return `$ErrorActionPreference = "Stop"
 $EnrollmentToken = "${token}"
 $CloudflaredVersion = "${config.CLOUDFLARED_VERSION}"
 $ClaimUrl = "${publicBaseUrl}/api/public/enrollments/claim"
 $ReportUrl = "${publicBaseUrl}/api/public/enrollments/report"
 $AssignedHostname = "${hostname}"
+$AgentToken = "${agentToken}"
 $ReportSent = $false
 $LogUrl = "${publicBaseUrl}/api/public/enrollments/logs"
+$architecture = "unknown"
+$osName = "unknown"
+$osVersion = "unknown"
+$osBuild = "unknown"
+$machineName = if ($env:COMPUTERNAME) { $env:COMPUTERNAME } else { "unknown" }
 
 function Send-InstallLog {
   param(
@@ -260,6 +587,10 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
 }
 
 $architecture = if ([Environment]::Is64BitOperatingSystem) { "amd64" } else { "386" }
+$osInfo = Get-CimInstance Win32_OperatingSystem
+$osName = [string]$osInfo.Caption
+$osVersion = [string]$osInfo.Version
+$osBuild = [string]$osInfo.BuildNumber
 $installDirectory = Join-Path $env:ProgramFiles "cloudflared"
 $binary = Join-Path $installDirectory "cloudflared.exe"
 $stateDirectory = Join-Path $env:ProgramData "cloudflare-man"
@@ -289,11 +620,17 @@ if ($existingEnrollment) {
     Stop-Service -Name "cloudflared" -Force -ErrorAction SilentlyContinue
     & sc.exe delete cloudflared | Out-Null
   }
+  Stop-ScheduledTask -TaskName "CloudflareManCommandAgent" -ErrorAction SilentlyContinue
+  Unregister-ScheduledTask -TaskName "CloudflareManCommandAgent" -Confirm:$false -ErrorAction SilentlyContinue
+  Get-CimInstance Win32_Process -Filter "Name = 'powershell.exe'" -ErrorAction SilentlyContinue |
+    Where-Object { $_.CommandLine -like "*cloudflare-man*command-agent.ps1*" } |
+    ForEach-Object { Invoke-CimMethod -InputObject $_ -MethodName Terminate -ErrorAction SilentlyContinue | Out-Null }
   if (Test-Path $stateDirectory) { Remove-Item $stateDirectory -Recurse -Force }
   $overrideExisting = $true
 }
 New-Item -ItemType Directory -Path $installDirectory -Force | Out-Null
 New-Item -ItemType Directory -Path $stateDirectory -Force | Out-Null
+& icacls.exe $stateDirectory /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" | Out-Null
 $installId = [guid]::NewGuid().ToString()
 Set-Content -Path $installIdFile -Value $installId -NoNewline
 Send-InstallLog -Level "info" -Step "preflight" -Message "Local enrollment state is ready"
@@ -315,7 +652,10 @@ $claimBody = @{
   token = $EnrollmentToken
   platform = "windows"
   architecture = $architecture
-  machineName = $env:COMPUTERNAME
+  machineName = $machineName
+  osName = $osName
+  osVersion = $osVersion
+  osBuild = $osBuild
   installId = $installId
   overrideExisting = $overrideExisting
 } | ConvertTo-Json
@@ -327,6 +667,9 @@ $serviceOutput = & $binary service install $claim.tunnelToken 2>&1
 $serviceExitCode = $LASTEXITCODE
 foreach ($line in $serviceOutput) { Send-InstallLog -Level "info" -Step "service" -Message $line.ToString() }
 if ($serviceExitCode -ne 0) { throw "cloudflared service installation failed with exit code $serviceExitCode." }
+Set-Service -Name "cloudflared" -StartupType Automatic
+& sc.exe failure cloudflared reset= 86400 actions= restart/5000/restart/10000/restart/60000 | Out-Null
+Start-Service -Name "cloudflared" -ErrorAction SilentlyContinue
 
 $rdpEnabled = $false
 $rdpTargetIp = $null
@@ -360,15 +703,54 @@ try {
   Send-InstallLog -Level "warn" -Step "rdp" -Message $rdpError
 }
 
+$agentReady = $false
+$agentError = $null
+try {
+  Send-InstallLog -Level "info" -Step "command-agent" -Message "Installing the local command agent"
+  $agentScript = Join-Path $stateDirectory "command-agent.ps1"
+  $agentProgram = @'
+${windowsAgentProgram(agentToken)}
+'@
+  Set-Content -Path $agentScript -Value $agentProgram -Encoding UTF8
+  $taskName = "CloudflareManCommandAgent"
+  $taskAction = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File \`"$agentScript\`""
+  $taskTrigger = New-ScheduledTaskTrigger -AtStartup
+  $taskPrincipal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+  $taskSettings = New-ScheduledTaskSettingsSet -StartWhenAvailable -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Days 3650)
+  Register-ScheduledTask -TaskName $taskName -Action $taskAction -Trigger $taskTrigger -Principal $taskPrincipal -Settings $taskSettings -Force | Out-Null
+  Start-ScheduledTask -TaskName $taskName
+  for ($attempt = 0; $attempt -lt 10; $attempt++) {
+    try {
+      $health = Invoke-RestMethod -Method Get -Uri "http://127.0.0.1:47831/health" -Headers @{ "X-Cloudflare-Man-Agent-Token" = $AgentToken } -TimeoutSec 2
+      if ($health.ready) { $agentReady = $true; break }
+    } catch { }
+    Start-Sleep -Seconds 1
+  }
+  if (-not $agentReady) { throw "The local command agent did not become ready" }
+  Send-InstallLog -Level "info" -Step "command-agent" -Message "Local command agent is ready"
+} catch {
+  $agentError = $_.Exception.Message
+  Send-InstallLog -Level "error" -Step "command-agent" -Message $agentError
+  throw
+}
+
 $reportPayload = @{
   token = $EnrollmentToken
+  platform = "windows"
   status = "installed"
   version = (& $binary --version | Select-Object -First 1)
   rdpEnabled = $rdpEnabled
   rdpPort = 3389
+  agentReady = $agentReady
+  osName = $osName
+  osVersion = $osVersion
+  osBuild = $osBuild
+  architecture = $architecture
+  machineName = $machineName
 }
 if ($rdpTargetIp) { $reportPayload.rdpTargetIp = $rdpTargetIp }
 if ($rdpError) { $reportPayload.rdpError = $rdpError }
+if ($agentError) { $reportPayload.agentError = $agentError }
 $reportBody = $reportPayload | ConvertTo-Json
 Send-InstallLog -Level "info" -Step "report" -Message "Reporting successful installation"
 $report = Invoke-RestMethod -Method Post -Uri $ReportUrl -ContentType "application/json" -Body $reportBody
@@ -384,7 +766,7 @@ Write-Host "Store tunnel installed: $AssignedHostname"
   Send-InstallLog -Level "error" -Step "installer" -Message $_.Exception.Message
   if (-not $ReportSent) {
     try {
-      $failureBody = @{ token = $EnrollmentToken; status = "failed"; error = $_.Exception.Message } | ConvertTo-Json
+      $failureBody = @{ token = $EnrollmentToken; platform = "windows"; status = "failed"; error = $_.Exception.Message; osName = $osName; osVersion = $osVersion; osBuild = $osBuild; architecture = $architecture; machineName = $machineName } | ConvertTo-Json
       Invoke-RestMethod -Method Post -Uri $ReportUrl -ContentType "application/json" -Body $failureBody | Out-Null
     } catch { }
   }
@@ -394,12 +776,14 @@ Write-Host "Store tunnel installed: $AssignedHostname"
 }
 
 function shellUnenrollScript(token: string, hostname: string, publicBaseUrl: string): string {
+  const claimUrl = `${publicBaseUrl}/api/public/enrollments/unenroll/claim`;
   const reportUrl = `${publicBaseUrl}/api/public/enrollments/unenroll/report`;
   const logUrl = `${publicBaseUrl}/api/public/enrollments/unenroll/logs`;
   return `#!/usr/bin/env bash
 set -euo pipefail
 
 UNENROLL_TOKEN='${token}'
+CLAIM_URL='${claimUrl}'
 REPORT_URL='${reportUrl}'
 LOG_URL='${logUrl}'
 REPORT_SENT=0
@@ -416,7 +800,7 @@ report_failure() {
   if [ "$exit_code" -ne 0 ] && [ "$REPORT_SENT" -eq 0 ]; then
     curl --silent --show-error --fail --retry 2 --retry-all-errors -X POST "$REPORT_URL" \\
       -H 'Content-Type: application/json' \\
-      --data "{\\"token\\":\\"$UNENROLL_TOKEN\\",\\"status\\":\\"failed\\",\\"error\\":\\"cleanup exited with code $exit_code\\"}" >/dev/null || true
+      --data "{\\"token\\":\\"$UNENROLL_TOKEN\\",\\"platform\\":\\"unix\\",\\"status\\":\\"failed\\",\\"error\\":\\"cleanup exited with code $exit_code\\"}" >/dev/null || true
   fi
   exit "$exit_code"
 }
@@ -426,24 +810,39 @@ if [ "$(id -u)" -ne 0 ]; then
   echo "Run this command as root (sudo)." >&2
   exit 1
 fi
+curl --silent --show-error --fail --retry 2 --retry-all-errors -X POST "$CLAIM_URL" \\
+  -H 'Content-Type: application/json' \\
+  --data "{\\"token\\":\\"$UNENROLL_TOKEN\\",\\"platform\\":\\"unix\\"}" >/dev/null
+send_log "info" "cleanup" "Unenrollment script claimed for unix"
 send_log "info" "cleanup" "Stopping and removing the cloudflared service"
 if command -v cloudflared >/dev/null 2>&1; then
   cloudflared service uninstall >/dev/null 2>&1 || true
 fi
+if command -v systemctl >/dev/null 2>&1; then
+  systemctl disable --now cloudflare-man-command-agent.service >/dev/null 2>&1 || true
+  rm -f /etc/systemd/system/cloudflare-man-command-agent.service
+  systemctl daemon-reload >/dev/null 2>&1 || true
+fi
+if command -v launchctl >/dev/null 2>&1; then
+  launchctl bootout system/dev.cloudflare-man.command-agent >/dev/null 2>&1 || true
+  rm -f /Library/LaunchDaemons/dev.cloudflare-man.command-agent.plist
+fi
 rm -rf "/var/lib/cloudflare-man" "/Library/Application Support/cloudflare-man"
 curl --silent --show-error --fail --retry 3 --retry-all-errors -X POST "$REPORT_URL" \\
   -H 'Content-Type: application/json' \\
-  --data "{\\"token\\":\\"$UNENROLL_TOKEN\\",\\"status\\":\\"unenrolled\\"}" >/dev/null
+  --data "{\\"token\\":\\"$UNENROLL_TOKEN\\",\\"platform\\":\\"unix\\",\\"status\\":\\"unenrolled\\"}" >/dev/null
 REPORT_SENT=1
 echo "Cloudflare tunnel instance unenrolled successfully."
 `;
 }
 
 function powerShellUnenrollScript(token: string, hostname: string, publicBaseUrl: string): string {
+  const claimUrl = `${publicBaseUrl}/api/public/enrollments/unenroll/claim`;
   const reportUrl = `${publicBaseUrl}/api/public/enrollments/unenroll/report`;
   const logUrl = `${publicBaseUrl}/api/public/enrollments/unenroll/logs`;
   return `$ErrorActionPreference = "Stop"
 $UnenrollToken = "${token}"
+$ClaimUrl = "${claimUrl}"
 $ReportUrl = "${reportUrl}"
 $LogUrl = "${logUrl}"
 $ReportSent = $false
@@ -460,9 +859,16 @@ function Send-CleanupLog {
 try {
   $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
   if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw "Run PowerShell as Administrator." }
+  Invoke-RestMethod -Method Post -Uri $ClaimUrl -ContentType "application/json" -Body (@{ token = $UnenrollToken; platform = "windows" } | ConvertTo-Json) | Out-Null
+  Send-CleanupLog -Level "info" -Message "Unenrollment script claimed for windows"
   Send-CleanupLog -Level "info" -Message "Stopping and removing the cloudflared service for ${hostname}"
   $binary = Join-Path $env:ProgramFiles "cloudflared\\cloudflared.exe"
   if (Test-Path $binary) { & $binary service uninstall 2>&1 | ForEach-Object { Send-CleanupLog -Level "info" -Message $_.ToString() } }
+  Stop-ScheduledTask -TaskName "CloudflareManCommandAgent" -ErrorAction SilentlyContinue
+  Unregister-ScheduledTask -TaskName "CloudflareManCommandAgent" -Confirm:$false -ErrorAction SilentlyContinue
+  Get-CimInstance Win32_Process -Filter "Name = 'powershell.exe'" -ErrorAction SilentlyContinue |
+    Where-Object { $_.CommandLine -like "*cloudflare-man*command-agent.ps1*" } |
+    ForEach-Object { Invoke-CimMethod -InputObject $_ -MethodName Terminate -ErrorAction SilentlyContinue | Out-Null }
   $service = Get-Service -Name "cloudflared" -ErrorAction SilentlyContinue
   if ($service) {
     Stop-Service -Name "cloudflared" -Force -ErrorAction SilentlyContinue
@@ -470,7 +876,7 @@ try {
   }
   $stateDirectory = Join-Path $env:ProgramData "cloudflare-man"
   if (Test-Path $stateDirectory) { Remove-Item $stateDirectory -Recurse -Force }
-  $body = @{ token = $UnenrollToken; status = "unenrolled" } | ConvertTo-Json
+  $body = @{ token = $UnenrollToken; platform = "windows"; status = "unenrolled" } | ConvertTo-Json
   Invoke-RestMethod -Method Post -Uri $ReportUrl -ContentType "application/json" -Body $body | Out-Null
   $ReportSent = $true
   Write-Host "Cloudflare tunnel instance unenrolled successfully."
@@ -478,7 +884,7 @@ try {
   Send-CleanupLog -Level "error" -Message $_.Exception.Message
   if (-not $ReportSent) {
     try {
-      $body = @{ token = $UnenrollToken; status = "failed"; error = $_.Exception.Message } | ConvertTo-Json
+      $body = @{ token = $UnenrollToken; platform = "windows"; status = "failed"; error = $_.Exception.Message } | ConvertTo-Json
       Invoke-RestMethod -Method Post -Uri $ReportUrl -ContentType "application/json" -Body $body | Out-Null
     } catch { }
   }
@@ -491,26 +897,38 @@ export async function enrollmentRoutes(app: FastifyInstance): Promise<void> {
   app.get("/e/:token/install.sh", async (request, reply) => {
     const { token } = tokenParams.parse(request.params);
     const enrollment = await findEnrollment(token);
+    const script = enrollment ? await findEnrollmentScript(enrollment.id, "install", "unix") : null;
+    if (script?.status === "staled_ignored") {
+      return reply.code(410).type("text/plain").send("This unix installer is staled - ignored because the Windows installer already started.\n");
+    }
     if (!enrollment || !["url_issued", "failed"].includes(enrollment.status) || new Date(enrollment.expires_at) <= new Date()) {
       return reply.code(404).type("text/plain").send("Enrollment URL is invalid or expired.\n");
     }
     noStore(reply);
-    return reply.type("text/x-shellscript; charset=utf-8").send(shellScript(token, enrollment.hostname, await getPublicBaseUrl()));
+    return reply.type("text/x-shellscript; charset=utf-8").send(shellScript(token, enrollment.hostname, await getPublicBaseUrl(), await commandAgentToken(enrollment.store_id)));
   });
 
   app.get("/e/:token/install.ps1", async (request, reply) => {
     const { token } = tokenParams.parse(request.params);
     const enrollment = await findEnrollment(token);
+    const script = enrollment ? await findEnrollmentScript(enrollment.id, "install", "windows") : null;
+    if (script?.status === "staled_ignored") {
+      return reply.code(410).type("text/plain").send("This Windows installer is staled - ignored because the Unix installer already started.\n");
+    }
     if (!enrollment || !["url_issued", "failed"].includes(enrollment.status) || new Date(enrollment.expires_at) <= new Date()) {
       return reply.code(404).type("text/plain").send("Enrollment URL is invalid or expired.\n");
     }
     noStore(reply);
-    return reply.type("text/plain; charset=utf-8").send(powerShellScript(token, enrollment.hostname, await getPublicBaseUrl()));
+    return reply.type("text/plain; charset=utf-8").send(powerShellScript(token, enrollment.hostname, await getPublicBaseUrl(), await commandAgentToken(enrollment.store_id)));
   });
 
   app.get("/e/:token/unenroll.sh", async (request, reply) => {
     const { token } = tokenParams.parse(request.params);
     const enrollment = await findUnenrollment(token);
+    const script = enrollment ? await findEnrollmentScript(enrollment.id, "unenroll", "unix") : null;
+    if (script?.status === "staled_ignored") {
+      return reply.code(410).type("text/plain").send("This unix unenrollment script is staled - ignored because the Windows script already started.\n");
+    }
     if (!enrollment || enrollment.unenrolled_at || !enrollment.unenroll_token_expires_at || new Date(enrollment.unenroll_token_expires_at) <= new Date()) {
       return reply.code(404).type("text/plain").send("Unenrollment URL is invalid or expired.\n");
     }
@@ -521,6 +939,10 @@ export async function enrollmentRoutes(app: FastifyInstance): Promise<void> {
   app.get("/e/:token/unenroll.ps1", async (request, reply) => {
     const { token } = tokenParams.parse(request.params);
     const enrollment = await findUnenrollment(token);
+    const script = enrollment ? await findEnrollmentScript(enrollment.id, "unenroll", "windows") : null;
+    if (script?.status === "staled_ignored") {
+      return reply.code(410).type("text/plain").send("This Windows unenrollment script is staled - ignored because the Unix script already started.\n");
+    }
     if (!enrollment || enrollment.unenrolled_at || !enrollment.unenroll_token_expires_at || new Date(enrollment.unenroll_token_expires_at) <= new Date()) {
       return reply.code(404).type("text/plain").send("Unenrollment URL is invalid or expired.\n");
     }
@@ -536,13 +958,18 @@ export async function enrollmentRoutes(app: FastifyInstance): Promise<void> {
     const claimed = await pool.query(
       `UPDATE enrollments
           SET status = 'provisioning', claimed_at = now(), platform = $1, claimed_by = $2,
-              install_id = $3, updated_at = now()
+              install_id = $3,
+              host_info = host_info || jsonb_strip_nulls(jsonb_build_object(
+                'osName', $6::text, 'osVersion', $7::text, 'osBuild', $8::text,
+                'architecture', $9::text, 'machineName', $10::text
+              )),
+              updated_at = now()
         WHERE token_hash = $4
           AND status IN ('url_issued', 'failed', 'provisioning', 'ready')
           AND expires_at > now()
           AND (claimed_at IS NULL OR install_id = $3 OR $5 = true)
       RETURNING id, store_id`,
-      [body.platform, body.machineName ?? request.ip, body.installId ?? null, tokenHash, body.overrideExisting]
+      [body.platform, body.machineName ?? request.ip, body.installId ?? null, tokenHash, body.overrideExisting, body.osName ?? null, body.osVersion ?? null, body.osBuild ?? null, body.architecture ?? null, body.machineName ?? null]
     );
     let enrollment = claimed.rows[0];
     if (!enrollment) {
@@ -567,18 +994,37 @@ export async function enrollmentRoutes(app: FastifyInstance): Promise<void> {
       }
     }
 
+    const scriptPlatform = normalizeScriptPlatform(body.platform)!;
+    await pool.query(
+      `UPDATE enrollment_scripts
+          SET status = CASE WHEN platform = $1 THEN 'running' ELSE 'staled_ignored' END,
+              started_at = CASE WHEN platform = $1 THEN COALESCE(started_at, now()) ELSE started_at END,
+              finished_at = CASE WHEN platform = $1 THEN null ELSE finished_at END,
+              last_error = CASE WHEN platform = $1 THEN null ELSE last_error END,
+              updated_at = now()
+        WHERE enrollment_id = $2 AND script_kind = 'install'`,
+      [scriptPlatform, enrollment.id]
+    );
+
     try {
       const provisioned = await provisionStore(enrollment.store_id);
+      const agentToken = await commandAgentToken(enrollment.store_id);
       await pool.query("UPDATE enrollments SET status = 'ready', last_error = null, updated_at = now() WHERE id = $1", [enrollment.id]);
       if (request.headers.accept?.includes("text/plain")) {
         noStore(reply);
-        return reply.type("text/plain").send(provisioned.tunnelToken);
+        return reply.type("text/plain").send(`${provisioned.tunnelToken}\n${agentToken}`);
       }
       noStore(reply);
-      return provisioned;
+      return { ...provisioned, agentToken };
     } catch (error) {
       const message = error instanceof Error ? error.message : "Provisioning failed";
       await pool.query("UPDATE enrollments SET status = 'failed', last_error = $1, updated_at = now() WHERE id = $2", [message, enrollment.id]);
+      await pool.query(
+        `UPDATE enrollment_scripts
+            SET status = 'failed', finished_at = now(), last_error = $1, updated_at = now()
+          WHERE enrollment_id = $2 AND script_kind = 'install' AND platform = $3`,
+        [message, enrollment.id, scriptPlatform]
+      );
       return reply.code(502).send({ error: message });
     }
   });
@@ -625,6 +1071,39 @@ export async function enrollmentRoutes(app: FastifyInstance): Promise<void> {
     return reply.code(202).send({ accepted: body.events.length });
   });
 
+  app.post("/api/public/enrollments/unenroll/claim", {
+    config: { rateLimit: { max: 20, timeWindow: "1 minute" } }
+  }, async (request, reply) => {
+    const body = z.object({
+      token: z.string().min(30).max(200),
+      platform: z.enum(["windows", "unix"])
+    }).parse(request.body);
+    const result = await withTransaction(async (client) => {
+      const enrollmentResult = await client.query(
+        `SELECT id, unenrolled_at, unenroll_token_expires_at
+           FROM enrollments
+          WHERE unenroll_token_hash = $1
+          FOR UPDATE`,
+        [hashToken(body.token)]
+      );
+      const enrollment = enrollmentResult.rows[0];
+      if (!enrollment || enrollment.unenrolled_at || !enrollment.unenroll_token_expires_at || new Date(enrollment.unenroll_token_expires_at) <= new Date()) return null;
+      await client.query(
+        `UPDATE enrollment_scripts
+            SET status = CASE WHEN platform = $1 THEN 'running' ELSE 'staled_ignored' END,
+                started_at = CASE WHEN platform = $1 THEN COALESCE(started_at, now()) ELSE started_at END,
+                finished_at = CASE WHEN platform = $1 THEN null ELSE finished_at END,
+                last_error = CASE WHEN platform = $1 THEN null ELSE last_error END,
+                updated_at = now()
+          WHERE enrollment_id = $2 AND script_kind = 'unenroll'`,
+        [body.platform, enrollment.id]
+      );
+      return enrollment.id as string;
+    });
+    if (!result) return reply.code(409).send({ error: "Unenrollment URL is invalid, expired, or already completed" });
+    return { success: true, enrollmentId: result, platform: body.platform };
+  });
+
   app.post("/api/public/enrollments/unenroll/report", {
     config: { rateLimit: { max: 20, timeWindow: "1 minute" } }
   }, async (request, reply) => {
@@ -632,10 +1111,18 @@ export async function enrollmentRoutes(app: FastifyInstance): Promise<void> {
     const enrollment = await findUnenrollment(body.token);
     if (!enrollment) return reply.code(404).send({ error: "Unenrollment not found" });
     if (body.status === "failed") {
-      await pool.query(
-        `UPDATE enrollments SET unenroll_last_error = $1, updated_at = now() WHERE id = $2`,
-        [body.error ?? "Unenrollment failed", enrollment.id]
-      );
+      await withTransaction(async (client) => {
+        await client.query(
+          `UPDATE enrollments SET unenroll_last_error = $1, updated_at = now() WHERE id = $2`,
+          [body.error ?? "Unenrollment failed", enrollment.id]
+        );
+        await client.query(
+          `UPDATE enrollment_scripts
+              SET status = 'failed', finished_at = now(), last_error = $1, updated_at = now()
+            WHERE enrollment_id = $2 AND script_kind = 'unenroll' AND platform = $3`,
+          [body.error ?? "Unenrollment failed", enrollment.id, body.platform]
+        );
+      });
       return { success: false };
     }
     await withTransaction(async (client) => {
@@ -644,6 +1131,12 @@ export async function enrollmentRoutes(app: FastifyInstance): Promise<void> {
             SET unenrolled_at = COALESCE(unenrolled_at, now()), unenroll_last_error = null, updated_at = now()
           WHERE id = $1`,
         [enrollment.id]
+      );
+      await client.query(
+        `UPDATE enrollment_scripts
+            SET status = 'completed', finished_at = now(), last_error = null, updated_at = now()
+          WHERE enrollment_id = $1 AND script_kind = 'unenroll' AND platform = $2`,
+        [enrollment.id, body.platform]
       );
       await client.query(
         `UPDATE stores SET tunnel_status = 'inactive', updated_at = now()
@@ -668,6 +1161,10 @@ export async function enrollmentRoutes(app: FastifyInstance): Promise<void> {
     const enrollment = await findEnrollment(body.token);
     if (!enrollment || enrollment.status === "revoked") return reply.code(404).send({ error: "Enrollment not found" });
     const success = body.status === "installed";
+    const reportPlatform = body.platform ?? normalizeScriptPlatform(enrollment.platform);
+    if (body.platform && enrollment.platform && reportPlatform !== normalizeScriptPlatform(enrollment.platform)) {
+      return reply.code(409).send({ error: "The report platform does not match the claimed installer" });
+    }
     if (success && !["provisioning", "ready", "installed"].includes(enrollment.status)) {
       return reply.code(409).send({ error: "Enrollment has not been provisioned" });
     }
@@ -676,9 +1173,38 @@ export async function enrollmentRoutes(app: FastifyInstance): Promise<void> {
     await withTransaction(async (client) => {
       await client.query(
         `UPDATE enrollments SET status = $1, installed_at = CASE WHEN $2 THEN now() ELSE installed_at END,
-         last_error = $3, updated_at = now() WHERE id = $4`,
-        [success ? "installed" : retryablePreflightFailure ? "url_issued" : "failed", success, body.error ?? null, enrollment.id]
+         last_error = $3, host_info = host_info || $5::jsonb, updated_at = now() WHERE id = $4`,
+        [
+          success ? "installed" : retryablePreflightFailure ? "url_issued" : "failed",
+          success,
+          body.error ?? null,
+          enrollment.id,
+          JSON.stringify(Object.fromEntries(Object.entries({
+            osName: body.osName,
+            osVersion: body.osVersion,
+            osBuild: body.osBuild,
+            architecture: body.architecture,
+            machineName: body.machineName
+          }).filter(([, value]) => value !== undefined)))
+        ]
       );
+      if (reportPlatform) {
+        await client.query(
+          `UPDATE enrollment_scripts
+              SET status = $1, finished_at = now(), last_error = $2, updated_at = now()
+            WHERE enrollment_id = $3 AND script_kind = 'install' AND platform = $4`,
+          [success ? "completed" : "failed", body.error ?? null, enrollment.id, reportPlatform]
+        );
+      }
+      if (body.agentReady !== undefined || body.agentError) {
+        await client.query(
+          `UPDATE store_command_agents
+              SET status = $1, last_seen_at = CASE WHEN $2 THEN now() ELSE last_seen_at END,
+                  last_error = $3, updated_at = now()
+            WHERE store_id = $4`,
+          [body.agentReady ? "ready" : "failed", body.agentReady ?? false, body.agentError ?? null, enrollment.store_id]
+        );
+      }
       const provider = await client.query(
         `SELECT a.provider_mode FROM stores s JOIN cloudflare_accounts a ON a.id = s.account_id WHERE s.id = $1`,
         [enrollment.store_id]
