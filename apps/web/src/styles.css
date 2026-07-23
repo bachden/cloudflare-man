@@ -264,6 +264,26 @@ tbody tr:hover td { background: #fbfcfb; }
 .detail-status > div { display: flex; align-items: center; gap: 8px; }
 .detail-status div > span:first-child { color: var(--muted); font-size: 10px; }
 .detail-actions { display: flex; flex-wrap: wrap; gap: 8px; border-top: 1px solid var(--line); padding-top: 18px; }
+.enrollment-history { display: flex; flex-direction: column; border-top: 1px solid var(--line); padding-top: 2px; }
+.enrollment-history > header { min-height: 42px; display: flex; align-items: center; justify-content: space-between; }
+.enrollment-history > header h3 { font-size: 11px; }
+.enrollment-history > header span { color: var(--muted); font-size: 9px; }
+.enrollment-history-list { display: flex; flex-direction: column; border: 1px solid var(--line); border-radius: 5px; overflow: hidden; }
+.enrollment-history-row { min-height: 58px; padding: 9px 11px; display: grid; grid-template-columns: minmax(190px, 1fr) minmax(160px, .8fr) auto; align-items: center; gap: 12px; border-bottom: 1px solid var(--line); }
+.enrollment-history-row:last-child { border-bottom: 0; }
+.enrollment-history-date { min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+.enrollment-history-date strong { font-size: 10px; }
+.enrollment-history-date code { color: var(--muted); font-size: 8px; overflow: hidden; text-overflow: ellipsis; }
+.enrollment-history-row > div:nth-child(2) { display: flex; flex-wrap: wrap; align-items: center; gap: 5px; }
+.enrollment-history-meta { display: flex; align-items: center; justify-content: flex-end; gap: 8px; color: var(--muted); font-size: 9px; white-space: nowrap; }
+.enrollment-log-list { display: flex; flex-direction: column; gap: 8px; }
+.enrollment-log { padding: 11px 12px; border: 1px solid var(--line); border-left: 3px solid var(--line-strong); border-radius: 4px; background: #fbfcfb; }
+.enrollment-log-error { border-left-color: #c75a4e; }
+.enrollment-log-warn { border-left-color: #d6a14a; }
+.enrollment-log header { display: flex; align-items: center; gap: 8px; }
+.enrollment-log header strong { color: var(--ink); font-size: 9px; text-transform: uppercase; }
+.enrollment-log time { margin-left: auto; color: var(--muted); font-size: 8px; }
+.enrollment-log p { margin: 7px 0 0; color: #435047; font-size: 10px; line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; }
 .publication-summary { display: flex; flex-direction: column; border-top: 1px solid var(--line); }
 .publication-summary > header { min-height: 42px; display: flex; align-items: center; justify-content: space-between; }
 .publication-summary > header h3 { font-size: 11px; }
@@ -285,6 +305,10 @@ tbody tr:hover td { background: #fbfcfb; }
 .connectivity-scope span { color: var(--muted); font-size: 8px; font-weight: 800; text-transform: uppercase; }
 .connectivity-scope strong { font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .command-section { border: 1px solid #cad4cd; border-radius: 6px; overflow: hidden; }
+.enrollment-command-stack { display: flex; flex-direction: column; gap: 12px; }
+.unenroll-command-panel { display: flex; flex-direction: column; gap: 9px; padding: 11px; border: 1px solid #edcf9c; border-radius: 6px; background: #fffaf0; }
+.unenroll-command-panel > .command-note { margin: -11px -11px 1px; border: 0; }
+.unenroll-command-panel .command-head strong { color: #4f3b20; font-size: 9px; }
 .command-head { min-height: 50px; padding: 8px 10px; display: flex; align-items: center; justify-content: space-between; background: #f5f8f6; border-bottom: 1px solid var(--line); }
 .command-section pre { margin: 0; padding: 18px; overflow-x: auto; background: #18221d; color: #d9eee2; font-size: 11px; line-height: 1.65; white-space: pre-wrap; overflow-wrap: anywhere; }
 .command-note { min-height: 34px; padding: 8px 12px; display: flex; align-items: center; gap: 7px; color: #724614; background: var(--amber-soft); border-top: 1px solid #edcf9c; font-size: 10px; font-weight: 700; }

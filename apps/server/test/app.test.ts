@@ -391,3 +391,55 @@ test("installer report activates a mock store", async () => {
   assert.equal(retry.statusCode, 200, retry.body);
   assert.equal(retry.json().ready, true);
 });
+
+test("tracks enrollment history and issues cleanup for a running tunnel", async () => {
+  const response = await app.inject({
+    method: "POST",
+    url: `/api/stores/${storeId}/enrollments`,
+    headers: { cookie: sessionCookie },
+    payload: { expiresInHours: 24 }
+  });
+  assert.equal(response.statusCode, 201, response.body);
+  const issued = response.json();
+  assert.equal(issued.unenrollCommands.length, 1);
+  assert.equal(issued.unenrollCommands[0].enrollmentId, enrollmentId);
+  assert.match(issued.unenrollCommands[0].urls.shell, /\/unenroll\.sh$/);
+
+  const cleanupToken = issued.unenrollCommands[0].urls.shell.match(/\/e\/([^/]+)\/unenroll\.sh$/)?.[1];
+  assert.ok(cleanupToken);
+  const cleanupScript = await app.inject({ method: "GET", url: `/e/${cleanupToken}/unenroll.sh` });
+  assert.equal(cleanupScript.statusCode, 200, cleanupScript.body);
+  assert.match(cleanupScript.body, /cloudflared service uninstall/);
+  const cleanupPowerShell = await app.inject({ method: "GET", url: `/e/${cleanupToken}/unenroll.ps1` });
+  assert.equal(cleanupPowerShell.statusCode, 200, cleanupPowerShell.body);
+  assert.match(cleanupPowerShell.body, /Run PowerShell as Administrator/);
+
+  const detail = await app.inject({ method: "GET", url: `/api/stores/${storeId}`, headers: { cookie: sessionCookie } });
+  assert.equal(detail.statusCode, 200, detail.body);
+  assert.equal(detail.json().store.enrollments.length, 2);
+  assert.equal(detail.json().store.enrollments[1].unenrollStatus, "pending");
+
+  const cleanupLog = await app.inject({
+    method: "POST",
+    url: "/api/public/enrollments/unenroll/logs",
+    payload: { token: cleanupToken, events: [{ level: "info", step: "cleanup", message: "Service removed" }] }
+  });
+  assert.equal(cleanupLog.statusCode, 202, cleanupLog.body);
+  const cleanupReport = await app.inject({
+    method: "POST",
+    url: "/api/public/enrollments/unenroll/report",
+    payload: { token: cleanupToken, status: "unenrolled" }
+  });
+  assert.equal(cleanupReport.statusCode, 200, cleanupReport.body);
+  const oldEnrollment = await pool.query("SELECT unenrolled_at, unenroll_last_error FROM enrollments WHERE id = $1", [enrollmentId]);
+  assert.ok(oldEnrollment.rows[0].unenrolled_at);
+  assert.equal(oldEnrollment.rows[0].unenroll_last_error, null);
+
+  const logs = await app.inject({
+    method: "GET",
+    url: `/api/stores/${storeId}/enrollments/${enrollmentId}/logs`,
+    headers: { cookie: sessionCookie }
+  });
+  assert.equal(logs.statusCode, 200, logs.body);
+  assert.equal(logs.json().logs.length, 3);
+});

@@ -87,6 +87,14 @@ async function enrollmentUrls(token: string) {
   };
 }
 
+async function unenrollmentUrls(token: string) {
+  const publicBaseUrl = await getPublicBaseUrl();
+  return {
+    shell: `${publicBaseUrl}/e/${token}/unenroll.sh`,
+    powershell: `${publicBaseUrl}/e/${token}/unenroll.ps1`
+  };
+}
+
 const publicationsJson = `COALESCE((
   SELECT jsonb_agg(jsonb_build_object(
     'id', p.id,
@@ -104,6 +112,28 @@ const publicationsJson = `COALESCE((
     ), '[]'::jsonb)
   ) ORDER BY p.created_at)
   FROM store_publications p WHERE p.store_id = s.id
+), '[]'::jsonb)`;
+
+const enrollmentsJson = `COALESCE((
+  SELECT jsonb_agg(jsonb_build_object(
+    'id', e.id,
+    'status', e.status,
+    'createdAt', e.created_at,
+    'expiresAt', e.expires_at,
+    'claimedAt', e.claimed_at,
+    'installedAt', e.installed_at,
+    'lastError', e.last_error,
+    'unenrollStatus', CASE
+      WHEN e.unenrolled_at IS NOT NULL THEN 'unenrolled'
+      WHEN e.unenroll_last_error IS NOT NULL THEN 'failed'
+      WHEN e.unenroll_token_hash IS NOT NULL THEN 'pending'
+      ELSE 'not_required'
+    END,
+    'unenrollRequestedAt', e.unenroll_requested_at,
+    'unenrolledAt', e.unenrolled_at,
+    'logCount', (SELECT count(*)::int FROM enrollment_logs l WHERE l.enrollment_id = e.id)
+  ) ORDER BY e.created_at DESC)
+  FROM enrollments e WHERE e.store_id = s.id
 ), '[]'::jsonb)`;
 
 function preparePublications(
@@ -168,12 +198,15 @@ export async function storeRoutes(app: FastifyInstance): Promise<void> {
   app.get("/api/stores/:id", { preHandler: requireAuth }, async (request, reply) => {
     const { id } = z.object({ id: z.string().uuid() }).parse(request.params);
     const result = await pool.query(`
-      SELECT s.*, a.name AS account_name, a.provider_mode, z.name AS zone_name,
+      SELECT s.id, s.tenant_code AS "tenantCode", s.store_code AS "storeCode", s.display_name AS "displayName",
+             s.origin_url AS "originUrl", s.hostname, s.tunnel_id AS "tunnelId", s.tunnel_name AS "tunnelName",
+             s.tunnel_status AS "tunnelStatus", s.onboarding_status AS "onboardingStatus",
+             s.rdp_status AS "rdpStatus", s.rdp_target_ip::text AS "rdpTargetIp",
+             s.rdp_url AS "rdpUrl", s.rdp_last_error AS "rdpLastError",
+             s.last_connected_at AS "lastConnectedAt", s.last_verified_at AS "lastVerifiedAt", s.last_error AS "lastError",
+             s.created_at AS "createdAt", a.id AS "accountId", a.name AS "accountName", z.id AS "zoneId", z.name AS "zoneName",
              ${publicationsJson} AS publications,
-             (SELECT jsonb_build_object(
-                'id', e.id, 'status', e.status, 'expiresAt', e.expires_at,
-                'claimedAt', e.claimed_at, 'installedAt', e.installed_at, 'lastError', e.last_error
-              ) FROM enrollments e WHERE e.store_id = s.id ORDER BY e.created_at DESC LIMIT 1) AS enrollment
+             ${enrollmentsJson} AS enrollments
         FROM stores s
         JOIN cloudflare_accounts a ON a.id = s.account_id
         JOIN zones z ON z.id = s.zone_id
@@ -181,6 +214,24 @@ export async function storeRoutes(app: FastifyInstance): Promise<void> {
     `, [id]);
     if (!result.rowCount) return reply.code(404).send({ error: "Store not found" });
     return { store: result.rows[0] };
+  });
+
+  app.get("/api/stores/:storeId/enrollments/:enrollmentId/logs", { preHandler: requireAuth }, async (request, reply) => {
+    const { storeId, enrollmentId } = z.object({
+      storeId: z.string().uuid(),
+      enrollmentId: z.string().uuid()
+    }).parse(request.params);
+    const result = await pool.query(
+      `SELECT l.id, l.level, l.step, l.message, l.metadata, l.created_at AS "createdAt"
+         FROM enrollment_logs l
+         JOIN enrollments e ON e.id = l.enrollment_id
+        WHERE e.store_id = $1 AND e.id = $2
+        ORDER BY l.created_at ASC, l.id ASC`,
+      [storeId, enrollmentId]
+    );
+    const enrollment = await pool.query("SELECT 1 FROM enrollments WHERE id = $1 AND store_id = $2", [enrollmentId, storeId]);
+    if (!enrollment.rowCount) return reply.code(404).send({ error: "Enrollment not found" });
+    return { logs: result.rows };
   });
 
   app.post("/api/stores", { preHandler: requireAuth }, async (request, reply) => {
@@ -324,9 +375,33 @@ export async function storeRoutes(app: FastifyInstance): Promise<void> {
     const body = enrollmentSchema.parse(request.body ?? {});
     const rawToken = createOpaqueToken();
     const expiresAt = new Date(Date.now() + body.expiresInHours * 60 * 60 * 1000);
-    const enrollment = await withTransaction(async (client) => {
-      const store = await client.query("SELECT id FROM stores WHERE id = $1 FOR UPDATE", [id]);
+    const issued = await withTransaction(async (client) => {
+      const store = await client.query("SELECT id, tunnel_status FROM stores WHERE id = $1 FOR UPDATE", [id]);
       if (!store.rowCount) throw new Error("Store not found");
+      const previous: Array<{ enrollmentId: string; createdAt: string; expiresAt: Date; rawToken: string }> = [];
+      if (["healthy", "degraded", "connector_online"].includes(store.rows[0].tunnel_status)) {
+        const active = await client.query(
+          `SELECT id, created_at
+             FROM enrollments
+            WHERE store_id = $1
+              AND status IN ('claimed', 'provisioning', 'ready', 'installed')
+              AND unenrolled_at IS NULL
+            ORDER BY created_at DESC`,
+          [id]
+        );
+        for (const row of active.rows) {
+          const cleanupToken = createOpaqueToken();
+          await client.query(
+            `UPDATE enrollments
+                SET unenroll_token_hash = $1, unenroll_token_expires_at = $2,
+                    unenroll_requested_at = now(), unenrolled_at = null,
+                    unenroll_last_error = null, updated_at = now()
+              WHERE id = $3`,
+            [hashToken(cleanupToken), expiresAt, row.id]
+          );
+          previous.push({ enrollmentId: row.id, createdAt: row.created_at, expiresAt, rawToken: cleanupToken });
+        }
+      }
       await client.query(
         "UPDATE enrollments SET status = 'revoked', updated_at = now() WHERE store_id = $1 AND status IN ('url_issued', 'claimed', 'failed')",
         [id]
@@ -345,11 +420,25 @@ export async function storeRoutes(app: FastifyInstance): Promise<void> {
         action: "enrollment.issued",
         entityType: "store",
         entityId: id,
-        details: { enrollmentId: result.rows[0].id, expiresAt }
+        details: {
+          enrollmentId: result.rows[0].id,
+          expiresAt,
+          unenrollEnrollmentIds: previous.map((item) => item.enrollmentId)
+        }
       }, client);
-      return result.rows[0].id as string;
+      return { id: result.rows[0].id as string, previous };
     });
-    return reply.code(201).send({ id: enrollment, expiresAt, urls: await enrollmentUrls(rawToken) });
+    return reply.code(201).send({
+      id: issued.id,
+      expiresAt,
+      urls: await enrollmentUrls(rawToken),
+      unenrollCommands: await Promise.all(issued.previous.map(async (item) => ({
+        enrollmentId: item.enrollmentId,
+        createdAt: item.createdAt,
+        expiresAt: item.expiresAt,
+        urls: await unenrollmentUrls(item.rawToken)
+      })))
+    });
   });
 
   app.post("/api/stores/:id/enrollments/revoke", { preHandler: requireAuth }, async (request, reply) => {

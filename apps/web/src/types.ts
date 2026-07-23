@@ -73,6 +73,21 @@ export type Store = {
   rdpUrl: string | null;
   rdpLastError: string | null;
   publications: StorePublication[];
+  enrollments?: StoreEnrollment[];
+};
+
+export type StoreEnrollment = {
+  id: string;
+  status: string;
+  createdAt: string;
+  expiresAt: string;
+  claimedAt: string | null;
+  installedAt: string | null;
+  lastError: string | null;
+  unenrollStatus: "not_required" | "pending" | "unenrolled" | "failed";
+  unenrollRequestedAt: string | null;
+  unenrolledAt: string | null;
+  logCount: number;
 };
 
 export type EnrollmentResult = {
@@ -82,4 +97,13 @@ export type EnrollmentResult = {
     shell: string;
     powershell: string;
   };
+  unenrollCommands?: Array<{
+    enrollmentId: string;
+    createdAt: string;
+    expiresAt: string;
+    urls: {
+      shell: string;
+      powershell: string;
+    };
+  }>;
 };

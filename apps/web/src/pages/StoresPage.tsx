@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { CheckCircle2, ChevronLeft, ChevronRight, Copy, ExternalLink, MonitorUp, MoreHorizontal, Plus, RefreshCw, Search, Settings2, ShieldAlert, TerminalSquare } from "lucide-react";
+import { CheckCircle2, ChevronLeft, ChevronRight, Copy, ExternalLink, MonitorUp, MoreHorizontal, Plus, RefreshCw, ScrollText, Search, Settings2, ShieldAlert, TerminalSquare } from "lucide-react";
 import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { toast } from "sonner";
@@ -9,7 +9,7 @@ import { CopyButton } from "../components/CopyButton";
 import { Modal } from "../components/Modal";
 import { PageHeader } from "../components/PageHeader";
 import { StatusBadge } from "../components/StatusBadge";
-import type { AppSettings, EnrollmentResult, Store } from "../types";
+import type { AppSettings, EnrollmentResult, Store, StoreEnrollment } from "../types";
 
 type StoreListResponse = {
   stores: Store[];
@@ -78,9 +78,21 @@ export function StoresPage() {
 function StoreModal({ store, onClose, onEditConnectivity }: { store: Store | null; onClose: () => void; onEditConnectivity: (store: Store) => void }) {
   const queryClient = useQueryClient();
   const [enrollment, setEnrollment] = useState<EnrollmentResult | null>(null);
+  const [logEnrollment, setLogEnrollment] = useState<StoreEnrollment | null>(null);
+  const { data: detailData } = useQuery({
+    queryKey: ["store-detail", store?.id],
+    queryFn: () => api.get<{ store: Store }>(`/api/stores/${store!.id}`),
+    enabled: Boolean(store)
+  });
+  const currentStore = detailData?.store ?? store;
+  const { data: logData, isLoading: logsLoading } = useQuery({
+    queryKey: ["enrollment-logs", store?.id, logEnrollment?.id],
+    queryFn: () => api.get<{ logs: Array<{ id: number; level: string; step: string | null; message: string; metadata: Record<string, unknown>; createdAt: string }> }>(`/api/stores/${store!.id}/enrollments/${logEnrollment!.id}/logs`),
+    enabled: Boolean(store && logEnrollment)
+  });
   const mutation = useMutation({
     mutationFn: () => api.post<EnrollmentResult>(`/api/stores/${store!.id}/enrollments`, { expiresInHours: 24 }),
-    onSuccess: async (result) => { setEnrollment(result); toast.success("Enrollment URL issued"); await queryClient.invalidateQueries({ queryKey: ["stores"] }); },
+    onSuccess: async (result) => { setEnrollment(result); toast.success("Enrollment URL issued"); await queryClient.invalidateQueries({ queryKey: ["stores"] }); await queryClient.invalidateQueries({ queryKey: ["store-detail", store?.id] }); },
     onError: (error) => toast.error(error instanceof Error ? error.message : "Unable to issue enrollment")
   });
   const verify = useMutation({
@@ -98,40 +110,50 @@ function StoreModal({ store, onClose, onEditConnectivity }: { store: Store | nul
     onSuccess: async () => { await queryClient.invalidateQueries({ queryKey: ["stores"] }); toast.success("Browser RDP provisioned"); },
     onError: (error) => toast.error(error instanceof Error ? error.message : "RDP provisioning failed")
   });
-  const close = () => { setEnrollment(null); onClose(); };
-  const canRevoke = ["url_issued", "claimed", "provisioning", "failed"].includes(store?.onboardingStatus ?? "");
+  const close = () => { setEnrollment(null); setLogEnrollment(null); onClose(); };
+  const canRevoke = ["url_issued", "claimed", "provisioning", "failed"].includes(currentStore?.onboardingStatus ?? "");
   return (
-    <Modal open={Boolean(store)} title={store?.displayName ?? "Store details"} onClose={close} width="wide">
-      {store && <div className="detail-layout">
+    <>
+    <Modal open={Boolean(store)} title={currentStore?.displayName ?? "Store details"} onClose={close} width="wide">
+      {currentStore && <div className="detail-layout">
         <dl className="detail-list">
-          <div><dt>Store code</dt><dd>{store.tenantCode} / {store.storeCode}</dd></div>
-          <div><dt>Hostname</dt><dd className="mono">{store.hostname}</dd></div>
-          <div><dt>Origin</dt><dd className="mono">{store.originUrl}</dd></div>
-          <div><dt>Account</dt><dd>{store.accountName}</dd></div>
-          <div><dt>Zone</dt><dd>{store.zoneName}</dd></div>
-          <div><dt>Tunnel ID</dt><dd className="mono">{store.tunnelId ?? "Not provisioned"}</dd></div>
-          <div><dt>RDP target</dt><dd className="mono">{store.rdpTargetIp ? `${store.rdpTargetIp}:3389` : "Awaiting Windows installer"}</dd></div>
-          <div><dt>RDP gateway</dt><dd className="mono">{store.rdpUrl ? new URL(store.rdpUrl).hostname : "Not provisioned"}</dd></div>
+          <div><dt>Store code</dt><dd>{currentStore.tenantCode} / {currentStore.storeCode}</dd></div>
+          <div><dt>Hostname</dt><dd className="mono">{currentStore.hostname}</dd></div>
+          <div><dt>Origin</dt><dd className="mono">{currentStore.originUrl}</dd></div>
+          <div><dt>Account</dt><dd>{currentStore.accountName}</dd></div>
+          <div><dt>Zone</dt><dd>{currentStore.zoneName}</dd></div>
+          <div><dt>Tunnel ID</dt><dd className="mono">{currentStore.tunnelId ?? "Not provisioned"}</dd></div>
+          <div><dt>RDP target</dt><dd className="mono">{currentStore.rdpTargetIp ? `${currentStore.rdpTargetIp}:3389` : "Awaiting Windows installer"}</dd></div>
+          <div><dt>RDP gateway</dt><dd className="mono">{currentStore.rdpUrl ? new URL(currentStore.rdpUrl).hostname : "Not provisioned"}</dd></div>
         </dl>
         <div className="detail-status">
-          <div><span>Onboarding</span><StatusBadge status={store.onboardingStatus} /></div>
-          <div><span>Tunnel</span><StatusBadge status={store.tunnelStatus} /></div>
-          <div><span>RDP</span><StatusBadge status={store.rdpStatus} /></div>
+          <div><span>Onboarding</span><StatusBadge status={currentStore.onboardingStatus} /></div>
+          <div><span>Tunnel</span><StatusBadge status={currentStore.tunnelStatus} /></div>
+          <div><span>RDP</span><StatusBadge status={currentStore.rdpStatus} /></div>
         </div>
-        <section className="publication-summary"><header><h3>Published endpoints</h3><span>{store.publications.length} hostname{store.publications.length === 1 ? "" : "s"}</span></header>{store.publications.map((publication) => <div className="publication-summary-item" key={publication.id}><div><code>{publication.hostname}</code><StatusBadge status={publication.status} />{store.tunnelStatus === "healthy" && <a className="copy-icon" href={`https://${publication.hostname}`} target="_blank" rel="noreferrer" title="Open endpoint"><ExternalLink size={14} /></a>}</div>{publication.routes.map((route) => <div className="publication-route" key={route.id}><code>{route.path}</code><span>→</span><code>{route.serviceUrl}</code></div>)}</div>)}</section>
-        {store.rdpLastError && <div className="inline-alert">{store.rdpLastError}</div>}
+        <section className="publication-summary"><header><h3>Published endpoints</h3><span>{currentStore.publications.length} hostname{currentStore.publications.length === 1 ? "" : "s"}</span></header>{currentStore.publications.map((publication) => <div className="publication-summary-item" key={publication.id}><div><code>{publication.hostname}</code><StatusBadge status={publication.status} />{currentStore.tunnelStatus === "healthy" && <a className="copy-icon" href={`https://${publication.hostname}`} target="_blank" rel="noreferrer" title="Open endpoint"><ExternalLink size={14} /></a>}</div>{publication.routes.map((route) => <div className="publication-route" key={route.id}><code>{route.path}</code><span>→</span><code>{route.serviceUrl}</code></div>)}</div>)}</section>
+        {currentStore.rdpLastError && <div className="inline-alert">{currentStore.rdpLastError}</div>}
+        <EnrollmentHistory enrollments={currentStore.enrollments ?? []} onViewLog={setLogEnrollment} />
         {enrollment ? <EnrollmentCommands result={enrollment} /> : <div className="detail-actions">
-          <button className="button button-secondary" onClick={() => onEditConnectivity(store)}><Settings2 size={15} />Edit connectivity</button>
+          <button className="button button-secondary" onClick={() => onEditConnectivity(currentStore)}><Settings2 size={15} />Edit connectivity</button>
           <button className="button button-primary" onClick={() => mutation.mutate()} disabled={mutation.isPending}><TerminalSquare size={16} />{mutation.isPending ? "Issuing..." : "Issue install URL"}</button>
-          {store.rdpStatus === "ready" && store.rdpUrl && <a className="button button-primary" href={store.rdpUrl} target="_blank" rel="noreferrer"><MonitorUp size={16} />Remote desktop</a>}
-          {store.rdpTargetIp && store.rdpStatus !== "ready" && <button className="button button-secondary" onClick={() => retryRdp.mutate()} disabled={retryRdp.isPending}><RefreshCw size={15} />{retryRdp.isPending ? "Retrying..." : "Retry RDP"}</button>}
+          {currentStore.rdpStatus === "ready" && currentStore.rdpUrl && <a className="button button-primary" href={currentStore.rdpUrl} target="_blank" rel="noreferrer"><MonitorUp size={16} />Remote desktop</a>}
+          {currentStore.rdpTargetIp && currentStore.rdpStatus !== "ready" && <button className="button button-secondary" onClick={() => retryRdp.mutate()} disabled={retryRdp.isPending}><RefreshCw size={15} />{retryRdp.isPending ? "Retrying..." : "Retry RDP"}</button>}
           <button className="button button-secondary" onClick={() => verify.mutate()} disabled={verify.isPending}><CheckCircle2 size={15} />{verify.isPending ? "Checking..." : "Verify endpoint"}</button>
           {canRevoke && <button className="button button-danger" onClick={() => { if (window.confirm("Revoke this enrollment URL?")) revoke.mutate(); }} disabled={revoke.isPending}><ShieldAlert size={15} />Revoke</button>}
-          {store.tunnelStatus === "healthy" && <a className="button button-secondary" href={`https://${store.hostname}`} target="_blank" rel="noreferrer"><ExternalLink size={15} />Open endpoint</a>}
+          {currentStore.tunnelStatus === "healthy" && <a className="button button-secondary" href={`https://${currentStore.hostname}`} target="_blank" rel="noreferrer"><ExternalLink size={15} />Open endpoint</a>}
         </div>}
       </div>}
     </Modal>
+    <Modal open={Boolean(logEnrollment)} title={`Enrollment log · ${logEnrollment ? new Date(logEnrollment.createdAt).toLocaleString() : ""}`} onClose={() => setLogEnrollment(null)} width="wide">
+      {logsLoading ? <div className="quiet-empty">Loading logs...</div> : logData?.logs.length ? <div className="enrollment-log-list">{logData.logs.map((log) => <article key={log.id} className={`enrollment-log enrollment-log-${log.level}`}><header><StatusBadge status={log.level} /><strong>{log.step ?? "installer"}</strong><time>{new Date(log.createdAt).toLocaleString()}</time></header><p>{log.message}</p></article>)}</div> : <div className="quiet-empty">No logs have been reported for this enrollment.</div>}
+    </Modal>
+    </>
   );
+}
+
+function EnrollmentHistory({ enrollments, onViewLog }: { enrollments: StoreEnrollment[]; onViewLog: (enrollment: StoreEnrollment) => void }) {
+  return <section className="enrollment-history"><header><h3>Enrollment history</h3><span>{enrollments.length} attempt{enrollments.length === 1 ? "" : "s"}</span></header>{enrollments.length ? <div className="enrollment-history-list">{enrollments.map((enrollment) => <div className="enrollment-history-row" key={enrollment.id}><div className="enrollment-history-date"><strong>{new Date(enrollment.createdAt).toLocaleString()}</strong><code>{enrollment.id}</code></div><div><StatusBadge status={enrollment.status} />{enrollment.unenrollStatus !== "not_required" && <StatusBadge status={`unenroll_${enrollment.unenrollStatus}`} />}</div><div className="enrollment-history-meta"><span>{enrollment.logCount} log{enrollment.logCount === 1 ? "" : "s"}</span><button className="icon-button" title="View log" aria-label="View enrollment log" onClick={() => onViewLog(enrollment)}><ScrollText size={15} /></button></div></div>)}</div> : <div className="quiet-empty">No enrollment links have been issued for this store.</div>}</section>;
 }
 
 function EditConnectivityModal({ store, onClose }: { store: Store | null; onClose: () => void }) {
@@ -190,5 +212,14 @@ export function EnrollmentCommands({ result }: { result: EnrollmentResult }) {
   const powershellUrl = withCurrentBaseUrl(result.urls.powershell);
   const shellUrl = withCurrentBaseUrl(result.urls.shell);
   const command = platform === "windows" ? `irm '${powershellUrl}' | iex` : `curl -fsSL '${shellUrl}' | sudo bash`;
-  return <div className="command-section"><div className="command-head"><div className="segmented compact"><button type="button" className={platform === "windows" ? "active" : ""} onClick={() => setPlatform("windows")}>PowerShell</button><button type="button" className={platform === "unix" ? "active" : ""} onClick={() => setPlatform("unix")}>Bash</button></div><CopyButton value={command} label="Copy command" /></div><pre><code>{command}</code></pre>{platform === "windows" && <div className="command-note"><ShieldAlert size={14} />Run PowerShell as Administrator.</div>}<div className="expiry-line">Expires {new Date(result.expiresAt).toLocaleString()}</div></div>;
+  const cleanupCommands = result.unenrollCommands ?? [];
+  const commandFor = (urls: { shell: string; powershell: string }) => {
+    const powershell = withCurrentBaseUrl(urls.powershell);
+    const shell = withCurrentBaseUrl(urls.shell);
+    return platform === "windows" ? `irm '${powershell}' | iex` : `curl -fsSL '${shell}' | sudo bash`;
+  };
+  return <div className="enrollment-command-stack">
+    {cleanupCommands.length > 0 && <div className="unenroll-command-panel"><div className="command-note"><ShieldAlert size={14} />A running tunnel instance was found. Run the cleanup command on the old store machine before installing this new link.</div>{cleanupCommands.map((cleanup) => { const cleanupCommand = commandFor(cleanup.urls); return <div className="command-section" key={cleanup.enrollmentId}><div className="command-head"><strong>Unenroll instance created {new Date(cleanup.createdAt).toLocaleString()}</strong><CopyButton value={cleanupCommand} label="Copy cleanup command" /></div><pre><code>{cleanupCommand}</code></pre>{platform === "windows" && <div className="command-note"><ShieldAlert size={14} />Run PowerShell as Administrator.</div>}<div className="expiry-line">Cleanup link expires {new Date(cleanup.expiresAt).toLocaleString()}</div></div>; })}</div>}
+    <div className="command-section"><div className="command-head"><div className="segmented compact"><button type="button" className={platform === "windows" ? "active" : ""} onClick={() => setPlatform("windows")}>PowerShell</button><button type="button" className={platform === "unix" ? "active" : ""} onClick={() => setPlatform("unix")}>Bash</button></div><CopyButton value={command} label="Copy command" /></div><pre><code>{command}</code></pre>{platform === "windows" && <div className="command-note"><ShieldAlert size={14} />Run PowerShell as Administrator.</div>}<div className="expiry-line">Expires {new Date(result.expiresAt).toLocaleString()}</div></div>
+  </div>;
 }

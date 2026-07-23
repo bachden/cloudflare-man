@@ -38,12 +38,27 @@ const logSchema = z.object({
     metadata: z.record(z.string(), z.unknown()).optional()
   }).refine((event) => event.message || event.messageBase64, "A log message is required")).min(1).max(50)
 });
+const unenrollReportSchema = z.object({
+  token: z.string().min(30).max(200),
+  status: z.enum(["unenrolled", "failed"]),
+  error: z.string().max(2000).optional()
+});
 
 async function findEnrollment(token: string) {
   const result = await pool.query(
     `SELECT e.id, e.store_id, e.status, e.expires_at, e.install_id, e.claimed_at, e.claimed_by, e.platform, s.hostname
        FROM enrollments e JOIN stores s ON s.id = e.store_id
       WHERE e.token_hash = $1`,
+    [hashToken(token)]
+  );
+  return result.rows[0];
+}
+
+async function findUnenrollment(token: string) {
+  const result = await pool.query(
+    `SELECT e.id, e.store_id, e.status, e.unenroll_token_expires_at, e.unenrolled_at, s.hostname
+       FROM enrollments e JOIN stores s ON s.id = e.store_id
+      WHERE e.unenroll_token_hash = $1`,
     [hashToken(token)]
   );
   return result.rows[0];
@@ -378,6 +393,100 @@ Write-Host "Store tunnel installed: $AssignedHostname"
 `;
 }
 
+function shellUnenrollScript(token: string, hostname: string, publicBaseUrl: string): string {
+  const reportUrl = `${publicBaseUrl}/api/public/enrollments/unenroll/report`;
+  const logUrl = `${publicBaseUrl}/api/public/enrollments/unenroll/logs`;
+  return `#!/usr/bin/env bash
+set -euo pipefail
+
+UNENROLL_TOKEN='${token}'
+REPORT_URL='${reportUrl}'
+LOG_URL='${logUrl}'
+REPORT_SENT=0
+
+send_log() {
+  level="$1"
+  message="$(printf '%s' "$3" | cut -c1-3500)"
+  encoded_message="$(printf '%s' "$message" | base64 | tr -d '\\r\\n')"
+  curl --silent --show-error --fail --max-time 10 -X POST "$LOG_URL" -H 'Content-Type: application/json' --data "{\\"token\\":\\"$UNENROLL_TOKEN\\",\\"events\\":[{\\"level\\":\\"$level\\",\\"step\\":\\"cleanup\\",\\"messageBase64\\":\\"$encoded_message\\"}]}" >/dev/null 2>&1 || true
+}
+
+report_failure() {
+  exit_code=$?
+  if [ "$exit_code" -ne 0 ] && [ "$REPORT_SENT" -eq 0 ]; then
+    curl --silent --show-error --fail --retry 2 --retry-all-errors -X POST "$REPORT_URL" \\
+      -H 'Content-Type: application/json' \\
+      --data "{\\"token\\":\\"$UNENROLL_TOKEN\\",\\"status\\":\\"failed\\",\\"error\\":\\"cleanup exited with code $exit_code\\"}" >/dev/null || true
+  fi
+  exit "$exit_code"
+}
+trap report_failure EXIT
+echo "Unenrolling cloudflare-man instance for ${hostname}"
+if [ "$(id -u)" -ne 0 ]; then
+  echo "Run this command as root (sudo)." >&2
+  exit 1
+fi
+send_log "info" "cleanup" "Stopping and removing the cloudflared service"
+if command -v cloudflared >/dev/null 2>&1; then
+  cloudflared service uninstall >/dev/null 2>&1 || true
+fi
+rm -rf "/var/lib/cloudflare-man" "/Library/Application Support/cloudflare-man"
+curl --silent --show-error --fail --retry 3 --retry-all-errors -X POST "$REPORT_URL" \\
+  -H 'Content-Type: application/json' \\
+  --data "{\\"token\\":\\"$UNENROLL_TOKEN\\",\\"status\\":\\"unenrolled\\"}" >/dev/null
+REPORT_SENT=1
+echo "Cloudflare tunnel instance unenrolled successfully."
+`;
+}
+
+function powerShellUnenrollScript(token: string, hostname: string, publicBaseUrl: string): string {
+  const reportUrl = `${publicBaseUrl}/api/public/enrollments/unenroll/report`;
+  const logUrl = `${publicBaseUrl}/api/public/enrollments/unenroll/logs`;
+  return `$ErrorActionPreference = "Stop"
+$UnenrollToken = "${token}"
+$ReportUrl = "${reportUrl}"
+$LogUrl = "${logUrl}"
+$ReportSent = $false
+
+function Send-CleanupLog {
+  param([string]$Level, [string]$Message)
+  Write-Host "[cleanup] $Message"
+  try {
+    $body = @{ token = $UnenrollToken; events = @(@{ level = $Level; step = "cleanup"; message = $Message }) } | ConvertTo-Json -Depth 5
+    Invoke-RestMethod -Method Post -Uri $LogUrl -ContentType "application/json" -Body $body -TimeoutSec 10 | Out-Null
+  } catch { }
+}
+
+try {
+  $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
+  if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw "Run PowerShell as Administrator." }
+  Send-CleanupLog -Level "info" -Message "Stopping and removing the cloudflared service for ${hostname}"
+  $binary = Join-Path $env:ProgramFiles "cloudflared\\cloudflared.exe"
+  if (Test-Path $binary) { & $binary service uninstall 2>&1 | ForEach-Object { Send-CleanupLog -Level "info" -Message $_.ToString() } }
+  $service = Get-Service -Name "cloudflared" -ErrorAction SilentlyContinue
+  if ($service) {
+    Stop-Service -Name "cloudflared" -Force -ErrorAction SilentlyContinue
+    & sc.exe delete cloudflared | Out-Null
+  }
+  $stateDirectory = Join-Path $env:ProgramData "cloudflare-man"
+  if (Test-Path $stateDirectory) { Remove-Item $stateDirectory -Recurse -Force }
+  $body = @{ token = $UnenrollToken; status = "unenrolled" } | ConvertTo-Json
+  Invoke-RestMethod -Method Post -Uri $ReportUrl -ContentType "application/json" -Body $body | Out-Null
+  $ReportSent = $true
+  Write-Host "Cloudflare tunnel instance unenrolled successfully."
+} catch {
+  Send-CleanupLog -Level "error" -Message $_.Exception.Message
+  if (-not $ReportSent) {
+    try {
+      $body = @{ token = $UnenrollToken; status = "failed"; error = $_.Exception.Message } | ConvertTo-Json
+      Invoke-RestMethod -Method Post -Uri $ReportUrl -ContentType "application/json" -Body $body | Out-Null
+    } catch { }
+  }
+  throw
+}
+`;
+}
+
 export async function enrollmentRoutes(app: FastifyInstance): Promise<void> {
   app.get("/e/:token/install.sh", async (request, reply) => {
     const { token } = tokenParams.parse(request.params);
@@ -397,6 +506,26 @@ export async function enrollmentRoutes(app: FastifyInstance): Promise<void> {
     }
     noStore(reply);
     return reply.type("text/plain; charset=utf-8").send(powerShellScript(token, enrollment.hostname, await getPublicBaseUrl()));
+  });
+
+  app.get("/e/:token/unenroll.sh", async (request, reply) => {
+    const { token } = tokenParams.parse(request.params);
+    const enrollment = await findUnenrollment(token);
+    if (!enrollment || enrollment.unenrolled_at || !enrollment.unenroll_token_expires_at || new Date(enrollment.unenroll_token_expires_at) <= new Date()) {
+      return reply.code(404).type("text/plain").send("Unenrollment URL is invalid or expired.\n");
+    }
+    noStore(reply);
+    return reply.type("text/x-shellscript; charset=utf-8").send(shellUnenrollScript(token, enrollment.hostname, await getPublicBaseUrl()));
+  });
+
+  app.get("/e/:token/unenroll.ps1", async (request, reply) => {
+    const { token } = tokenParams.parse(request.params);
+    const enrollment = await findUnenrollment(token);
+    if (!enrollment || enrollment.unenrolled_at || !enrollment.unenroll_token_expires_at || new Date(enrollment.unenroll_token_expires_at) <= new Date()) {
+      return reply.code(404).type("text/plain").send("Unenrollment URL is invalid or expired.\n");
+    }
+    noStore(reply);
+    return reply.type("text/plain; charset=utf-8").send(powerShellUnenrollScript(token, enrollment.hostname, await getPublicBaseUrl()));
   });
 
   app.post("/api/public/enrollments/claim", {
@@ -473,6 +602,63 @@ export async function enrollmentRoutes(app: FastifyInstance): Promise<void> {
       }
     });
     return reply.code(202).send({ accepted: body.events.length });
+  });
+
+  app.post("/api/public/enrollments/unenroll/logs", {
+    config: { rateLimit: { max: 100, timeWindow: "1 minute" } }
+  }, async (request, reply) => {
+    const body = logSchema.parse(request.body);
+    const enrollment = await findUnenrollment(body.token);
+    if (!enrollment || enrollment.unenrolled_at) return reply.code(404).send({ error: "Unenrollment not found" });
+    await withTransaction(async (client) => {
+      for (const event of body.events) {
+        const decodedMessage = event.messageBase64
+          ? Buffer.from(event.messageBase64, "base64").toString("utf8").slice(0, 4000)
+          : event.message!;
+        await client.query(
+          `INSERT INTO enrollment_logs(enrollment_id, level, step, message, metadata)
+           VALUES ($1, $2, $3, $4, $5::jsonb)`,
+          [enrollment.id, event.level, event.step ?? "cleanup", decodedMessage, JSON.stringify(event.metadata ?? {})]
+        );
+      }
+    });
+    return reply.code(202).send({ accepted: body.events.length });
+  });
+
+  app.post("/api/public/enrollments/unenroll/report", {
+    config: { rateLimit: { max: 20, timeWindow: "1 minute" } }
+  }, async (request, reply) => {
+    const body = unenrollReportSchema.parse(request.body);
+    const enrollment = await findUnenrollment(body.token);
+    if (!enrollment) return reply.code(404).send({ error: "Unenrollment not found" });
+    if (body.status === "failed") {
+      await pool.query(
+        `UPDATE enrollments SET unenroll_last_error = $1, updated_at = now() WHERE id = $2`,
+        [body.error ?? "Unenrollment failed", enrollment.id]
+      );
+      return { success: false };
+    }
+    await withTransaction(async (client) => {
+      await client.query(
+        `UPDATE enrollments
+            SET unenrolled_at = COALESCE(unenrolled_at, now()), unenroll_last_error = null, updated_at = now()
+          WHERE id = $1`,
+        [enrollment.id]
+      );
+      await client.query(
+        `UPDATE stores SET tunnel_status = 'inactive', updated_at = now()
+          WHERE id = $1
+            AND NOT EXISTS (
+              SELECT 1 FROM enrollments active
+               WHERE active.store_id = $1
+                 AND active.id <> $2
+                 AND active.status IN ('claimed', 'provisioning', 'ready', 'installed')
+                 AND active.unenrolled_at IS NULL
+            )`,
+        [enrollment.store_id, enrollment.id]
+      );
+    });
+    return { success: true };
   });
 
   app.post("/api/public/enrollments/report", {
