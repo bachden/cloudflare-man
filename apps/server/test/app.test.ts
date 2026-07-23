@@ -600,6 +600,11 @@ test("tracks enrollment history and issues cleanup for a running tunnel", async 
   const issued = response.json();
   const waitingState = await pool.query("SELECT onboarding_status FROM stores WHERE id = $1", [storeId]);
   assert.equal(waitingState.rows[0].onboarding_status, "waiting_for_new_enrollment");
+  await pool.query("UPDATE stores SET onboarding_status = 'active' WHERE id = $1", [storeId]);
+  const latestEnrollmentList = await app.inject({ method: "GET", url: "/api/stores?page=1&pageSize=25", headers: { cookie: sessionCookie } });
+  assert.equal(latestEnrollmentList.statusCode, 200, latestEnrollmentList.body);
+  assert.equal(latestEnrollmentList.json().stores[0].onboardingStatus, "waiting_for_new_enrollment");
+  await pool.query("UPDATE stores SET onboarding_status = 'waiting_for_new_enrollment' WHERE id = $1", [storeId]);
   const deletedPending = await app.inject({
     method: "DELETE",
     url: `/api/stores/${storeId}/enrollments/${issued.id}`,

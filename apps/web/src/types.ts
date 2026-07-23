@@ -61,6 +61,7 @@ export type Store = {
   tunnelName: string | null;
   tunnelStatus: string;
   onboardingStatus: string;
+  latestEnrollmentStatus?: string | null;
   accountId: string;
   accountName: string;
   zoneId: string;

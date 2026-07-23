@@ -295,6 +295,31 @@ const publicationsJson = `COALESCE((
   FROM store_publications p WHERE p.store_id = s.id
 ), '[]'::jsonb)`;
 
+const latestEnrollmentJoin = `LEFT JOIN LATERAL (
+  SELECT e.status, e.expires_at,
+         EXISTS (
+           SELECT 1
+             FROM enrollments previous
+            WHERE previous.store_id = e.store_id
+              AND previous.id <> e.id
+              AND previous.deleted_at IS NULL
+              AND previous.unenrolled_at IS NULL
+              AND previous.status IN ('claimed', 'provisioning', 'ready', 'installed')
+         ) AS has_active_previous
+    FROM enrollments e
+   WHERE e.store_id = s.id
+     AND e.deleted_at IS NULL
+   ORDER BY e.created_at DESC, e.id DESC
+   LIMIT 1
+) latest_enrollment ON TRUE`;
+
+const onboardingStatusExpression = `CASE
+  WHEN latest_enrollment.status IS NULL THEN s.onboarding_status
+  WHEN latest_enrollment.status = 'url_issued' AND latest_enrollment.expires_at <= now() THEN 'expired'
+  WHEN latest_enrollment.status = 'url_issued' AND latest_enrollment.has_active_previous THEN 'waiting_for_new_enrollment'
+  ELSE latest_enrollment.status
+END`;
+
 const enrollmentsJson = `COALESCE((
   SELECT jsonb_agg(jsonb_build_object(
             'id', e.id,
@@ -426,10 +451,10 @@ export async function storeRoutes(app: FastifyInstance): Promise<void> {
     }
     if (query.status) {
       values.push(query.status);
-      conditions.push(`s.onboarding_status = $${values.length}`);
+      conditions.push(`${onboardingStatusExpression} = $${values.length}`);
     }
     const where = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
-    const countResult = await pool.query(`SELECT count(*)::int AS total FROM stores s ${where}`, values);
+    const countResult = await pool.query(`SELECT count(*)::int AS total FROM stores s ${latestEnrollmentJoin} ${where}`, values);
     const total = countResult.rows[0]?.total as number ?? 0;
     const offset = (query.page - 1) * query.pageSize;
     const pageValues = [...values, query.pageSize, offset];
@@ -438,7 +463,8 @@ export async function storeRoutes(app: FastifyInstance): Promise<void> {
     const result = await pool.query(`
       SELECT s.id, s.tenant_code AS "tenantCode", s.store_code AS "storeCode", s.display_name AS "displayName",
              s.origin_url AS "originUrl", s.hostname, s.tunnel_id AS "tunnelId", s.tunnel_name AS "tunnelName",
-             s.tunnel_status AS "tunnelStatus", s.onboarding_status AS "onboardingStatus",
+             s.tunnel_status AS "tunnelStatus", ${onboardingStatusExpression} AS "onboardingStatus",
+             latest_enrollment.status AS "latestEnrollmentStatus",
              s.rdp_status AS "rdpStatus", s.rdp_target_ip::text AS "rdpTargetIp",
              s.rdp_url AS "rdpUrl", s.rdp_last_error AS "rdpLastError",
              s.last_connected_at AS "lastConnectedAt", s.last_verified_at AS "lastVerifiedAt", s.last_error AS "lastError",
@@ -448,6 +474,7 @@ export async function storeRoutes(app: FastifyInstance): Promise<void> {
         FROM stores s
         JOIN cloudflare_accounts a ON a.id = s.account_id
         JOIN zones z ON z.id = s.zone_id
+        ${latestEnrollmentJoin}
         ${where}
        ORDER BY s.created_at DESC
        LIMIT $${limitParameter} OFFSET $${offsetParameter}
