@@ -1,16 +1,18 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { ChevronLeft, ChevronRight, Code2, FilePlus2, RefreshCw, Save, Search, TerminalSquare } from "lucide-react";
+import { ChevronLeft, ChevronRight, FilePlus2, RefreshCw, Save, Search, TerminalSquare } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import { toast } from "sonner";
 import { api } from "../api";
 import { CopyButton } from "../components/CopyButton";
+import { ExecutionStatsSummary } from "../components/ExecutionStatsSummary";
 import { FieldHelp } from "../components/FieldHelp";
+import { HostPlatformIcon } from "../components/HostPlatformIcon";
 import { PageHeader } from "../components/PageHeader";
 import { SearchableSelect } from "../components/SearchableSelect";
 import { ScriptEditor } from "../components/ScriptEditor";
 import { StatusBadge } from "../components/StatusBadge";
-import type { ManagedScript, ManagedScriptSummary, ScriptCommandExecution, Store } from "../types";
+import type { ExecutionStats, ManagedScript, ManagedScriptSummary, ScriptCommandExecution, Store } from "../types";
 import { StoreDrawer, type StoreDrawerTab } from "./StoresPage";
 
 const defaultContent = {
@@ -28,6 +30,12 @@ type ScriptExecutionPage = {
   scriptId: string;
   version: number | null;
   executions: ScriptCommandExecution[];
+  summary: ExecutionStats;
+  pagination: { page: number; pageSize: number; total: number; totalPages: number };
+};
+
+type ScriptListPage = {
+  scripts: ManagedScriptSummary[];
   pagination: { page: number; pageSize: number; total: number; totalPages: number };
 };
 
@@ -38,6 +46,7 @@ export function ScriptsPage() {
   const linkedVersion = Number(searchParams.get("version"));
   const [nameFilter, setNameFilter] = useState("");
   const [platformFilter, setPlatformFilter] = useState<"" | "windows" | "unix">("");
+  const [scriptPage, setScriptPage] = useState(1);
   const [selectedId, setSelectedId] = useState<string | null>(linkedScriptId);
   const [draft, setDraft] = useState(false);
   const [name, setName] = useState("");
@@ -51,12 +60,13 @@ export function ScriptsPage() {
   const [expandedExecutionId, setExpandedExecutionId] = useState<string | null>(null);
   const [drawerStore, setDrawerStore] = useState<Store | null>(null);
   const [drawerTab, setDrawerTab] = useState<StoreDrawerTab>("connect");
-  const scriptParams = new URLSearchParams();
+  const scriptPageSize = 12;
+  const scriptParams = new URLSearchParams({ page: String(scriptPage), pageSize: String(scriptPageSize) });
   if (nameFilter.trim()) scriptParams.set("name", nameFilter.trim());
   if (platformFilter) scriptParams.set("platform", platformFilter);
   const { data, isLoading } = useQuery({
-    queryKey: ["scripts", nameFilter, platformFilter],
-    queryFn: () => api.get<{ scripts: ManagedScriptSummary[] }>(`/api/scripts${scriptParams.size ? `?${scriptParams.toString()}` : ""}`)
+    queryKey: ["scripts", nameFilter, platformFilter, scriptPage, scriptPageSize],
+    queryFn: () => api.get<ScriptListPage>(`/api/scripts?${scriptParams.toString()}`)
   });
   const { data: detailData } = useQuery({
     queryKey: ["script-detail", selectedId],
@@ -64,6 +74,7 @@ export function ScriptsPage() {
     enabled: Boolean(selectedId)
   });
   const scripts = data?.scripts ?? [];
+  const scriptPagination = data?.pagination;
   const detail = detailData?.script;
   const selectedVersionData = useMemo(() => detail?.versions.find((version) => version.version === selectedVersion) ?? detail?.versions[0], [detail, selectedVersion]);
   const executionPageSize = 10;
@@ -78,6 +89,8 @@ export function ScriptsPage() {
     setExecutionPage(1);
     setExpandedExecutionId(null);
   }, [selectedId, selectedVersion]);
+
+  useEffect(() => setScriptPage(1), [nameFilter, platformFilter]);
 
   useEffect(() => {
     if (!linkedScriptId) return;
@@ -180,12 +193,14 @@ export function ScriptsPage() {
   const active = Boolean(draft || selectedId);
   const executions = executionData?.executions ?? [];
   const executionPagination = executionData?.pagination;
+  const executionSummary = executionData?.summary ?? { total: 0, succeeded: 0, failed: 0, timedOut: 0, running: 0 };
   return <><div className="page">
     <PageHeader title="Script library" eyebrow="Versioned store automation" actions={<><button className="button button-secondary" type="button" onClick={() => refresh.mutate()} disabled={refresh.isPending}><RefreshCw size={15} className={refresh.isPending ? "spin-icon" : undefined} />{refresh.isPending ? "Refreshing..." : "Refresh"}</button><button className="button button-primary" type="button" onClick={openNew}><FilePlus2 size={16} />New script</button></>} />
     <div className="scripts-layout">
       <section className="panel script-list-panel">
-        <div className="script-list-toolbar"><label className="search-box"><Search size={15} /><input value={nameFilter} onChange={(event) => setNameFilter(event.target.value)} placeholder="Search script names" /></label><div className="script-platform-filter"><SearchableSelect name="platformFilter" options={platformFilterOptions} ariaLabel="Filter scripts by platform" emptyMessage="No matching platforms" onValueChange={(value) => setPlatformFilter(value as typeof platformFilter)} /></div><span>{scripts.length} script{scripts.length === 1 ? "" : "s"}</span></div>
-        {isLoading ? <div className="quiet-empty">Loading scripts...</div> : scripts.length ? <div className="script-list">{scripts.map((script) => <button className={`script-list-item ${selectedId === script.id && !draft ? "active" : ""}`} key={script.id} type="button" onClick={() => selectScript(script)}><span className="script-list-icon"><Code2 size={15} /></span><span><strong>{script.name}</strong><small>{script.platform} · v{script.latestVersion ?? "-"}</small></span><StatusBadge status={script.platform === "windows" ? "windows" : "unix"} /></button>)}</div> : <div className="quiet-empty">No scripts saved yet.</div>}
+        <div className="script-list-toolbar"><label className="search-box"><Search size={15} /><input value={nameFilter} onChange={(event) => setNameFilter(event.target.value)} placeholder="Search script names" /></label><div className="script-platform-filter"><SearchableSelect name="platformFilter" options={platformFilterOptions} ariaLabel="Filter scripts by platform" emptyMessage="No matching platforms" onValueChange={(value) => setPlatformFilter(value as typeof platformFilter)} /></div><span>{scriptPagination?.total ?? 0} script{scriptPagination?.total === 1 ? "" : "s"}</span></div>
+        {isLoading ? <div className="quiet-empty">Loading scripts...</div> : scripts.length ? <div className="script-list">{scripts.map((script) => <button className={`script-list-item ${selectedId === script.id && !draft ? "active" : ""}`} key={script.id} type="button" onClick={() => selectScript(script)}><span className="script-list-icon"><HostPlatformIcon platform={script.platform} size={16} /></span><span><strong>{script.name}</strong><small>Version {script.latestVersion ?? "-"}</small><ExecutionStatsSummary stats={script.executionStats} compact /></span></button>)}</div> : <div className="quiet-empty">No scripts saved yet.</div>}
+        {scriptPagination && scriptPagination.totalPages > 1 && <div className="script-list-pagination"><button className="icon-button" type="button" title="Previous script page" aria-label="Previous script page" disabled={scriptPagination.page <= 1} onClick={() => setScriptPage((page) => Math.max(1, page - 1))}><ChevronLeft size={15} /></button><span>Page {scriptPagination.page} of {scriptPagination.totalPages}</span><button className="icon-button" type="button" title="Next script page" aria-label="Next script page" disabled={scriptPagination.page >= scriptPagination.totalPages} onClick={() => setScriptPage((page) => page + 1)}><ChevronRight size={15} /></button></div>}
       </section>
       <section className="panel script-editor-panel">
         {!active ? <div className="script-empty-state"><TerminalSquare size={26} /><strong>Select a script or create one</strong></div> : <>
@@ -193,11 +208,11 @@ export function ScriptsPage() {
           <div className="script-metadata-grid"><label className="field"><span className="field-label">Name <FieldHelp text="The reusable script name shown when an operator selects a script for a store. Names must be unique within the same platform." /></span><input value={name} onChange={(event) => setName(event.target.value)} placeholder="Inventory refresh" /></label><label className="field"><span className="field-label">Platform <FieldHelp text="The host family this script can run on. Windows scripts use PowerShell; Unix scripts can use Bash or POSIX sh. The platform cannot change after creation." /></span><select value={platform} disabled={!draft} onChange={(event) => { const next = event.target.value as "windows" | "unix"; setPlatform(next); setLanguage(next === "windows" ? "powershell" : "bash"); }}><option value="windows">Windows</option><option value="unix">Unix</option></select></label><label className="field"><span className="field-label">Language <FieldHelp text="Controls syntax highlighting and identifies the shell expected on the enrolled host." /></span><select value={language} onChange={(event) => setLanguage(event.target.value as typeof language)}>{languageOptions.map((option) => <option value={option.value} key={option.value}>{option.label}</option>)}</select></label><label className="field"><span className="field-label">Description <FieldHelp text="Optional operator-facing context about the script's purpose, prerequisites, or expected effect." /></span><input value={description} onChange={(event) => setDescription(event.target.value)} placeholder="Optional description" /></label></div>
           <ScriptEditor value={content} language={language} readOnly={!draft && selectedVersionData?.version !== detail?.latestVersion} onChange={setContent} />
           <div className="form-actions"><span className="script-editor-hint">{draft ? "Creates version 1" : content !== originalContent ? `Creates version ${(detail?.latestVersion ?? 0) + 1}` : "No content changes"}</span><button className="button button-primary" type="button" disabled={!name.trim() || !content.trim() || create.isPending || save.isPending} onClick={() => draft ? create.mutate() : save.mutate()}><Save size={15} />{draft ? "Create script" : "Save changes"}</button></div>
-          {!draft && selectedId && selectedVersion && <section className="script-execution-history"><header><div><h3>Execution history</h3><span>Script {name} · Version {selectedVersion}</span></div><div className="command-history-head-actions"><span>{executionPagination?.total ?? 0} run{executionPagination?.total === 1 ? "" : "s"}</span><button className="icon-button" type="button" title="Refresh execution history" aria-label="Refresh execution history" disabled={refreshExecutions.isPending || executionsFetching} onClick={() => refreshExecutions.mutate()}><RefreshCw size={14} className={refreshExecutions.isPending || executionsFetching ? "spin-icon" : undefined} /></button></div></header>{executions.length ? <div className="script-execution-list">{executions.map((execution) => {
+          {!draft && selectedId && selectedVersion && <section className="script-execution-history"><header><div><h3>Execution history</h3><span>Script {name} · Version {selectedVersion}</span></div><div className="command-history-head-actions"><ExecutionStatsSummary stats={executionSummary} /><span>{executionPagination?.total ?? 0} run{executionPagination?.total === 1 ? "" : "s"}</span><button className="icon-button" type="button" title="Refresh execution history" aria-label="Refresh execution history" disabled={refreshExecutions.isPending || executionsFetching} onClick={() => refreshExecutions.mutate()}><RefreshCw size={14} className={refreshExecutions.isPending || executionsFetching ? "spin-icon" : undefined} /></button></div></header>{executions.length ? <div className="script-execution-list">{executions.map((execution) => {
             const statusLabel = execution.status === "succeeded" ? "Succeeded" : execution.status === "failed" ? "Error" : execution.status === "timed_out" ? "Timeout" : "Running";
             const environment = scriptExecutionEnvironment(execution);
             const executionLanguage = execution.language ?? (execution.platform === "windows" ? "powershell" : "bash");
-            return <details className={`command-execution command-execution-${execution.status}`} key={execution.id} open={expandedExecutionId === execution.id} onToggle={(event) => { if (event.currentTarget.open) setExpandedExecutionId(execution.id); else if (expandedExecutionId === execution.id) setExpandedExecutionId(null); }}><summary><span><StatusBadge status={execution.status} label={statusLabel} /><button className="script-execution-store-link" type="button" disabled={openStoreDrawer.isPending && openStoreDrawer.variables === execution.storeId} onClick={(event) => { event.preventDefault(); event.stopPropagation(); openStoreDrawer.mutate(execution.storeId); }}>{execution.storeDisplayName}</button><code>{execution.tenantCode} / {execution.storeCode} · {execution.computerName ?? "N/A"} · {environment}</code></span><span className="command-execution-timing"><time>{new Date(execution.startedAt).toLocaleString()}</time><code>{execution.elapsedMs !== null ? `${execution.elapsedMs} ms` : execution.status === "running" ? "running" : "-"}</code></span></summary>{expandedExecutionId === execution.id && <div className="command-execution-body"><div className="command-execution-meta"><span><code>Execution {execution.id}</code><code>Enrollment {execution.enrollmentId ?? "N/A"}</code></span></div><ScriptEditor value={execution.script} language={executionLanguage} height="200px" readOnly />{execution.error && <div className="inline-alert">{execution.error}</div>}{execution.stdout && <div className="command-output-block"><header><strong>stdout</strong><CopyButton value={execution.stdout} label="Copy stdout" iconOnly /></header><pre>{execution.stdout}</pre></div>}{execution.stderr && <div className="command-output-block"><header><strong>stderr</strong><CopyButton value={execution.stderr} label="Copy stderr" iconOnly /></header><pre>{execution.stderr}</pre></div>}{!execution.stdout && !execution.stderr && !execution.error && <div className="quiet-empty">The script produced no output.</div>}</div>}</details>;
+            return <details className={`command-execution command-execution-${execution.status}`} key={execution.id} open={expandedExecutionId === execution.id} onToggle={(event) => { if (event.currentTarget.open) setExpandedExecutionId(execution.id); else if (expandedExecutionId === execution.id) setExpandedExecutionId(null); }}><summary><span><StatusBadge status={execution.status} label={statusLabel} /><button className="script-execution-store-link" type="button" disabled={openStoreDrawer.isPending && openStoreDrawer.variables === execution.storeId} onClick={(event) => { event.preventDefault(); event.stopPropagation(); openStoreDrawer.mutate(execution.storeId); }}>{execution.storeDisplayName}</button><code>{execution.tenantCode} / {execution.storeCode} ·</code><span className="host-identity" title={environment}><HostPlatformIcon environment={execution.environment} platform={execution.enrollmentPlatform} osName={execution.osName} /><code>{execution.computerName ?? "N/A"}</code></span></span><span className="command-execution-timing"><time>{new Date(execution.startedAt).toLocaleString()}</time><code>{execution.elapsedMs !== null ? `${execution.elapsedMs} ms` : execution.status === "running" ? "running" : "-"}</code></span></summary>{expandedExecutionId === execution.id && <div className="command-execution-body"><ScriptEditor value={execution.script} language={executionLanguage} height="200px" readOnly />{execution.error && <div className="inline-alert">{execution.error}</div>}{execution.stdout && <div className="command-output-block"><header><strong>stdout</strong><CopyButton value={execution.stdout} label="Copy stdout" iconOnly /></header><pre>{execution.stdout}</pre></div>}{execution.stderr && <div className="command-output-block"><header><strong>stderr</strong><CopyButton value={execution.stderr} label="Copy stderr" iconOnly /></header><pre>{execution.stderr}</pre></div>}{!execution.stdout && !execution.stderr && !execution.error && <div className="quiet-empty">The script produced no output.</div>}</div>}</details>;
           })}</div> : <div className="quiet-empty">This script version has not been executed.</div>}{executionPagination && executionPagination.totalPages > 1 && <div className="command-history-pagination"><button className="icon-button" type="button" title="Previous execution page" aria-label="Previous execution page" disabled={executionPagination.page <= 1} onClick={() => { setExpandedExecutionId(null); setExecutionPage((page) => Math.max(1, page - 1)); }}><ChevronLeft size={15} /></button><span>Page {executionPagination.page} of {executionPagination.totalPages}</span><button className="icon-button" type="button" title="Next execution page" aria-label="Next execution page" disabled={executionPagination.page >= executionPagination.totalPages} onClick={() => { setExpandedExecutionId(null); setExecutionPage((page) => page + 1); }}><ChevronRight size={15} /></button></div>}</section>}
         </>}
       </section>

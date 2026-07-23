@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Check, CheckCircle2, CircleAlert, CloudCog, ExternalLink, KeyRound, LoaderCircle, MonitorCog, Plus, RefreshCw, Trash2 } from "lucide-react";
+import { Check, CheckCircle2, CircleAlert, CloudCog, ExternalLink, KeyRound, LoaderCircle, Mail, MonitorCog, Plus, RefreshCw, Trash2 } from "lucide-react";
 import { useEffect, useState, type FormEvent } from "react";
 import { toast } from "sonner";
 import { ApiError, api } from "../api";
@@ -15,6 +15,7 @@ export function AccountsPage() {
   const [accountModal, setAccountModal] = useState(false);
   const [zoneAccount, setZoneAccount] = useState<CloudflareAccount | null>(null);
   const [rdpAccount, setRdpAccount] = useState<CloudflareAccount | null>(null);
+  const [supportAccount, setSupportAccount] = useState<CloudflareAccount | null>(null);
   const [deleteAccount, setDeleteAccount] = useState<CloudflareAccount | null>(null);
   const { data, isLoading } = useQuery({ queryKey: ["accounts"], queryFn: () => api.get<{ accounts: CloudflareAccount[] }>("/api/accounts") });
   const sync = useMutation({
@@ -42,10 +43,11 @@ export function AccountsPage() {
           {data?.accounts.map((account) => (
             <section className="account-section" key={account.id}>
               <header className="account-header">
-                <div className="account-identity"><span className="large-glyph"><CloudCog size={20} /></span><div><div className="title-line"><h2>{account.name}</h2><StatusBadge status={account.status} />{account.providerMode === "mock" && <span className="mode-label">TEST</span>}</div><span className="mono subdued">{account.cfAccountId ?? "Local mock provider"}</span></div></div>
+                <div className="account-identity"><span className="large-glyph"><CloudCog size={20} /></span><div><div className="title-line"><h2>{account.name}</h2><StatusBadge status={account.status} />{account.providerMode === "mock" && <span className="mode-label">TEST</span>}</div><span className="mono subdued">{account.cfAccountId ?? "Local mock provider"}</span><span className="account-support-email"><Mail size={12} />{account.supportEmail ?? "No support email"}</span></div></div>
                 <div className="account-capacity"><span>Tunnel allocation</span><CapacityBar value={account.storeCount} limit={account.softTunnelLimit} compact /></div>
                 <div className="account-actions">
                   <button className="button button-secondary" onClick={() => sync.mutate(account.id)} disabled={sync.isPending}><RefreshCw size={15} />Sync</button>
+                  <button className="button button-secondary" onClick={() => setSupportAccount(account)}><Mail size={15} />Support</button>
                   <button className="button button-secondary" onClick={() => setRdpAccount(account)}><MonitorCog size={15} />RDP access</button>
                   <button className="button button-secondary" onClick={() => setZoneAccount(account)}><Plus size={15} />Zone</button>
                   <button className="icon-button account-delete" onClick={() => setDeleteAccount(account)} aria-label={`Delete ${account.name}`} title="Delete account"><Trash2 size={16} /></button>
@@ -63,6 +65,7 @@ export function AccountsPage() {
       )}
       <AddAccountModal open={accountModal} onClose={() => setAccountModal(false)} />
       <AddZoneModal account={zoneAccount} onClose={() => setZoneAccount(null)} />
+      <SupportEmailModal account={supportAccount} onClose={() => setSupportAccount(null)} />
       <RdpSettingsModal account={rdpAccount} onClose={() => setRdpAccount(null)} />
       <DeleteAccountModal account={deleteAccount} onClose={() => setDeleteAccount(null)} />
     </div>
@@ -119,6 +122,7 @@ function AddAccountModal({ open, onClose }: { open: boolean; onClose: () => void
       cfAccountId: form.get("cfAccountId"),
       apiToken: form.get("apiToken"),
       softTunnelLimit: Number(form.get("softTunnelLimit")),
+      supportEmail: form.get("supportEmail") || null,
       rdpAllowedEmails: parseEmails(form.get("rdpAllowedEmails"))
     });
   };
@@ -127,6 +131,7 @@ function AddAccountModal({ open, onClose }: { open: boolean; onClose: () => void
       <form className="form-stack" onSubmit={submit}>
         {error && <div className="form-error">{error}</div>}
         <label className="field"><span className="field-label">Display name <FieldHelp text="An internal name used to identify this Cloudflare account in the account pool. It does not change anything in Cloudflare." /></span><input name="name" placeholder="Account 1" required /></label>
+        <label className="field"><span className="field-label">Support email <FieldHelp text="The internal contact shown to operators when this account needs investigation or escalation. This value does not modify the Cloudflare account owner." /></span><input name="supportEmail" type="email" placeholder="support@example.com" /></label>
         <label className="field"><span className="field-label">Cloudflare Account ID <FieldHelp text="The 32-character account identifier shown on the Cloudflare account Overview page and in the dashboard URL after dash.cloudflare.com/." /></span><input name="cfAccountId" className="mono-input" autoComplete="off" value={cfAccountId} onChange={(event) => setCfAccountId(event.target.value)} required /></label>
         <ApiTokenGuide accountId={cfAccountId} />
         <label className={`field token-field token-field-${tokenValidation.status}`}>
@@ -227,6 +232,27 @@ function DeleteAccountModal({ account, onClose }: { account: CloudflareAccount |
 
 function parseEmails(value: FormDataEntryValue | null): string[] {
   return String(value ?? "").split(",").map((email) => email.trim().toLowerCase()).filter(Boolean);
+}
+
+function SupportEmailModal({ account, onClose }: { account: CloudflareAccount | null; onClose: () => void }) {
+  const queryClient = useQueryClient();
+  const [error, setError] = useState("");
+  const mutation = useMutation({
+    mutationFn: (supportEmail: string | null) => api.patch(`/api/accounts/${account!.id}/support`, { supportEmail }),
+    onSuccess: async () => {
+      toast.success("Support email updated");
+      await queryClient.invalidateQueries({ queryKey: ["accounts"] });
+      onClose();
+    },
+    onError: (requestError) => setError(requestError instanceof Error ? requestError.message : "Unable to update support email")
+  });
+  const submit = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    setError("");
+    const value = String(new FormData(event.currentTarget).get("supportEmail") ?? "").trim().toLowerCase();
+    mutation.mutate(value || null);
+  };
+  return <Modal open={Boolean(account)} title={`Support email · ${account?.name ?? "account"}`} onClose={onClose}><form className="form-stack" onSubmit={submit}>{error && <div className="form-error">{error}</div>}<label className="field"><span className="field-label">Support email <FieldHelp text="The internal contact shown to operators for account investigation and escalation. Clear the field to remove it. This does not change any Cloudflare login or account owner." /></span><input name="supportEmail" type="email" defaultValue={account?.supportEmail ?? ""} placeholder="support@example.com" /></label><div className="form-actions"><button className="button button-secondary" type="button" onClick={onClose}>Cancel</button><button className="button button-primary" disabled={mutation.isPending}><Mail size={15} />{mutation.isPending ? "Saving..." : "Save email"}</button></div></form></Modal>;
 }
 
 function RdpSettingsModal({ account, onClose }: { account: CloudflareAccount | null; onClose: () => void }) {

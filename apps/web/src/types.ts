@@ -34,6 +34,7 @@ export type CloudflareAccount = {
   status: string;
   tunnelLimit: number;
   softTunnelLimit: number;
+  supportEmail: string | null;
   rdpAllowedEmails: string[];
   storeCount: number;
   lastSyncedAt: string | null;
@@ -183,6 +184,7 @@ export type ScriptCommandExecution = StoreCommandExecution & {
   tenantCode: string;
   storeCode: string;
   computerName: string | null;
+  osName: string | null;
   environment: "windows" | "linux" | "darwin" | "unix" | null;
   enrollmentPlatform: "windows" | "unix" | null;
   anchorScriptVersionId: string;
@@ -196,8 +198,17 @@ export type ManagedScriptSummary = {
   description: string;
   latestVersion: number | null;
   latestVersionId: string | null;
+  executionStats: ExecutionStats;
   updatedAt: string;
   createdAt: string;
+};
+
+export type ExecutionStats = {
+  total: number;
+  succeeded: number;
+  failed: number;
+  timedOut: number;
+  running: number;
 };
 
 export type ManagedScript = ManagedScriptSummary & {

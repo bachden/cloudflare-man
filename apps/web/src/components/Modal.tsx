@@ -3,7 +3,7 @@ import type { ReactNode } from "react";
 
 type ModalProps = {
   open: boolean;
-  title: string;
+  title: ReactNode;
   children: ReactNode;
   onClose: () => void;
   width?: "default" | "wide" | "extra-wide";

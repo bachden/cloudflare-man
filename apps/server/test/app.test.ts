@@ -108,6 +108,7 @@ test("enables MCP and exposes structured tools with reusable identifiers", async
   assert.ok(listed.json().result.tools.some((tool: { name: string }) => tool.name === "cfman_save_inline_execution_as_script"));
   assert.ok(listed.json().result.tools.some((tool: { name: string }) => tool.name === "cfman_get_script_execution_history"));
   assert.ok(listed.json().result.tools.some((tool: { name: string }) => tool.name === "cfman_get_store_execution_history"));
+  assert.ok(listed.json().result.tools.some((tool: { name: string }) => tool.name === "cfman_update_account_support_email"));
 
   const created = await mcpRequest({
     jsonrpc: "2.0",
@@ -172,12 +173,39 @@ test("creates a mock account with its first zone", async () => {
       name: "Test Account A",
       providerMode: "mock",
       initialZoneName: "stores-a.example",
+      supportEmail: "initial-support@example.com",
       softTunnelLimit: 750
     }
   });
   assert.equal(response.statusCode, 201, response.body);
   accountId = response.json().id;
   assert.match(accountId, /^[0-9a-f-]{36}$/);
+  const rotatedMcp = await app.inject({ method: "POST", url: "/api/settings/mcp/rotate", headers: { cookie: sessionCookie } });
+  assert.equal(rotatedMcp.statusCode, 200, rotatedMcp.body);
+  const updated = await app.inject({
+    method: "POST",
+    url: "/mcp",
+    headers: {
+      authorization: `Bearer ${rotatedMcp.json().token}`,
+      accept: "application/json, text/event-stream",
+      "mcp-protocol-version": "2025-11-25"
+    },
+    payload: {
+      jsonrpc: "2.0",
+      id: 9,
+      method: "tools/call",
+      params: {
+        name: "cfman_update_account_support_email",
+        arguments: { accountId, supportEmail: "store-support@example.com" }
+      }
+    }
+  });
+  assert.equal(updated.statusCode, 200, updated.body);
+  assert.equal(updated.json().result.structuredContent.data.account.id, accountId);
+  assert.equal(updated.json().result.structuredContent.data.account.supportEmail, "store-support@example.com");
+  const accountList = await app.inject({ method: "GET", url: "/api/accounts", headers: { cookie: sessionCookie } });
+  assert.equal(accountList.statusCode, 200, accountList.body);
+  assert.equal(accountList.json().accounts.find((account: { id: string }) => account.id === accountId).supportEmail, "store-support@example.com");
 });
 
 test("deletes an empty account and its zones", async () => {
@@ -355,6 +383,7 @@ test("creates and versions a platform-specific managed script", async () => {
   assert.equal(list.statusCode, 200, list.body);
   assert.equal(list.json().scripts.length, 1);
   assert.equal(list.json().scripts[0].latestVersion, 2);
+  assert.deepEqual(list.json().pagination, { page: 1, pageSize: 100, total: 1, totalPages: 1 });
   assert.equal(list.json().scripts[0].latestVersionId, scriptVersionId);
   const noMatch = await app.inject({ method: "GET", url: "/api/scripts?platform=windows&name=missing", headers: { cookie: sessionCookie } });
   assert.equal(noMatch.statusCode, 200, noMatch.body);
@@ -848,9 +877,11 @@ test("executes a script through the configured store command agent", async () =>
     assert.equal(historyResult.scriptId, savedInlineResult.scriptId);
     assert.equal(historyResult.version, 1);
     assert.equal(historyResult.pagination.total, 1);
+    assert.deepEqual(historyResult.summary, { total: 1, succeeded: 1, failed: 0, timedOut: 0, running: 0 });
     assert.equal(historyResult.executions[0].id, inlineResult.executionId);
     assert.equal(historyResult.executions[0].storeId, storeId);
     assert.equal(historyResult.executions[0].enrollmentId, enrollmentId);
+    assert.equal(historyResult.executions[0].osName, "Microsoft Windows 11 Pro");
     assert.equal(historyResult.executions[0].anchorScriptVersionId, savedInlineResult.versionId);
     assert.equal(historyResult.executions[0].scriptType, "inline");
     assert.ok(scriptHistory.json().result.structuredContent.references.some((reference: { path: string; value: string }) => reference.path === "response.executions[0].storeId" && reference.value === storeId));
@@ -910,9 +941,14 @@ test("executes a script through the configured store command agent", async () =>
   const paginatedHistory = await app.inject({ method: "GET", url: `/api/stores/${storeId}/command-executions?page=1&pageSize=5`, headers: { cookie: sessionCookie } });
   assert.equal(paginatedHistory.statusCode, 200, paginatedHistory.body);
   assert.equal(paginatedHistory.json().pagination.total, 3);
+  assert.deepEqual(paginatedHistory.json().summary, { total: 3, succeeded: 2, failed: 1, timedOut: 0, running: 0 });
   assert.equal(paginatedHistory.json().pagination.pageSize, 5);
   assert.equal(paginatedHistory.json().executions.length, 3);
   assert.equal(paginatedHistory.json().executions[0].id, latestExecution.id);
+  const scriptListWithStats = await app.inject({ method: "GET", url: "/api/scripts", headers: { cookie: sessionCookie } });
+  assert.equal(scriptListWithStats.statusCode, 200, scriptListWithStats.body);
+  const readinessScript = scriptListWithStats.json().scripts.find((script: { name: string }) => script.name === "Store readiness check");
+  assert.deepEqual(readinessScript.executionStats, { total: 2, succeeded: 1, failed: 1, timedOut: 0, running: 0 });
 });
 
 test("rejects a second command agent route for the same store", async () => {

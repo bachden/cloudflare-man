@@ -7,6 +7,7 @@ export function FieldHelp({ text }: { text: string }) {
     <span className={`field-help ${open ? "field-help-open" : ""}`}>
       <button
         type="button"
+        tabIndex={-1}
         aria-label="Show field help"
         aria-expanded={open}
         title="Field help"
@@ -23,4 +24,3 @@ export function FieldHelp({ text }: { text: string }) {
     </span>
   );
 }
-

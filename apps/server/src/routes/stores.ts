@@ -875,7 +875,7 @@ export async function storeRoutes(app: FastifyInstance): Promise<void> {
     const { id } = z.object({ id: z.string().uuid() }).parse(request.params);
     const query = commandExecutionListSchema.parse(request.query);
     const offset = (query.page - 1) * query.pageSize;
-    const [storeResult, executionResult, countResult] = await Promise.all([
+    const [storeResult, executionResult, statsResult] = await Promise.all([
       pool.query("SELECT 1 FROM stores WHERE id = $1", [id]),
       pool.query(
         `SELECT ce.id,
@@ -903,12 +903,23 @@ export async function storeRoutes(app: FastifyInstance): Promise<void> {
           LIMIT $2 OFFSET $3`,
         [id, query.pageSize, offset]
       ),
-      pool.query("SELECT count(*)::int AS total FROM store_command_executions WHERE store_id = $1", [id])
+      pool.query(
+        `SELECT count(*)::int AS total,
+                (count(*) FILTER (WHERE status = 'succeeded'))::int AS succeeded,
+                (count(*) FILTER (WHERE status = 'failed'))::int AS failed,
+                (count(*) FILTER (WHERE status = 'timed_out'))::int AS "timedOut",
+                (count(*) FILTER (WHERE status = 'running'))::int AS running
+           FROM store_command_executions
+          WHERE store_id = $1`,
+        [id]
+      )
     ]);
     if (!storeResult.rowCount) return reply.code(404).send({ error: "Store not found" });
-    const total = countResult.rows[0].total as number;
+    const summary = statsResult.rows[0];
+    const total = summary.total as number;
     return {
       executions: executionResult.rows,
+      summary,
       pagination: {
         page: query.page,
         pageSize: query.pageSize,

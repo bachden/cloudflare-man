@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { AlertTriangle, Apple, CheckCircle2, ChevronLeft, ChevronRight, FilePlus2, Monitor, MonitorUp, Plus, RefreshCw, Save, ScrollText, Search, Server, Settings2, ShieldAlert, ShieldCheck, TerminalSquare, Trash2, Unplug } from "lucide-react";
+import { AlertTriangle, CheckCircle2, ChevronLeft, ChevronRight, FilePlus2, MonitorUp, Plus, RefreshCw, Save, ScrollText, Search, Settings2, ShieldAlert, ShieldCheck, TerminalSquare, Trash2, Unplug } from "lucide-react";
 import { useEffect, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { toast } from "sonner";
@@ -7,13 +7,15 @@ import { api } from "../api";
 import { ConnectivityEditor, connectivityPayload, validatePublications, type DraftPublication } from "../components/ConnectivityEditor";
 import { CopyButton } from "../components/CopyButton";
 import { FieldHelp } from "../components/FieldHelp";
+import { ExecutionStatsSummary } from "../components/ExecutionStatsSummary";
+import { HostPlatformIcon } from "../components/HostPlatformIcon";
 import { Modal } from "../components/Modal";
 import { PageHeader } from "../components/PageHeader";
 import { ScriptEditor } from "../components/ScriptEditor";
 import { SearchableSelect } from "../components/SearchableSelect";
 import { SideDrawer } from "../components/SideDrawer";
 import { StatusBadge } from "../components/StatusBadge";
-import type { AppSettings, EnrollmentResult, ManagedScript, ManagedScriptSummary, Store, StoreCommandExecution, StoreDeletePreflight, StoreEnrollment, StoreRoute, UnenrollmentResult } from "../types";
+import type { AppSettings, EnrollmentResult, ExecutionStats, ManagedScript, ManagedScriptSummary, Store, StoreCommandExecution, StoreDeletePreflight, StoreEnrollment, StoreRoute, UnenrollmentResult } from "../types";
 
 type StoreListResponse = {
   stores: Store[];
@@ -261,7 +263,7 @@ function StoreDeleteDialog({
 }
 
 function EnrollmentDeleteDialog({ enrollment, onClose, onConfirm, deleting }: { enrollment: StoreEnrollment | null; onClose: () => void; onConfirm: () => void; deleting: boolean }) {
-  return <Modal open={Boolean(enrollment)} title={`Delete enrollment · ${enrollment ? enrollmentComputerName(enrollment) : ""}`} onClose={onClose}>
+  return <Modal open={Boolean(enrollment)} title={enrollment ? <span className="host-identity"><HostPlatformIcon environment={enrollment.environment} platform={enrollment.platform} osName={enrollment.hostInfo.osName} /><span>Delete enrollment · {enrollmentComputerName(enrollment)}</span></span> : "Delete enrollment"} onClose={onClose}>
     <div className="enrollment-delete-dialog">
       <div className="inline-alert enrollment-delete-no-logs"><Trash2 size={15} />This permanently deletes the enrollment. Its logs will no longer be available to view.</div>
       <div className="form-actions"><button className="button button-secondary" type="button" onClick={onClose}>Cancel</button><button className="button button-danger" type="button" onClick={onConfirm} disabled={deleting}><Trash2 size={15} />{deleting ? "Deleting..." : "Delete permanently"}</button></div>
@@ -275,7 +277,7 @@ function EnrollmentHistory({ enrollments, onViewLog, onDelete, onUnenroll, delet
     const displayStatus = enrollmentDisplayStatus(enrollment);
     const displayTime = enrollmentDisplayTime(enrollment, displayStatus);
     return <div className="enrollment-history-row" key={enrollment.id}>
-      <div className="enrollment-history-field enrollment-computer-field"><div className="enrollment-computer-summary" title={environment} aria-label={`${environment} · ${enrollmentComputerName(enrollment)}`}><span className="enrollment-platform-icon">{enrollmentPlatformIcon(enrollment)}</span><strong>{enrollmentComputerName(enrollment)}</strong></div></div>
+      <div className="enrollment-history-field enrollment-computer-field"><div className="enrollment-computer-summary" title={environment} aria-label={`${environment} · ${enrollmentComputerName(enrollment)}`}><span className="enrollment-platform-icon"><HostPlatformIcon environment={enrollment.environment} platform={enrollment.platform} osName={enrollment.hostInfo.osName} size={19} /></span><strong>{enrollmentComputerName(enrollment)}</strong></div></div>
       <div className="enrollment-history-field enrollment-status-cell"><StatusBadge status={displayStatus} /></div>
       <time className="enrollment-event-time" dateTime={displayTime ?? undefined}>{displayTime ? new Date(displayTime).toLocaleString() : "-"}</time>
       <div className="enrollment-history-actions"><button className="button button-secondary enrollment-log-button" type="button" onClick={() => onViewLog(enrollment)}><ScrollText size={15} />View log</button>{enrollment.isCurrent ? <button className="icon-button enrollment-unenroll-button" type="button" title="Unenroll this computer" aria-label={`Unenroll ${enrollmentComputerName(enrollment)}`} onClick={() => onUnenroll(enrollment)} disabled={unenrolling}><Unplug size={16} /></button> : enrollment.unenrollStatus === "unenrolled" && !enrollment.deletedAt ? <button className="icon-button enrollment-delete-button" type="button" title="Delete enrollment permanently" aria-label={`Delete enrollment for ${enrollmentComputerName(enrollment)}`} onClick={() => onDelete(enrollment)} disabled={deleting}><Trash2 size={15} /></button> : <span className="enrollment-action-placeholder" aria-hidden="true" />}</div>
@@ -285,14 +287,6 @@ function EnrollmentHistory({ enrollments, onViewLog, onDelete, onUnenroll, delet
 
 function enrollmentComputerName(enrollment: StoreEnrollment): string {
   return enrollment.computerName ?? enrollment.hostInfo.machineName ?? "N/A";
-}
-
-function enrollmentPlatformIcon(enrollment: StoreEnrollment) {
-  switch (enrollment.environment ?? enrollment.platform) {
-    case "darwin": return <Apple size={19} />;
-    case "linux": return <Server size={19} />;
-    default: return <Monitor size={19} />;
-  }
 }
 
 function enrollmentRunStatus(enrollment: StoreEnrollment): "never_run" | "running" | "success" | "failed" {
@@ -355,6 +349,7 @@ type CommandExecutionResult = {
 
 type CommandExecutionPage = {
   executions: StoreCommandExecution[];
+  summary: ExecutionStats;
   pagination: { page: number; pageSize: number; total: number; totalPages: number };
 };
 
@@ -391,7 +386,7 @@ function CommandExecutionPanel({ store }: { store: Store }) {
   });
   const { data: scriptData } = useQuery({
     queryKey: ["scripts", "command-agent", hostPlatform],
-    queryFn: () => api.get<{ scripts: ManagedScriptSummary[] }>(`/api/scripts${hostPlatform ? `?platform=${hostPlatform}` : ""}`),
+    queryFn: () => api.get<{ scripts: ManagedScriptSummary[] }>(`/api/scripts?${new URLSearchParams({ ...(hostPlatform ? { platform: hostPlatform } : {}), pageSize: "100" })}`),
     enabled: Boolean(hostPlatform)
   });
   const { data: selectedScriptData } = useQuery({
@@ -497,6 +492,7 @@ function CommandExecutionPanel({ store }: { store: Store }) {
   const agent = store.commandAgent!;
   const executions = executionData?.executions ?? [];
   const historyPagination = executionData?.pagination;
+  const historySummary = executionData?.summary ?? { total: 0, succeeded: 0, failed: 0, timedOut: 0, running: 0 };
   const enrollmentById = new Map((store.enrollments ?? []).map((enrollment) => [enrollment.id, enrollment]));
   useEffect(() => {
     if (expandLatestAfterExecution && executions[0]) {
@@ -528,7 +524,7 @@ function CommandExecutionPanel({ store }: { store: Store }) {
         {executionMode === "saved" && selectedScript && selectedScriptVersion && <div className="command-script-preview"><header><div><strong>Script preview</strong><span>{selectedScript.name} · Version {selectedScriptVersion.version}</span></div><code>{selectedScript.language}</code></header><ScriptEditor value={selectedScriptVersion.content} language={selectedScript.language} height="220px" readOnly /></div>}
         <div className="command-execution-controls"><label className="field"><span className="field-label">Timeout (seconds) <FieldHelp text="The maximum time the command agent may let this script run before terminating it. Allowed range: 1 to 300 seconds." /></span><input type="number" min={1} max={300} value={timeoutSeconds} onChange={(event) => setTimeoutSeconds(Math.min(300, Math.max(1, Number(event.target.value) || 1)))} /></label><button className="button button-primary command-execute-button" type="button" disabled={!canExecute} onClick={() => execute.mutate()}><TerminalSquare size={15} />{execute.isPending ? "Executing..." : "Execute script"}</button></div>
       </>}
-      <div className="command-execution-history"><header><h4>Execution history</h4><div className="command-history-head-actions"><span>{historyPagination?.total ?? 0} run{historyPagination?.total === 1 ? "" : "s"}</span><button className="icon-button" type="button" title="Refresh execution history" aria-label="Refresh execution history" disabled={refreshHistory.isPending} onClick={() => refreshHistory.mutate()}><RefreshCw size={14} className={refreshHistory.isPending ? "spin-icon" : undefined} /></button></div></header>{executions.length ? executions.map((execution: StoreCommandExecution) => {
+      <div className="command-execution-history"><header><h4>Execution history</h4><div className="command-history-head-actions"><ExecutionStatsSummary stats={historySummary} /><span>{historyPagination?.total ?? 0} run{historyPagination?.total === 1 ? "" : "s"}</span><button className="icon-button" type="button" title="Refresh execution history" aria-label="Refresh execution history" disabled={refreshHistory.isPending} onClick={() => refreshHistory.mutate()}><RefreshCw size={14} className={refreshHistory.isPending ? "spin-icon" : undefined} /></button></div></header>{executions.length ? executions.map((execution: StoreCommandExecution) => {
         const enrollment = execution.enrollmentId ? enrollmentById.get(execution.enrollmentId) : undefined;
         const environment = enrollment ? enrollmentEnvironment(enrollment) : "Enrollment unavailable";
         const computerName = enrollment ? enrollmentComputerName(enrollment) : "Enrollment unavailable";
@@ -537,7 +533,7 @@ function CommandExecutionPanel({ store }: { store: Store }) {
         const inlineName = execution.scriptName ?? "Inline script";
         const isSaving = saveInlineExecution.isPending && saveInlineExecution.variables?.id === execution.id;
         const executionLanguage = execution.language ?? (execution.platform === "windows" ? "powershell" : "bash");
-        return <details className={`command-execution command-execution-${execution.status}`} key={execution.id} open={expandedExecutionId === execution.id} onToggle={(event) => { if (event.currentTarget.open) setExpandedExecutionId(execution.id); else if (expandedExecutionId === execution.id) setExpandedExecutionId(null); }}><summary><span><StatusBadge status={execution.status} label={statusLabel} />{execution.scriptType === "inline" ? <><span className="command-execution-source-tag">inline</span>{execution.savedScriptId ? <Link className="command-execution-script-link" to={`/scripts?scriptId=${encodeURIComponent(execution.savedScriptId)}&version=1`} onClick={(event) => event.stopPropagation()}>{inlineName}</Link> : <strong className="command-execution-inline-name">{inlineName}</strong>}</> : execution.scriptId ? <Link className="command-execution-script-link" to={`/scripts?scriptId=${encodeURIComponent(execution.scriptId)}${execution.scriptVersion ? `&version=${execution.scriptVersion}` : ""}`} onClick={(event) => event.stopPropagation()}>{scriptLabel}</Link> : <strong>{scriptLabel}</strong>}<code>{computerName} · {environment}</code></span><span className="command-execution-timing"><time>{new Date(execution.startedAt).toLocaleString()}</time><code>{execution.elapsedMs !== null ? `${execution.elapsedMs} ms` : execution.status === "running" ? "running" : "-"}</code></span></summary>{expandedExecutionId === execution.id && <div className="command-execution-body">{execution.scriptType === "inline" && <div className="command-execution-actions">{execution.savedScriptId ? <Link className="button button-secondary button-small" to={`/scripts?scriptId=${encodeURIComponent(execution.savedScriptId)}&version=1`}><ScrollText size={14} />Open saved script</Link> : <button className="button button-secondary button-small" type="button" disabled={isSaving} onClick={() => saveInlineExecution.mutate(execution)}><Save size={14} />{isSaving ? "Saving..." : "Save script"}</button>}</div>}<ScriptEditor value={execution.script} language={executionLanguage} height="200px" readOnly />{execution.error && <div className="inline-alert">{execution.error}</div>}{execution.stdout && <div className="command-output-block"><header><strong>stdout</strong><CopyButton value={execution.stdout} label="Copy stdout" iconOnly /></header><pre>{execution.stdout}</pre></div>}{execution.stderr && <div className="command-output-block"><header><strong>stderr</strong><CopyButton value={execution.stderr} label="Copy stderr" iconOnly /></header><pre>{execution.stderr}</pre></div>}{!execution.stdout && !execution.stderr && !execution.error && <div className="quiet-empty">The script produced no output.</div>}</div>}</details>;
+        return <details className={`command-execution command-execution-${execution.status}`} key={execution.id} open={expandedExecutionId === execution.id} onToggle={(event) => { if (event.currentTarget.open) setExpandedExecutionId(execution.id); else if (expandedExecutionId === execution.id) setExpandedExecutionId(null); }}><summary><span><StatusBadge status={execution.status} label={statusLabel} />{execution.scriptType === "inline" ? <><span className="command-execution-source-tag">inline</span>{execution.savedScriptId ? <Link className="command-execution-script-link" to={`/scripts?scriptId=${encodeURIComponent(execution.savedScriptId)}&version=1`} onClick={(event) => event.stopPropagation()}>{inlineName}</Link> : <strong className="command-execution-inline-name">{inlineName}</strong>}</> : execution.scriptId ? <Link className="command-execution-script-link" to={`/scripts?scriptId=${encodeURIComponent(execution.scriptId)}${execution.scriptVersion ? `&version=${execution.scriptVersion}` : ""}`} onClick={(event) => event.stopPropagation()}>{scriptLabel}</Link> : <strong>{scriptLabel}</strong>}<span className="host-identity" title={environment}><HostPlatformIcon environment={enrollment?.environment} platform={enrollment?.platform} osName={enrollment?.hostInfo.osName} /><code>{computerName}</code></span><code>· {environment}</code></span><span className="command-execution-timing"><time>{new Date(execution.startedAt).toLocaleString()}</time><code>{execution.elapsedMs !== null ? `${execution.elapsedMs} ms` : execution.status === "running" ? "running" : "-"}</code></span></summary>{expandedExecutionId === execution.id && <div className="command-execution-body">{execution.scriptType === "inline" && <div className="command-execution-actions">{execution.savedScriptId ? <Link className="button button-secondary button-small" to={`/scripts?scriptId=${encodeURIComponent(execution.savedScriptId)}&version=1`}><ScrollText size={14} />Open saved script</Link> : <button className="button button-secondary button-small" type="button" disabled={isSaving} onClick={() => saveInlineExecution.mutate(execution)}><Save size={14} />{isSaving ? "Saving..." : "Save script"}</button>}</div>}<ScriptEditor value={execution.script} language={executionLanguage} height="200px" readOnly />{execution.error && <div className="inline-alert">{execution.error}</div>}{execution.stdout && <div className="command-output-block"><header><strong>stdout</strong><CopyButton value={execution.stdout} label="Copy stdout" iconOnly /></header><pre>{execution.stdout}</pre></div>}{execution.stderr && <div className="command-output-block"><header><strong>stderr</strong><CopyButton value={execution.stderr} label="Copy stderr" iconOnly /></header><pre>{execution.stderr}</pre></div>}{!execution.stdout && !execution.stderr && !execution.error && <div className="quiet-empty">The script produced no output.</div>}</div>}</details>;
       }) : <div className="quiet-empty">No scripts have been executed for this store.</div>}{historyPagination && historyPagination.totalPages > 1 && <div className="command-history-pagination"><button className="icon-button" type="button" title="Previous execution page" aria-label="Previous execution page" disabled={historyPagination.page <= 1} onClick={() => { setExpandedExecutionId(null); setHistoryPage((page) => Math.max(1, page - 1)); }}><ChevronLeft size={15} /></button><span>Page {historyPagination.page} of {historyPagination.totalPages}</span><button className="icon-button" type="button" title="Next execution page" aria-label="Next execution page" disabled={historyPagination.page >= historyPagination.totalPages} onClick={() => { setExpandedExecutionId(null); setHistoryPage((page) => page + 1); }}><ChevronRight size={15} /></button></div>}</div>
     </section>
     <Modal open={quickCreateOpen} title="Create new script" onClose={() => setQuickCreateOpen(false)} width="wide">

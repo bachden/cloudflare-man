@@ -149,11 +149,13 @@ function createMcpServer(app: FastifyInstance, token: string): McpServer {
     storeId: z.string().uuid(),
     enrollmentId: z.string().uuid()
   }, (args) => callApi(app, token, "GET", `/api/stores/${args.storeId}/enrollments/${args.enrollmentId}/logs`));
-  registerApiTool(server, app, token, "cfman_list_scripts", "List saved scripts with optional platform and case-insensitive name filters.", {
+  registerApiTool(server, app, token, "cfman_list_scripts", "List saved scripts with pagination, execution statistics, and optional platform and case-insensitive name filters.", {
     platform: z.enum(["windows", "unix"]).optional(),
-    name: z.string().optional()
+    name: z.string().optional(),
+    page: z.number().int().min(1).default(1),
+    pageSize: z.number().int().min(5).max(100).default(50)
   }, (args) => {
-    const params = new URLSearchParams();
+    const params = new URLSearchParams({ page: String(args.page), pageSize: String(args.pageSize) });
     if (args.platform) params.set("platform", args.platform);
     if (args.name) params.set("name", args.name);
     return callApi(app, token, "GET", `/api/scripts?${params}`);
@@ -189,6 +191,7 @@ function createMcpServer(app: FastifyInstance, token: string): McpServer {
     apiToken: z.string().optional(),
     softTunnelLimit: z.number().int().min(1).max(1000).default(750),
     initialZoneName: z.string().optional(),
+    supportEmail: z.string().email().nullable().default(null),
     rdpAllowedEmails: z.array(z.string().email()).default([])
   }, (args) => callApi(app, token, "POST", "/api/accounts", args));
   registerApiTool(server, app, token, "cfman_delete_account", "Delete an unused account pool entry; the API rejects accounts still assigned to stores.", {
@@ -210,6 +213,13 @@ function createMcpServer(app: FastifyInstance, token: string): McpServer {
   }, (args) => {
     const { accountId, ...body } = args;
     return callApi(app, token, "PATCH", `/api/accounts/${accountId}/rdp-settings`, body);
+  });
+  registerApiTool(server, app, token, "cfman_update_account_support_email", "Set or clear the operator-facing support email shown for one Cloudflare account.", {
+    accountId: z.string().uuid(),
+    supportEmail: z.string().email().nullable()
+  }, (args) => {
+    const { accountId, ...body } = args;
+    return callApi(app, token, "PATCH", `/api/accounts/${accountId}/support`, body);
   });
   registerApiTool(server, app, token, "cfman_sync_account", "Synchronize one Cloudflare account's zones, tunnels, and statuses.", {
     accountId: z.string().uuid()

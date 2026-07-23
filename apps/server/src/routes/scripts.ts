@@ -40,6 +40,13 @@ const scriptSummary = `jsonb_build_object(
   'description', s.description,
   'latestVersion', latest.version,
   'latestVersionId', latest.id,
+  'executionStats', jsonb_build_object(
+    'total', execution_stats.total,
+    'succeeded', execution_stats.succeeded,
+    'failed', execution_stats.failed,
+    'timedOut', execution_stats."timedOut",
+    'running', execution_stats.running
+  ),
   'updatedAt', s.updated_at,
   'createdAt', s.created_at
 )`;
@@ -48,24 +55,57 @@ export async function scriptRoutes(app: FastifyInstance): Promise<void> {
   app.get("/api/scripts", { preHandler: requireAuth }, async (request) => {
     const query = z.object({
       platform: platformSchema.optional(),
-      name: z.string().trim().max(120).optional()
+      name: z.string().trim().max(120).optional(),
+      page: z.coerce.number().int().min(1).default(1),
+      pageSize: z.coerce.number().int().min(5).max(100).default(100)
     }).parse(request.query);
-    const result = await pool.query(
-      `SELECT ${scriptSummary} AS script
+    const offset = (query.page - 1) * query.pageSize;
+    const [result, countResult] = await Promise.all([
+      pool.query(
+        `SELECT ${scriptSummary} AS script
          FROM managed_scripts s
          LEFT JOIN LATERAL (
            SELECT v.id, v.version
              FROM managed_script_versions v
             WHERE v.script_id = s.id
             ORDER BY v.version DESC
-            LIMIT 1
+           LIMIT 1
          ) latest ON true
+         LEFT JOIN LATERAL (
+           SELECT count(*)::int AS total,
+                  (count(*) FILTER (WHERE ce.status = 'succeeded'))::int AS succeeded,
+                  (count(*) FILTER (WHERE ce.status = 'failed'))::int AS failed,
+                  (count(*) FILTER (WHERE ce.status = 'timed_out'))::int AS "timedOut",
+                  (count(*) FILTER (WHERE ce.status = 'running'))::int AS running
+             FROM store_command_executions ce
+             LEFT JOIN managed_script_versions executed_version ON executed_version.id = ce.script_version_id
+             LEFT JOIN managed_script_versions saved_version ON saved_version.id = ce.saved_script_version_id
+            WHERE executed_version.script_id = s.id OR saved_version.script_id = s.id
+         ) execution_stats ON true
         WHERE ($1::text IS NULL OR s.platform = $1)
           AND ($2::text IS NULL OR s.name ILIKE '%' || $2 || '%')
-        ORDER BY s.name, s.platform`,
-      [query.platform ?? null, query.name || null]
-    );
-    return { scripts: result.rows.map((row) => row.script) };
+        ORDER BY s.name, s.platform
+        LIMIT $3 OFFSET $4`,
+        [query.platform ?? null, query.name || null, query.pageSize, offset]
+      ),
+      pool.query(
+        `SELECT count(*)::int AS total
+           FROM managed_scripts s
+          WHERE ($1::text IS NULL OR s.platform = $1)
+            AND ($2::text IS NULL OR s.name ILIKE '%' || $2 || '%')`,
+        [query.platform ?? null, query.name || null]
+      )
+    ]);
+    const total = countResult.rows[0].total as number;
+    return {
+      scripts: result.rows.map((row) => row.script),
+      pagination: {
+        page: query.page,
+        pageSize: query.pageSize,
+        total,
+        totalPages: Math.max(1, Math.ceil(total / query.pageSize))
+      }
+    };
   });
 
   app.get("/api/scripts/:id", { preHandler: requireAuth }, async (request, reply) => {
@@ -103,13 +143,14 @@ export async function scriptRoutes(app: FastifyInstance): Promise<void> {
       LEFT JOIN managed_script_versions saved_version ON saved_version.id = ce.saved_script_version_id
      WHERE (executed_version.script_id = $1 OR saved_version.script_id = $1)
        AND ($2::int IS NULL OR COALESCE(executed_version.version, saved_version.version) = $2)`;
-    const [executionResult, countResult] = await Promise.all([
+    const [executionResult, statsResult] = await Promise.all([
       pool.query(
         `SELECT ce.id,
                 ce.store_id AS "storeId", st.display_name AS "storeDisplayName",
                 st.tenant_code AS "tenantCode", st.store_code AS "storeCode",
                 ce.enrollment_id AS "enrollmentId",
                 NULLIF(e.host_info->>'machineName', '') AS "computerName",
+                NULLIF(e.host_info->>'osName', '') AS "osName",
                 e.platform AS environment, e.platform AS "enrollmentPlatform",
                 ce.script_type AS "scriptType",
                 $1::uuid AS "scriptId",
@@ -130,13 +171,23 @@ export async function scriptRoutes(app: FastifyInstance): Promise<void> {
          LIMIT $3 OFFSET $4`,
         [id, query.version ?? null, query.pageSize, offset]
       ),
-      pool.query(`SELECT count(*)::int AS total ${joins}`, [id, query.version ?? null])
+      pool.query(
+        `SELECT count(*)::int AS total,
+                (count(*) FILTER (WHERE ce.status = 'succeeded'))::int AS succeeded,
+                (count(*) FILTER (WHERE ce.status = 'failed'))::int AS failed,
+                (count(*) FILTER (WHERE ce.status = 'timed_out'))::int AS "timedOut",
+                (count(*) FILTER (WHERE ce.status = 'running'))::int AS running
+         ${joins}`,
+        [id, query.version ?? null]
+      )
     ]);
-    const total = countResult.rows[0].total as number;
+    const summary = statsResult.rows[0];
+    const total = summary.total as number;
     return {
       scriptId: id,
       version: query.version ?? null,
       executions: executionResult.rows,
+      summary,
       pagination: {
         page: query.page,
         pageSize: query.pageSize,
