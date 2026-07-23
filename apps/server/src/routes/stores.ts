@@ -100,10 +100,6 @@ const enrollmentSchema = z.object({
   expiresInHours: z.number().int().min(1).max(168).default(24)
 });
 
-const enrollmentDeleteSchema = z.object({
-  mode: z.enum(["soft", "hard"]).default("soft")
-});
-
 const executeScriptSchema = z.object({
   scriptVersionId: z.string().uuid(),
   timeoutMs: z.number().int().min(1_000).max(300_000).default(60_000)
@@ -495,7 +491,6 @@ export async function storeRoutes(app: FastifyInstance): Promise<void> {
       storeId: z.string().uuid(),
       enrollmentId: z.string().uuid()
     }).parse(request.params);
-    const body = enrollmentDeleteSchema.parse(request.body ?? {});
     const deleted = await withTransaction(async (client) => {
       const result = await client.query(
         `SELECT e.id, e.deleted_at,
@@ -521,19 +516,8 @@ export async function storeRoutes(app: FastifyInstance): Promise<void> {
       const enrollment = result.rows[0];
       if (!enrollment) return { kind: "missing" as const };
       if (enrollment.is_current) return { kind: "current" as const };
-      if (enrollment.deleted_at) return { kind: "already_deleted" as const, deletedAt: enrollment.deleted_at as string };
-      const hardDelete = body.mode === "hard" || enrollment.log_count === 0;
       const deletedAt = new Date().toISOString();
-      if (hardDelete) {
-        await client.query("DELETE FROM enrollments WHERE store_id = $1 AND id = $2", [storeId, enrollmentId]);
-      } else {
-        await client.query(
-          `UPDATE enrollments
-              SET deleted_at = $3, deleted_by = $4, updated_at = now()
-            WHERE store_id = $1 AND id = $2`,
-          [storeId, enrollmentId, deletedAt, request.authUser!.id]
-        );
-      }
+      await client.query("DELETE FROM enrollments WHERE store_id = $1 AND id = $2", [storeId, enrollmentId]);
       const activeEnrollment = await client.query(
         `SELECT 1
            FROM enrollments
@@ -557,14 +541,13 @@ export async function storeRoutes(app: FastifyInstance): Promise<void> {
         action: "enrollment.deleted",
         entityType: "enrollment",
         entityId: enrollmentId,
-        details: { storeId, hardDelete, logCount: enrollment.log_count }
+        details: { storeId, hardDelete: true, logCount: enrollment.log_count }
       }, client);
-      return { kind: "deleted" as const, deletedAt, hardDelete, logCount: enrollment.log_count as number };
+      return { kind: "deleted" as const, deletedAt, logCount: enrollment.log_count as number };
     });
     if (deleted.kind === "missing") return reply.code(404).send({ error: "Enrollment not found" });
     if (deleted.kind === "current") return reply.code(409).send({ error: "The current connected enrollment cannot be deleted" });
-    if (deleted.kind === "already_deleted") return { success: true, deletedAt: deleted.deletedAt, hardDeleted: false, alreadyDeleted: true };
-    return { success: true, deletedAt: deleted.deletedAt, hardDeleted: deleted.hardDelete, logCount: deleted.logCount, alreadyDeleted: false };
+    return { success: true, deletedAt: deleted.deletedAt, hardDeleted: true, logCount: deleted.logCount, alreadyDeleted: false };
   });
 
   app.post("/api/stores/:storeId/enrollments/:enrollmentId/unenroll", { preHandler: requireAuth }, async (request, reply) => {

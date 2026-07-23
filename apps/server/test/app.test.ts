@@ -670,21 +670,23 @@ test("tracks enrollment history and issues cleanup for a running tunnel", async 
   assert.equal(logs.statusCode, 200, logs.body);
   assert.equal(logs.json().logs.length, 3);
 
-  const softDeleted = await app.inject({
+  const hardDeleted = await app.inject({
     method: "DELETE",
     url: `/api/stores/${storeId}/enrollments/${enrollmentId}`,
     headers: { cookie: sessionCookie }
   });
-  assert.equal(softDeleted.statusCode, 200, softDeleted.body);
-  assert.equal(softDeleted.json().alreadyDeleted, false);
+  assert.equal(hardDeleted.statusCode, 200, hardDeleted.body);
+  assert.equal(hardDeleted.json().alreadyDeleted, false);
+  assert.equal(hardDeleted.json().hardDeleted, true);
   const deletedDetail = await app.inject({ method: "GET", url: `/api/stores/${storeId}`, headers: { cookie: sessionCookie } });
   assert.equal(deletedDetail.statusCode, 200, deletedDetail.body);
   const deletedEnrollment = deletedDetail.json().store.enrollments.find((item: { id: string }) => item.id === enrollmentId);
-  assert.ok(deletedEnrollment.deletedAt);
-  assert.equal(deletedEnrollment.computerName, "STORE-WIN-01");
+  assert.equal(deletedEnrollment, undefined);
+  const deletedLogs = await pool.query("SELECT 1 FROM enrollment_logs WHERE enrollment_id = $1", [enrollmentId]);
+  assert.equal(deletedLogs.rowCount, 0);
 
-  const retainedExecution = deletedDetail.json().store.commandExecutions.find((item: { enrollmentId: string | null }) => item.enrollmentId === enrollmentId);
-  assert.ok(retainedExecution, "Execution history must retain the soft-deleted enrollment reference");
+  const orphanedExecution = deletedDetail.json().store.commandExecutions.find((item: { enrollmentId: string | null }) => item.enrollmentId === null);
+  assert.ok(orphanedExecution, "Command execution rows remain available without the deleted enrollment");
 });
 
 test("preflights and force-deletes a store with explicit name confirmation", async () => {
