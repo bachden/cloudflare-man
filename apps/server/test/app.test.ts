@@ -107,6 +107,7 @@ test("enables MCP and exposes structured tools with reusable identifiers", async
   assert.ok(listed.json().result.tools.some((tool: { name: string }) => tool.name === "cfman_execute_inline_script"));
   assert.ok(listed.json().result.tools.some((tool: { name: string }) => tool.name === "cfman_save_inline_execution_as_script"));
   assert.ok(listed.json().result.tools.some((tool: { name: string }) => tool.name === "cfman_get_script_execution_history"));
+  assert.ok(listed.json().result.tools.some((tool: { name: string }) => tool.name === "cfman_delete_script"));
   assert.ok(listed.json().result.tools.some((tool: { name: string }) => tool.name === "cfman_get_store_execution_history"));
   assert.ok(listed.json().result.tools.some((tool: { name: string }) => tool.name === "cfman_update_account_support_email"));
 
@@ -667,6 +668,13 @@ test("updates all ingress routes on an existing tunnel", async () => {
   assert.deepEqual(agentRoute.rows[0], { route_kind: "command_agent", service_url: "http://127.0.0.1:47831" });
 });
 
+test("keeps configured ingress paths as the source of truth", async () => {
+  const { pathPrefixPattern } = await import("../src/lib/provisioning.js");
+  assert.equal(pathPrefixPattern("/exec"), "/exec");
+  assert.equal(pathPrefixPattern("/agent/v1"), "/agent/v1");
+  assert.equal(pathPrefixPattern("/"), undefined);
+});
+
 test("installer report activates a mock store", async () => {
   const report = await app.inject({
     method: "POST",
@@ -732,16 +740,16 @@ test("installer report activates a mock store", async () => {
 test("executes a script through the configured store command agent", async () => {
   const detail = await app.inject({ method: "GET", url: `/api/stores/${storeId}`, headers: { cookie: sessionCookie } });
   assert.equal(detail.statusCode, 200, detail.body);
-  assert.equal(detail.json().store.commandAgent.endpoint, "https://0001-ops.stores-a.example/agent/exec");
+  assert.equal(detail.json().store.commandAgent.endpoint, "https://0001-ops.stores-a.example/agent");
   assert.equal(detail.json().store.commandAgent.status, "ready");
   const list = await app.inject({ method: "GET", url: "/api/stores?page=1&pageSize=25", headers: { cookie: sessionCookie } });
   assert.equal(list.statusCode, 200, list.body);
-  assert.equal(list.json().stores.find((store: { id: string }) => store.id === storeId).commandAgent.endpoint, "https://0001-ops.stores-a.example/agent/exec");
+  assert.equal(list.json().stores.find((store: { id: string }) => store.id === storeId).commandAgent.endpoint, "https://0001-ops.stores-a.example/agent");
 
   const originalFetch = globalThis.fetch;
   let executionCall = 0;
   globalThis.fetch = async (input, init) => {
-    assert.equal(String(input), "https://0001-ops.stores-a.example/agent/exec");
+    assert.equal(String(input), "https://0001-ops.stores-a.example/agent");
     const headers = new Headers(init?.headers);
     assert.match(headers.get("X-Cloudflare-Man-Agent-Token") ?? "", /^[A-Za-z0-9_-]{40,}$/);
     executionCall += 1;
@@ -773,7 +781,7 @@ test("executes a script through the configured store command agent", async () =>
       stderr: response.json().stderr,
       durationMs: response.json().durationMs
     }, {
-      endpoint: "https://0001-ops.stores-a.example/agent/exec",
+      endpoint: "https://0001-ops.stores-a.example/agent",
       success: true,
       exitCode: 0,
       stdout: "ready\n",
@@ -884,7 +892,7 @@ test("executes a script through the configured store command agent", async () =>
     assert.equal(historyResult.executions[0].enrollmentId, enrollmentId);
     assert.equal(historyResult.executions[0].osName, "Microsoft Windows 11 Pro");
     assert.equal(historyResult.executions[0].anchorScriptVersionId, savedInlineResult.versionId);
-    assert.equal(historyResult.executions[0].scriptType, "inline");
+    assert.equal(historyResult.executions[0].scriptType, "managed");
     assert.ok(scriptHistory.json().result.structuredContent.references.some((reference: { path: string; value: string }) => reference.path === "response.executions[0].storeId" && reference.value === storeId));
   } finally {
     globalThis.fetch = originalFetch;
@@ -910,14 +918,14 @@ test("executes a script through the configured store command agent", async () =>
     status: executions.rows[2].status,
     stdout: executions.rows[2].stdout
   }, {
-    scriptVersionId: null,
-    scriptType: "inline",
+    scriptVersionId: executions.rows[2].saved_script_version_id,
+    scriptType: "managed",
     scriptName: "MCP quick check",
     savedScriptId: executions.rows[2].saved_script_id,
     savedScriptVersionId: executions.rows[2].saved_script_version_id,
     scriptPlatform: "windows",
     scriptLanguage: "powershell",
-    scriptVersion: null,
+    scriptVersion: 1,
     status: "succeeded",
     stdout: "inline\n"
   });
@@ -930,14 +938,15 @@ test("executes a script through the configured store command agent", async () =>
   const refreshedDetail = await app.inject({ method: "GET", url: `/api/stores/${storeId}`, headers: { cookie: sessionCookie } });
   assert.equal(refreshedDetail.statusCode, 200, refreshedDetail.body);
   const latestExecution = refreshedDetail.json().store.commandExecutions[0];
-  assert.equal(latestExecution.scriptType, "inline");
-  assert.equal(latestExecution.scriptId, null);
-  assert.equal(latestExecution.scriptVersionId, null);
+  assert.equal(latestExecution.scriptType, "managed");
+  assert.match(latestExecution.scriptId, /^[0-9a-f-]{36}$/);
+  assert.equal(latestExecution.scriptId, latestExecution.savedScriptId);
+  assert.equal(latestExecution.scriptVersionId, latestExecution.savedScriptVersionId);
   assert.equal(latestExecution.scriptName, "MCP quick check");
   assert.match(latestExecution.savedScriptId, /^[0-9a-f-]{36}$/);
   assert.match(latestExecution.savedScriptVersionId, /^[0-9a-f-]{36}$/);
   assert.ok(latestExecution.savedAt);
-  assert.equal(latestExecution.scriptVersion, null);
+  assert.equal(latestExecution.scriptVersion, 1);
 
   const paginatedHistory = await app.inject({ method: "GET", url: `/api/stores/${storeId}/command-executions?page=1&pageSize=5`, headers: { cookie: sessionCookie } });
   assert.equal(paginatedHistory.statusCode, 200, paginatedHistory.body);
@@ -950,6 +959,45 @@ test("executes a script through the configured store command agent", async () =>
   assert.equal(scriptListWithStats.statusCode, 200, scriptListWithStats.body);
   const readinessScript = scriptListWithStats.json().scripts.find((script: { name: string }) => script.name === "Store readiness check");
   assert.deepEqual(readinessScript.executionStats, { total: 2, succeeded: 1, failed: 1, timedOut: 0, running: 0 });
+});
+
+test("deletes a saved script and all related execution history", async () => {
+  const created = await app.inject({
+    method: "POST",
+    url: "/api/scripts",
+    headers: { cookie: sessionCookie },
+    payload: {
+      name: "Disposable script",
+      platform: "windows",
+      language: "powershell",
+      description: "Delete behavior test",
+      content: "Write-Output 'delete me'"
+    }
+  });
+  assert.equal(created.statusCode, 201, created.body);
+  const scriptId = created.json().id as string;
+  const versionId = created.json().versionId as string;
+  const execution = await pool.query(
+    `INSERT INTO store_command_executions(
+       store_id, enrollment_id, script_version_id, script, timeout_ms, status,
+       finished_at, elapsed_ms, script_name, script_platform, script_language, script_version_number
+     ) VALUES ($1, $2, $3, $4, 30000, 'succeeded', now(), 5, $5, 'windows', 'powershell', 1)
+     RETURNING id`,
+    [storeId, enrollmentId, versionId, "Write-Output 'delete me'", "Disposable script"]
+  );
+
+  const deleted = await app.inject({ method: "DELETE", url: `/api/scripts/${scriptId}`, headers: { cookie: sessionCookie } });
+  assert.equal(deleted.statusCode, 200, deleted.body);
+  assert.deepEqual(deleted.json(), {
+    success: true,
+    scriptId,
+    scriptName: "Disposable script",
+    deletedExecutionCount: 1
+  });
+  assert.equal((await pool.query("SELECT 1 FROM managed_scripts WHERE id = $1", [scriptId])).rowCount, 0);
+  assert.equal((await pool.query("SELECT 1 FROM store_command_executions WHERE id = $1", [execution.rows[0].id])).rowCount, 0);
+  const audit = await pool.query("SELECT details FROM audit_logs WHERE action = 'script.deleted' AND entity_id = $1", [scriptId]);
+  assert.equal(audit.rows[0].details.deletedExecutionCount, 1);
 });
 
 test("rejects a second command agent route for the same store", async () => {

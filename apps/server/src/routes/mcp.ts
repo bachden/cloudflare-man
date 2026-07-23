@@ -331,6 +331,9 @@ function createMcpServer(app: FastifyInstance, token: string): McpServer {
     const { scriptId, ...body } = args;
     return callApi(app, token, "PATCH", `/api/scripts/${scriptId}`, body);
   });
+  registerApiTool(server, app, token, "cfman_delete_script", "Permanently delete a saved script, all of its versions, and every related execution history record.", {
+    scriptId: z.string().uuid()
+  }, (args) => callApi(app, token, "DELETE", `/api/scripts/${args.scriptId}`));
   registerApiTool(server, app, token, "cfman_create_script_version", "Append a new immutable version to a saved script.", {
     scriptId: z.string().uuid(),
     content: z.string().min(1)

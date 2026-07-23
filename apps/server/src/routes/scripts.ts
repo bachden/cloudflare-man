@@ -247,6 +247,37 @@ export async function scriptRoutes(app: FastifyInstance): Promise<void> {
     return { success: Boolean(result.rowCount) };
   });
 
+  app.delete("/api/scripts/:id", { preHandler: requireAuth }, async (request, reply) => {
+    const { id } = z.object({ id: z.string().uuid() }).parse(request.params);
+    const deleted = await withTransaction(async (client) => {
+      const script = await client.query("SELECT id, name FROM managed_scripts WHERE id = $1 FOR UPDATE", [id]);
+      if (!script.rowCount) return null;
+      const executions = await client.query(
+        `DELETE FROM store_command_executions
+          WHERE script_version_id IN (SELECT id FROM managed_script_versions WHERE script_id = $1)
+             OR saved_script_id = $1
+             OR saved_script_version_id IN (SELECT id FROM managed_script_versions WHERE script_id = $1)
+        RETURNING id`,
+        [id]
+      );
+      await client.query("DELETE FROM managed_scripts WHERE id = $1", [id]);
+      await writeAudit({
+        actorUserId: request.authUser!.id,
+        action: "script.deleted",
+        entityType: "script",
+        entityId: id,
+        details: { name: script.rows[0].name, deletedExecutionCount: executions.rowCount }
+      }, client);
+      return {
+        scriptId: id,
+        scriptName: script.rows[0].name as string,
+        deletedExecutionCount: executions.rowCount ?? 0
+      };
+    });
+    if (!deleted) return reply.code(404).send({ error: "Script not found" });
+    return { success: true, ...deleted };
+  });
+
   app.post("/api/scripts/:id/versions", { preHandler: requireAuth }, async (request, reply) => {
     const { id } = z.object({ id: z.string().uuid() }).parse(request.params);
     const body = versionSchema.parse(request.body);

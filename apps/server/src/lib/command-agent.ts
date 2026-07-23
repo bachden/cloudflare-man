@@ -47,12 +47,11 @@ export async function getCommandAgentConfig(storeId: string): Promise<CommandAge
   );
   const row = result.rows[0];
   if (!row) return null;
-  const path = row.path === "/" ? "" : String(row.path).replace(/\/$/, "");
   return {
     storeId: row.store_id,
     hostname: row.hostname,
     path: row.path,
-    endpoint: `https://${row.hostname}${path}/exec`,
+    endpoint: `https://${row.hostname}${row.path}`,
     token: decryptSecret(row.token_encrypted),
     status: row.status,
     lastSeenAt: row.last_seen_at,

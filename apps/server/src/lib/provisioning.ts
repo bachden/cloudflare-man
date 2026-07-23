@@ -37,13 +37,9 @@ type ProvisioningResult = {
   providerMode: "live" | "mock";
 };
 
-function escapeRegex(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
 export function pathPrefixPattern(path: string): string | undefined {
   if (path === "/") return undefined;
-  return `^${escapeRegex(path)}(?:/.*)?$`;
+  return path;
 }
 
 function ingressRules(publications: Publication[]): CloudflareIngressRule[] {

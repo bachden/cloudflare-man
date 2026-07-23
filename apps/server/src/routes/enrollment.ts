@@ -136,9 +136,6 @@ class Handler(BaseHTTPRequestHandler):
             self.respond(404, {"error": "Not found"})
 
     def do_POST(self):
-        if not self.path.endswith("/exec"):
-            self.respond(404, {"error": "Not found"})
-            return
         if self.headers.get("X-Cloudflare-Man-Agent-Token") != TOKEN:
             self.respond(401, {"error": "Invalid command agent token"})
             return
@@ -220,7 +217,7 @@ while ($true) {
       Send-JsonResponse $context 401 @{ error = "Invalid command agent token" }
       continue
     }
-    if ($context.Request.HttpMethod -ne "POST" -or -not $path.EndsWith("/exec")) {
+    if ($context.Request.HttpMethod -ne "POST") {
       Send-JsonResponse $context 404 @{ error = "Not found" }
       continue
     }

@@ -26,20 +26,13 @@ const optionalServiceUrlSchema = z.preprocess(
 const routeKindSchema = z.enum(["service", "command_agent"]);
 const routeSchema = z.object({
   kind: routeKindSchema.default("service"),
-  path: z.string().trim().min(1).max(200).regex(/^\//, "Path must start with /").transform(normalizePath),
+  path: z.string().trim().min(1).max(200).regex(/^\//, "Path must start with /"),
   serviceUrl: optionalServiceUrlSchema
 }).superRefine((route, context) => {
   if (route.kind === "service" && !route.serviceUrl) {
     context.addIssue({ code: "custom", path: ["serviceUrl"], message: "A service URL is required" });
   }
 });
-
-function normalizePath(value: string): string {
-  let path = value.trim();
-  if (path.endsWith("/*")) path = path.slice(0, -2);
-  if (path.length > 1) path = path.replace(/\/+$/, "");
-  return path || "/";
-}
 
 const publicationSchema = z.object({
   suffix: z.string().trim().max(30).regex(
@@ -430,8 +423,7 @@ const commandAgentJson = `(
     'enabled', true,
     'hostname', p.hostname,
     'path', r.path,
-    'endpoint', CASE WHEN r.path = '/' THEN 'https://' || p.hostname || '/exec'
-                     ELSE 'https://' || p.hostname || r.path || '/exec' END,
+    'endpoint', 'https://' || p.hostname || r.path,
     'status', ca.status,
     'lastSeenAt', ca.last_seen_at,
     'lastError', ca.last_error
@@ -1048,7 +1040,6 @@ export async function storeRoutes(app: FastifyInstance): Promise<void> {
       );
       const execution = executionResult.rows[0];
       if (!execution) return null;
-      if (execution.script_type !== "inline") return { error: "Only inline executions can be saved to the script library" } as const;
       if (execution.saved_script_id && execution.saved_script_version_id) {
         return {
           executionId,
@@ -1058,6 +1049,7 @@ export async function storeRoutes(app: FastifyInstance): Promise<void> {
           alreadySaved: true
         };
       }
+      if (execution.script_type !== "inline") return { error: "Only inline executions can be saved to the script library" } as const;
       if (!execution.script_platform || !execution.script_language) {
         return { error: "This inline execution does not contain enough platform metadata to create a saved script" } as const;
       }
@@ -1076,7 +1068,8 @@ export async function storeRoutes(app: FastifyInstance): Promise<void> {
       );
       await client.query(
         `UPDATE store_command_executions
-            SET saved_script_id = $1, saved_script_version_id = $2, saved_at = now()
+            SET script_type = 'managed', script_version_id = $2, script_version_number = 1,
+                saved_script_id = $1, saved_script_version_id = $2, saved_at = now()
           WHERE id = $3`,
         [script.rows[0].id, version.rows[0].id, executionId]
       );
