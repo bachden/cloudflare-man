@@ -161,6 +161,21 @@ function createMcpServer(app: FastifyInstance, token: string): McpServer {
   registerApiTool(server, app, token, "cfman_get_script", "Read a saved script and all immutable versions including source content.", {
     scriptId: z.string().uuid()
   }, (args) => callApi(app, token, "GET", `/api/scripts/${args.scriptId}`));
+  registerApiTool(server, app, token, "cfman_get_script_execution_history", "Read paginated executions anchored to a saved script and optionally one immutable version. Results include store, enrollment, execution, script-version, output, status, and timing identifiers.", {
+    scriptId: z.string().uuid(),
+    version: z.number().int().min(1).optional(),
+    page: z.number().int().min(1).default(1),
+    pageSize: z.number().int().min(5).max(50).default(10)
+  }, (args) => {
+    const params = new URLSearchParams({ page: String(args.page), pageSize: String(args.pageSize) });
+    if (args.version) params.set("version", String(args.version));
+    return callApi(app, token, "GET", `/api/scripts/${args.scriptId}/executions?${params}`);
+  });
+  registerApiTool(server, app, token, "cfman_get_store_execution_history", "Read paginated command execution history for one store, including saved and inline script snapshots.", {
+    storeId: z.string().uuid(),
+    page: z.number().int().min(1).default(1),
+    pageSize: z.number().int().min(5).max(50).default(10)
+  }, (args) => callApi(app, token, "GET", `/api/stores/${args.storeId}/command-executions?page=${args.page}&pageSize=${args.pageSize}`));
   registerApiTool(server, app, token, "cfman_list_audit_logs", "Read the audit trail shown by the Audit page.", {}, () => callApi(app, token, "GET", "/api/audit"));
   registerApiTool(server, app, token, "cfman_get_route_waf", "Read a route WAF policy, including the resolved default Cloudflare Man source IP.", {
     storeId: z.string().uuid(),
@@ -263,6 +278,24 @@ function createMcpServer(app: FastifyInstance, token: string): McpServer {
   }, (args) => {
     const { storeId, ...body } = args;
     return callApi(app, token, "POST", `/api/stores/${storeId}/commands/execute`, body);
+  });
+  registerApiTool(server, app, token, "cfman_execute_inline_script", "Execute one named inline script without adding it to the script library. The source, name, output, timing, and active enrollment are persisted in execution history with an inline tag and no version.", {
+    storeId: z.string().uuid(),
+    inlineScript: z.string().min(1).max(262144),
+    name: z.string().trim().min(1).max(120).optional().describe("Operator-facing name shown beside the inline tag in execution history"),
+    language: z.enum(["powershell", "bash", "sh"]).optional().describe("Optional for inline scripts; defaults to PowerShell on Windows and Bash on Unix"),
+    timeoutMs: z.number().int().min(1000).max(300000).default(60000)
+  }, (args) => {
+    const { storeId, ...body } = args;
+    return callApi(app, token, "POST", `/api/stores/${storeId}/commands/execute`, body);
+  });
+  registerApiTool(server, app, token, "cfman_save_inline_execution_as_script", "Save the exact source snapshot from an inline execution as version 1 of a reusable script. Repeated calls return the same script and version identifiers.", {
+    storeId: z.string().uuid(),
+    executionId: z.string().uuid(),
+    name: z.string().trim().min(1).max(120).optional().describe("Optional replacement for the inline execution name")
+  }, (args) => {
+    const { storeId, executionId, ...body } = args;
+    return callApi(app, token, "POST", `/api/stores/${storeId}/commands/executions/${executionId}/save-script`, body);
   });
   registerApiTool(server, app, token, "cfman_delete_store", "Delete a store after preflight; force deletion requires the exact display name confirmation and still cleans Cloudflare resources.", {
     storeId: z.string().uuid(),

@@ -103,13 +103,32 @@ const refreshStoresSchema = z.object({
   storeIds: z.array(z.string().uuid()).min(1).max(100)
 });
 
+const commandExecutionListSchema = z.object({
+  page: z.coerce.number().int().min(1).default(1),
+  pageSize: z.coerce.number().int().min(5).max(50).default(10)
+});
+
 const enrollmentSchema = z.object({
   expiresInHours: z.number().int().min(1).max(168).default(24)
 });
 
 const executeScriptSchema = z.object({
-  scriptVersionId: z.string().uuid(),
+  scriptVersionId: z.string().uuid().optional(),
+  inlineScript: z.string().min(1).max(262_144).refine((value) => value.trim().length > 0, "Inline script content is required").optional(),
+  name: z.string().trim().min(1).max(120).optional(),
+  language: z.enum(["powershell", "bash", "sh"]).optional(),
   timeoutMs: z.number().int().min(1_000).max(300_000).default(60_000)
+}).superRefine((data, context) => {
+  if (Boolean(data.scriptVersionId) === Boolean(data.inlineScript)) {
+    context.addIssue({ code: "custom", message: "Provide exactly one saved script version or inline script" });
+  }
+  if (data.scriptVersionId && (data.language || data.name)) {
+    context.addIssue({ code: "custom", message: "Name and language are only accepted for inline scripts" });
+  }
+});
+
+const saveInlineExecutionSchema = z.object({
+  name: z.string().trim().min(1).max(120).optional()
 });
 
 const deleteStoreSchema = z.object({
@@ -429,11 +448,16 @@ const commandExecutionsJson = `COALESCE((
   SELECT jsonb_agg(jsonb_build_object(
     'id', ce.id,
     'enrollmentId', ce.enrollment_id,
+    'scriptType', ce.script_type,
+    'scriptId', ce.script_id,
     'scriptVersionId', ce.script_version_id,
-    'scriptName', ce.name,
-    'scriptVersion', ce.version,
-    'platform', ce.platform,
-    'language', ce.language,
+    'savedScriptId', ce.saved_script_id,
+    'savedScriptVersionId', ce.saved_script_version_id,
+    'savedAt', ce.saved_at,
+    'scriptName', COALESCE(ce.script_name, ce.name, 'inline'),
+    'scriptVersion', COALESCE(ce.script_version_number, ce.version),
+    'platform', COALESCE(ce.script_platform, ce.platform),
+    'language', COALESCE(ce.script_language, ce.language),
     'script', ce.script,
     'timeoutMs', ce.timeout_ms,
     'status', ce.status,
@@ -447,7 +471,7 @@ const commandExecutionsJson = `COALESCE((
     'requestedBy', ce.username
   ) ORDER BY ce.created_at DESC)
   FROM LATERAL (
-    SELECT ce.*, u.username, sv.version, ms.name, ms.platform, ms.language
+    SELECT ce.*, u.username, sv.version, ms.id AS script_id, ms.name, ms.platform, ms.language
       FROM store_command_executions ce
       LEFT JOIN users u ON u.id = ce.requested_by
       LEFT JOIN managed_script_versions sv ON sv.id = ce.script_version_id
@@ -847,6 +871,53 @@ export async function storeRoutes(app: FastifyInstance): Promise<void> {
     return { logs: result.rows };
   });
 
+  app.get("/api/stores/:id/command-executions", { preHandler: requireAuth }, async (request, reply) => {
+    const { id } = z.object({ id: z.string().uuid() }).parse(request.params);
+    const query = commandExecutionListSchema.parse(request.query);
+    const offset = (query.page - 1) * query.pageSize;
+    const [storeResult, executionResult, countResult] = await Promise.all([
+      pool.query("SELECT 1 FROM stores WHERE id = $1", [id]),
+      pool.query(
+        `SELECT ce.id,
+                ce.enrollment_id AS "enrollmentId",
+                ce.script_type AS "scriptType",
+                ms.id AS "scriptId",
+                ce.script_version_id AS "scriptVersionId",
+                ce.saved_script_id AS "savedScriptId",
+                ce.saved_script_version_id AS "savedScriptVersionId",
+                ce.saved_at AS "savedAt",
+                COALESCE(ce.script_name, ms.name, 'Inline script') AS "scriptName",
+                COALESCE(ce.script_version_number, sv.version) AS "scriptVersion",
+                COALESCE(ce.script_platform, ms.platform) AS platform,
+                COALESCE(ce.script_language, ms.language) AS language,
+                ce.script, ce.timeout_ms AS "timeoutMs", ce.status,
+                ce.started_at AS "startedAt", ce.finished_at AS "finishedAt",
+                ce.elapsed_ms AS "elapsedMs", ce.exit_code AS "exitCode",
+                ce.stdout, ce.stderr, ce.error, u.username AS "requestedBy"
+           FROM store_command_executions ce
+           LEFT JOIN users u ON u.id = ce.requested_by
+           LEFT JOIN managed_script_versions sv ON sv.id = ce.script_version_id
+           LEFT JOIN managed_scripts ms ON ms.id = sv.script_id
+          WHERE ce.store_id = $1
+          ORDER BY ce.created_at DESC, ce.id DESC
+          LIMIT $2 OFFSET $3`,
+        [id, query.pageSize, offset]
+      ),
+      pool.query("SELECT count(*)::int AS total FROM store_command_executions WHERE store_id = $1", [id])
+    ]);
+    if (!storeResult.rowCount) return reply.code(404).send({ error: "Store not found" });
+    const total = countResult.rows[0].total as number;
+    return {
+      executions: executionResult.rows,
+      pagination: {
+        page: query.page,
+        pageSize: query.pageSize,
+        total,
+        totalPages: Math.max(1, Math.ceil(total / query.pageSize))
+      }
+    };
+  });
+
   app.post("/api/stores/:id/commands/execute", { preHandler: requireAuth }, async (request, reply) => {
     const { id } = z.object({ id: z.string().uuid() }).parse(request.params);
     const body = executeScriptSchema.parse(request.body);
@@ -863,33 +934,79 @@ export async function storeRoutes(app: FastifyInstance): Promise<void> {
     );
     const enrollment = enrollmentResult.rows[0];
     if (!enrollment) return reply.code(409).send({ error: "This store has no active enrollment" });
-    const scriptVersionResult = await pool.query(
-      `SELECT v.id, v.content, v.version, s.id AS script_id, s.name, s.platform, s.language
-         FROM managed_script_versions v
-         JOIN managed_scripts s ON s.id = v.script_id
-        WHERE v.id = $1`,
-      [body.scriptVersionId]
-    );
-    const scriptVersion = scriptVersionResult.rows[0];
-    if (!scriptVersion) return reply.code(404).send({ error: "Script version not found" });
     const enrollmentPlatform = enrollment.platform === "windows" ? "windows" : "unix";
-    if (scriptVersion.platform !== enrollmentPlatform) {
-      return reply.code(409).send({ error: `This script is for ${scriptVersion.platform}, but the active enrollment is ${enrollmentPlatform}` });
+    let executionScript: string;
+    let scriptType: "managed" | "inline";
+    let scriptVersionId: string | null;
+    let scriptName: string;
+    let scriptVersion: number | null;
+    let scriptPlatform: "windows" | "unix";
+    let scriptLanguage: "powershell" | "bash" | "sh";
+    let scriptId: string | null;
+    if (body.scriptVersionId) {
+      const scriptVersionResult = await pool.query(
+        `SELECT v.id, v.content, v.version, s.id AS script_id, s.name, s.platform, s.language
+           FROM managed_script_versions v
+           JOIN managed_scripts s ON s.id = v.script_id
+          WHERE v.id = $1`,
+        [body.scriptVersionId]
+      );
+      const managedScript = scriptVersionResult.rows[0];
+      if (!managedScript) return reply.code(404).send({ error: "Script version not found" });
+      if (managedScript.platform !== enrollmentPlatform) {
+        return reply.code(409).send({ error: `This script is for ${managedScript.platform}, but the active enrollment is ${enrollmentPlatform}` });
+      }
+      executionScript = managedScript.content;
+      scriptType = "managed";
+      scriptVersionId = managedScript.id;
+      scriptId = managedScript.script_id;
+      scriptName = managedScript.name;
+      scriptVersion = managedScript.version;
+      scriptPlatform = managedScript.platform;
+      scriptLanguage = managedScript.language;
+    } else {
+      const inlineLanguage = body.language ?? (enrollmentPlatform === "windows" ? "powershell" : "bash");
+      if (enrollmentPlatform === "windows" && inlineLanguage !== "powershell") {
+        return reply.code(409).send({ error: "Windows inline scripts must use PowerShell" });
+      }
+      if (enrollmentPlatform === "unix" && inlineLanguage === "powershell") {
+        return reply.code(409).send({ error: "Unix inline scripts must use Bash or sh" });
+      }
+      executionScript = body.inlineScript!;
+      scriptType = "inline";
+      scriptVersionId = null;
+      scriptId = null;
+      scriptName = body.name ?? "Inline script";
+      scriptVersion = null;
+      scriptPlatform = enrollmentPlatform;
+      scriptLanguage = inlineLanguage;
     }
     const agent = await getCommandAgentConfig(id);
     if (!agent) return reply.code(409).send({ error: "No command agent route is configured for this store" });
-    const executionId = await createCommandExecution(id, enrollment.id, scriptVersion.id, request.authUser!.id, scriptVersion.content, body.timeoutMs);
+    const executionId = await createCommandExecution({
+      storeId: id,
+      enrollmentId: enrollment.id,
+      scriptVersionId,
+      requestedBy: request.authUser!.id,
+      script: executionScript,
+      timeoutMs: body.timeoutMs,
+      scriptType,
+      scriptName,
+      scriptPlatform,
+      scriptLanguage,
+      scriptVersion
+    });
     try {
-      const result = await executeStoreScript(id, scriptVersion.content, body.timeoutMs, executionId);
+      const result = await executeStoreScript(id, executionScript, body.timeoutMs, executionId);
       if (!result) return reply.code(409).send({ error: "No command agent route is configured for this store" });
       await writeAudit({
         actorUserId: request.authUser!.id,
         action: "store.command_executed",
         entityType: "store",
         entityId: id,
-        details: { endpoint: agent.endpoint, executionId, enrollmentId: enrollment.id, scriptVersionId: scriptVersion.id, timeoutMs: body.timeoutMs, success: result.success, exitCode: result.exitCode }
+        details: { endpoint: agent.endpoint, executionId, enrollmentId: enrollment.id, scriptType, scriptId, scriptVersionId, timeoutMs: body.timeoutMs, success: result.success, exitCode: result.exitCode }
       });
-      return { executionId, endpoint: agent.endpoint, enrollmentId: enrollment.id, scriptVersionId: scriptVersion.id, scriptName: scriptVersion.name, version: scriptVersion.version, ...result };
+      return { executionId, endpoint: agent.endpoint, enrollmentId: enrollment.id, scriptType, scriptId, scriptVersionId, scriptName, version: scriptVersion, platform: scriptPlatform, language: scriptLanguage, ...result };
     } catch (error) {
       const message = error instanceof Error ? error.message : "Command agent execution failed";
       await writeAudit({
@@ -897,10 +1014,79 @@ export async function storeRoutes(app: FastifyInstance): Promise<void> {
         action: "store.command_executed",
         entityType: "store",
         entityId: id,
-        details: { endpoint: agent.endpoint, executionId, enrollmentId: enrollment.id, scriptVersionId: scriptVersion.id, timeoutMs: body.timeoutMs, success: false, error: message }
+        details: { endpoint: agent.endpoint, executionId, enrollmentId: enrollment.id, scriptType, scriptId, scriptVersionId, timeoutMs: body.timeoutMs, success: false, error: message }
       });
       return reply.code(502).send({ error: message, executionId });
     }
+  });
+
+  app.post("/api/stores/:storeId/commands/executions/:executionId/save-script", { preHandler: requireAuth }, async (request, reply) => {
+    const { storeId, executionId } = z.object({
+      storeId: z.string().uuid(),
+      executionId: z.string().uuid()
+    }).parse(request.params);
+    const body = saveInlineExecutionSchema.parse(request.body ?? {});
+    const saved = await withTransaction(async (client) => {
+      const executionResult = await client.query(
+        `SELECT id, script_type, script_name, script_platform, script_language, script,
+                saved_script_id, saved_script_version_id
+           FROM store_command_executions
+          WHERE id = $1 AND store_id = $2
+          FOR UPDATE`,
+        [executionId, storeId]
+      );
+      const execution = executionResult.rows[0];
+      if (!execution) return null;
+      if (execution.script_type !== "inline") return { error: "Only inline executions can be saved to the script library" } as const;
+      if (execution.saved_script_id && execution.saved_script_version_id) {
+        return {
+          executionId,
+          scriptId: execution.saved_script_id as string,
+          versionId: execution.saved_script_version_id as string,
+          version: 1,
+          alreadySaved: true
+        };
+      }
+      if (!execution.script_platform || !execution.script_language) {
+        return { error: "This inline execution does not contain enough platform metadata to create a saved script" } as const;
+      }
+      const name = body.name ?? execution.script_name ?? "Inline script";
+      const script = await client.query(
+        `INSERT INTO managed_scripts(name, platform, language, description, created_by)
+         VALUES ($1, $2, $3, $4, $5)
+         RETURNING id`,
+        [name, execution.script_platform, execution.script_language, `Saved from inline execution ${executionId}`, request.authUser!.id]
+      );
+      const version = await client.query(
+        `INSERT INTO managed_script_versions(script_id, version, content, created_by)
+         VALUES ($1, 1, $2, $3)
+         RETURNING id, version`,
+        [script.rows[0].id, execution.script, request.authUser!.id]
+      );
+      await client.query(
+        `UPDATE store_command_executions
+            SET saved_script_id = $1, saved_script_version_id = $2, saved_at = now()
+          WHERE id = $3`,
+        [script.rows[0].id, version.rows[0].id, executionId]
+      );
+      await writeAudit({
+        actorUserId: request.authUser!.id,
+        action: "store.inline_execution_saved",
+        entityType: "store_command_execution",
+        entityId: executionId,
+        details: { storeId, scriptId: script.rows[0].id, scriptVersionId: version.rows[0].id, name }
+      }, client);
+      return {
+        executionId,
+        scriptId: script.rows[0].id as string,
+        versionId: version.rows[0].id as string,
+        version: version.rows[0].version as number,
+        alreadySaved: false
+      };
+    });
+    if (!saved) return reply.code(404).send({ error: "Command execution not found" });
+    if ("error" in saved) return reply.code(409).send({ error: saved.error });
+    return reply.code(saved.alreadySaved ? 200 : 201).send(saved);
   });
 
   app.post("/api/stores", { preHandler: requireAuth }, async (request, reply) => {

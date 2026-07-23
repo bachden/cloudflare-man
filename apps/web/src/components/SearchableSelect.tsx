@@ -1,38 +1,54 @@
 import { Check, ChevronDown } from "lucide-react";
-import { useEffect, useId, useMemo, useRef, useState } from "react";
+import { useEffect, useId, useMemo, useRef, useState, type ReactNode } from "react";
 
 export type SearchableSelectOption = {
   value: string;
   label: string;
 };
 
+export type SearchableSelectAction = {
+  label: string;
+  icon?: ReactNode;
+  onSelect: () => void;
+};
+
 export function SearchableSelect({
   name,
   options,
   defaultValue = "",
+  value,
   ariaLabel,
   emptyMessage = "No matching options",
-  onValueChange
+  onValueChange,
+  actions = []
 }: {
   name: string;
   options: SearchableSelectOption[];
   defaultValue?: string;
+  value?: string;
   ariaLabel: string;
   emptyMessage?: string;
   onValueChange?: (value: string) => void;
+  actions?: SearchableSelectAction[];
 }) {
   const initial = options.find((option) => option.value === defaultValue) ?? options[0];
-  const [selectedValue, setSelectedValue] = useState(initial?.value ?? "");
+  const [internalValue, setInternalValue] = useState(initial?.value ?? "");
   const [query, setQuery] = useState(initial?.label ?? "");
   const [open, setOpen] = useState(false);
   const [activeIndex, setActiveIndex] = useState(0);
   const rootRef = useRef<HTMLDivElement>(null);
   const listId = useId();
+  const selectedValue = value ?? internalValue;
   const filteredOptions = useMemo(() => {
     const normalized = query.trim().toLowerCase();
     if (!normalized || options.some((option) => option.value === selectedValue && option.label === query)) return options;
     return options.filter((option) => option.label.toLowerCase().includes(normalized));
   }, [options, query, selectedValue]);
+
+  useEffect(() => {
+    const selected = options.find((option) => option.value === selectedValue);
+    if (selected && !open) setQuery(selected.label);
+  }, [open, options, selectedValue]);
 
   useEffect(() => {
     const close = (event: PointerEvent) => {
@@ -47,7 +63,7 @@ export function SearchableSelect({
   }, [options, selectedValue]);
 
   const select = (option: SearchableSelectOption) => {
-    setSelectedValue(option.value);
+    setInternalValue(option.value);
     onValueChange?.(option.value);
     setQuery(option.label);
     setOpen(false);
@@ -81,7 +97,7 @@ export function SearchableSelect({
           }}
           onChange={(event) => {
             setQuery(event.target.value);
-            setSelectedValue("");
+            setInternalValue("");
             onValueChange?.("");
             setOpen(true);
             setActiveIndex(0);
@@ -128,6 +144,17 @@ export function SearchableSelect({
               {option.value === selectedValue && <Check size={14} />}
             </button>
           ))}
+          {actions.length > 0 && <div className="searchable-select-actions" role="presentation">
+            {actions.map((action) => <button
+              type="button"
+              key={action.label}
+              onMouseDown={(event) => event.preventDefault()}
+              onClick={() => { setOpen(false); action.onSelect(); }}
+            >
+              {action.icon}
+              <span>{action.label}</span>
+            </button>)}
+          </div>}
         </div>
       )}
     </div>

@@ -20,6 +20,11 @@ const scriptUpdateSchema = z.object({
   description: z.string().trim().max(500).optional()
 });
 const versionSchema = z.object({ content: scriptContent });
+const executionHistorySchema = z.object({
+  version: z.coerce.number().int().min(1).optional(),
+  page: z.coerce.number().int().min(1).default(1),
+  pageSize: z.coerce.number().int().min(5).max(50).default(10)
+});
 
 function validateLanguage(platform: "windows" | "unix", language: "powershell" | "bash" | "sh"): string | null {
   if (platform === "windows" && language !== "powershell") return "Windows scripts must use PowerShell";
@@ -81,6 +86,64 @@ export async function scriptRoutes(app: FastifyInstance): Promise<void> {
     );
     if (!result.rowCount) return reply.code(404).send({ error: "Script not found" });
     return { script: result.rows[0] };
+  });
+
+  app.get("/api/scripts/:id/executions", { preHandler: requireAuth }, async (request, reply) => {
+    const { id } = z.object({ id: z.string().uuid() }).parse(request.params);
+    const query = executionHistorySchema.parse(request.query);
+    const offset = (query.page - 1) * query.pageSize;
+    const script = await pool.query("SELECT 1 FROM managed_scripts WHERE id = $1", [id]);
+    if (!script.rowCount) return reply.code(404).send({ error: "Script not found" });
+    const joins = `
+      FROM store_command_executions ce
+      JOIN stores st ON st.id = ce.store_id
+      LEFT JOIN enrollments e ON e.id = ce.enrollment_id
+      LEFT JOIN users u ON u.id = ce.requested_by
+      LEFT JOIN managed_script_versions executed_version ON executed_version.id = ce.script_version_id
+      LEFT JOIN managed_script_versions saved_version ON saved_version.id = ce.saved_script_version_id
+     WHERE (executed_version.script_id = $1 OR saved_version.script_id = $1)
+       AND ($2::int IS NULL OR COALESCE(executed_version.version, saved_version.version) = $2)`;
+    const [executionResult, countResult] = await Promise.all([
+      pool.query(
+        `SELECT ce.id,
+                ce.store_id AS "storeId", st.display_name AS "storeDisplayName",
+                st.tenant_code AS "tenantCode", st.store_code AS "storeCode",
+                ce.enrollment_id AS "enrollmentId",
+                NULLIF(e.host_info->>'machineName', '') AS "computerName",
+                e.platform AS environment, e.platform AS "enrollmentPlatform",
+                ce.script_type AS "scriptType",
+                $1::uuid AS "scriptId",
+                ce.script_version_id AS "scriptVersionId",
+                ce.saved_script_id AS "savedScriptId",
+                ce.saved_script_version_id AS "savedScriptVersionId",
+                ce.saved_at AS "savedAt",
+                COALESCE(executed_version.id, saved_version.id) AS "anchorScriptVersionId",
+                COALESCE(executed_version.version, saved_version.version) AS "scriptVersion",
+                COALESCE(ce.script_name, 'Inline script') AS "scriptName",
+                ce.script_platform AS platform, ce.script_language AS language,
+                ce.script, ce.timeout_ms AS "timeoutMs", ce.status,
+                ce.started_at AS "startedAt", ce.finished_at AS "finishedAt",
+                ce.elapsed_ms AS "elapsedMs", ce.exit_code AS "exitCode",
+                ce.stdout, ce.stderr, ce.error, u.username AS "requestedBy"
+         ${joins}
+         ORDER BY ce.created_at DESC, ce.id DESC
+         LIMIT $3 OFFSET $4`,
+        [id, query.version ?? null, query.pageSize, offset]
+      ),
+      pool.query(`SELECT count(*)::int AS total ${joins}`, [id, query.version ?? null])
+    ]);
+    const total = countResult.rows[0].total as number;
+    return {
+      scriptId: id,
+      version: query.version ?? null,
+      executions: executionResult.rows,
+      pagination: {
+        page: query.page,
+        pageSize: query.pageSize,
+        total,
+        totalPages: Math.max(1, Math.ceil(total / query.pageSize))
+      }
+    };
   });
 
   app.post("/api/scripts", { preHandler: requireAuth }, async (request, reply) => {

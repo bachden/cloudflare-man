@@ -69,18 +69,40 @@ export type CommandExecutionResult = {
 };
 
 export async function createCommandExecution(
-  storeId: string,
-  enrollmentId: string,
-  scriptVersionId: string,
-  requestedBy: string,
-  script: string,
-  timeoutMs: number
+  input: {
+    storeId: string;
+    enrollmentId: string;
+    scriptVersionId: string | null;
+    requestedBy: string;
+    script: string;
+    timeoutMs: number;
+    scriptType: "managed" | "inline";
+    scriptName: string;
+    scriptPlatform: "windows" | "unix";
+    scriptLanguage: "powershell" | "bash" | "sh";
+    scriptVersion: number | null;
+  }
 ): Promise<string> {
   const result = await pool.query(
-    `INSERT INTO store_command_executions(store_id, enrollment_id, script_version_id, requested_by, script, timeout_ms)
-     VALUES ($1, $2, $3, $4, $5, $6)
+    `INSERT INTO store_command_executions(
+       store_id, enrollment_id, script_version_id, requested_by, script, timeout_ms,
+       script_type, script_name, script_platform, script_language, script_version_number
+     )
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
      RETURNING id`,
-    [storeId, enrollmentId, scriptVersionId, requestedBy, script, timeoutMs]
+    [
+      input.storeId,
+      input.enrollmentId,
+      input.scriptVersionId,
+      input.requestedBy,
+      input.script,
+      input.timeoutMs,
+      input.scriptType,
+      input.scriptName,
+      input.scriptPlatform,
+      input.scriptLanguage,
+      input.scriptVersion
+    ]
   );
   return result.rows[0].id as string;
 }

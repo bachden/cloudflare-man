@@ -266,7 +266,7 @@ Configure an MCP client with the endpoint and bearer token. Client configuration
 }
 ```
 
-The server exposes read and write tools for dashboard data, account pools, zones, stores, connectivity, route WAF policies, enrollments, logs, endpoint verification, RDP retries, the script library, command execution, audit history, and public URL settings. These tools call the same internal API handlers as the web UI, so validation, Cloudflare side effects, deletion preflight checks, and audit logging remain consistent.
+The server exposes read and write tools for dashboard data, account pools, zones, stores, connectivity, route WAF policies, enrollments, logs, endpoint verification, RDP retries, the script library, saved and inline command execution, audit history, and public URL settings. Named inline scripts remain in store execution history unless an operator or MCP client explicitly saves the exact execution snapshot as version 1 of a reusable library script. Store and script-version execution histories are independently paginated and available through MCP with their store, enrollment, script-version, and execution identifiers. These tools call the same internal API handlers as the web UI, so validation, Cloudflare side effects, deletion preflight checks, and audit logging remain consistent.
 
 Every tool result contains both human-readable JSON and `structuredContent`. The structured payload includes the original response under `data` and a `references` array containing every `id` and `*Id` found in the tool input or response. Agents can therefore carry exact account, zone, store, tunnel, publication, route, enrollment, script, version, and execution identifiers into subsequent calls without matching display names.
 

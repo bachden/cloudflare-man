@@ -154,7 +154,12 @@ export type StoreEnrollment = {
 export type StoreCommandExecution = {
   id: string;
   enrollmentId: string | null;
+  scriptType: "managed" | "inline";
+  scriptId: string | null;
   scriptVersionId: string | null;
+  savedScriptId: string | null;
+  savedScriptVersionId: string | null;
+  savedAt: string | null;
   scriptName: string | null;
   scriptVersion: number | null;
   platform: "windows" | "unix" | null;
@@ -170,6 +175,17 @@ export type StoreCommandExecution = {
   stderr: string;
   error: string | null;
   requestedBy: string | null;
+};
+
+export type ScriptCommandExecution = StoreCommandExecution & {
+  storeId: string;
+  storeDisplayName: string;
+  tenantCode: string;
+  storeCode: string;
+  computerName: string | null;
+  environment: "windows" | "linux" | "darwin" | "unix" | null;
+  enrollmentPlatform: "windows" | "unix" | null;
+  anchorScriptVersionId: string;
 };
 
 export type ManagedScriptSummary = {

@@ -104,6 +104,10 @@ test("enables MCP and exposes structured tools with reusable identifiers", async
   const listed = await mcpRequest({ jsonrpc: "2.0", id: 3, method: "tools/list", params: {} });
   assert.equal(listed.statusCode, 200, listed.body);
   assert.ok(listed.json().result.tools.some((tool: { name: string }) => tool.name === "cfman_list_accounts"));
+  assert.ok(listed.json().result.tools.some((tool: { name: string }) => tool.name === "cfman_execute_inline_script"));
+  assert.ok(listed.json().result.tools.some((tool: { name: string }) => tool.name === "cfman_save_inline_execution_as_script"));
+  assert.ok(listed.json().result.tools.some((tool: { name: string }) => tool.name === "cfman_get_script_execution_history"));
+  assert.ok(listed.json().result.tools.some((tool: { name: string }) => tool.name === "cfman_get_store_execution_history"));
 
   const created = await mcpRequest({
     jsonrpc: "2.0",
@@ -710,11 +714,15 @@ test("executes a script through the configured store command agent", async () =>
     assert.equal(String(input), "https://0001-ops.stores-a.example/agent/exec");
     const headers = new Headers(init?.headers);
     assert.match(headers.get("X-Cloudflare-Man-Agent-Token") ?? "", /^[A-Za-z0-9_-]{40,}$/);
-    assert.deepEqual(JSON.parse(String(init?.body)), { script: "Write-Output 'ready v2'", timeoutMs: 30000 });
     executionCall += 1;
+    assert.deepEqual(JSON.parse(String(init?.body)), executionCall <= 2
+      ? { script: "Write-Output 'ready v2'", timeoutMs: 30000 }
+      : { script: "Write-Output 'inline'", timeoutMs: 15000 });
     return new Response(JSON.stringify(executionCall === 1
       ? { success: true, exitCode: 0, stdout: "ready\n", stderr: "", durationMs: 25 }
-      : { success: false, exitCode: 2, stdout: "partial\n", stderr: "failed\n", durationMs: 12 }), {
+      : executionCall === 2
+        ? { success: false, exitCode: 2, stdout: "partial\n", stderr: "failed\n", durationMs: 12 }
+        : { success: true, exitCode: 0, stdout: "inline\n", stderr: "", durationMs: 8 }), {
       status: 200,
       headers: { "Content-Type": "application/json" }
     });
@@ -755,20 +763,156 @@ test("executes a script through the configured store command agent", async () =>
     });
     assert.equal(failed.statusCode, 200, failed.body);
     assert.equal(failed.json().success, false);
+    const rotatedMcp = await app.inject({
+      method: "POST",
+      url: "/api/settings/mcp/rotate",
+      headers: { cookie: sessionCookie }
+    });
+    assert.equal(rotatedMcp.statusCode, 200, rotatedMcp.body);
+    const inline = await app.inject({
+      method: "POST",
+      url: "/mcp",
+      headers: {
+        authorization: `Bearer ${rotatedMcp.json().token}`,
+        accept: "application/json, text/event-stream",
+        "mcp-protocol-version": "2025-11-25"
+      },
+      payload: {
+        jsonrpc: "2.0",
+        id: 20,
+        method: "tools/call",
+        params: {
+          name: "cfman_execute_inline_script",
+          arguments: { storeId, name: "MCP quick check", inlineScript: "Write-Output 'inline'", language: "powershell", timeoutMs: 15000 }
+        }
+      }
+    });
+    assert.equal(inline.statusCode, 200, inline.body);
+    const inlineResult = inline.json().result.structuredContent.data;
+    assert.equal(inlineResult.success, true);
+    assert.equal(inlineResult.scriptType, "inline");
+    assert.equal(inlineResult.scriptId, null);
+    assert.equal(inlineResult.scriptVersionId, null);
+    assert.equal(inlineResult.scriptName, "MCP quick check");
+    assert.equal(inlineResult.version, null);
+    assert.equal(inlineResult.enrollmentId, enrollmentId);
+    assert.match(inlineResult.executionId, /^[0-9a-f-]{36}$/);
+    assert.ok(inline.json().result.structuredContent.references.some((reference: { path: string; value: string }) => reference.path === "response.executionId" && reference.value === inlineResult.executionId));
+    const savedInline = await app.inject({
+      method: "POST",
+      url: "/mcp",
+      headers: {
+        authorization: `Bearer ${rotatedMcp.json().token}`,
+        accept: "application/json, text/event-stream",
+        "mcp-protocol-version": "2025-11-25"
+      },
+      payload: {
+        jsonrpc: "2.0",
+        id: 21,
+        method: "tools/call",
+        params: {
+          name: "cfman_save_inline_execution_as_script",
+          arguments: { storeId, executionId: inlineResult.executionId }
+        }
+      }
+    });
+    assert.equal(savedInline.statusCode, 200, savedInline.body);
+    const savedInlineResult = savedInline.json().result.structuredContent.data;
+    assert.equal(savedInlineResult.executionId, inlineResult.executionId);
+    assert.match(savedInlineResult.scriptId, /^[0-9a-f-]{36}$/);
+    assert.match(savedInlineResult.versionId, /^[0-9a-f-]{36}$/);
+    assert.equal(savedInlineResult.version, 1);
+    assert.equal(savedInlineResult.alreadySaved, false);
+    assert.ok(savedInline.json().result.structuredContent.references.some((reference: { path: string; value: string }) => reference.path === "response.scriptId" && reference.value === savedInlineResult.scriptId));
+    const scriptHistory = await app.inject({
+      method: "POST",
+      url: "/mcp",
+      headers: {
+        authorization: `Bearer ${rotatedMcp.json().token}`,
+        accept: "application/json, text/event-stream",
+        "mcp-protocol-version": "2025-11-25"
+      },
+      payload: {
+        jsonrpc: "2.0",
+        id: 22,
+        method: "tools/call",
+        params: {
+          name: "cfman_get_script_execution_history",
+          arguments: { scriptId: savedInlineResult.scriptId, version: 1, page: 1, pageSize: 10 }
+        }
+      }
+    });
+    assert.equal(scriptHistory.statusCode, 200, scriptHistory.body);
+    assert.equal(scriptHistory.json().result.isError, undefined, scriptHistory.body);
+    const historyResult = scriptHistory.json().result.structuredContent.data;
+    assert.equal(historyResult.scriptId, savedInlineResult.scriptId);
+    assert.equal(historyResult.version, 1);
+    assert.equal(historyResult.pagination.total, 1);
+    assert.equal(historyResult.executions[0].id, inlineResult.executionId);
+    assert.equal(historyResult.executions[0].storeId, storeId);
+    assert.equal(historyResult.executions[0].enrollmentId, enrollmentId);
+    assert.equal(historyResult.executions[0].anchorScriptVersionId, savedInlineResult.versionId);
+    assert.equal(historyResult.executions[0].scriptType, "inline");
+    assert.ok(scriptHistory.json().result.structuredContent.references.some((reference: { path: string; value: string }) => reference.path === "response.executions[0].storeId" && reference.value === storeId));
   } finally {
     globalThis.fetch = originalFetch;
   }
   const audit = await pool.query("SELECT details FROM audit_logs WHERE action = 'store.command_executed' AND entity_id = $1", [storeId]);
-  assert.equal(audit.rowCount, 2);
+  assert.equal(audit.rowCount, 3);
   assert.equal(audit.rows[0].details.success, true);
-  const executions = await pool.query("SELECT enrollment_id, script_version_id, status, elapsed_ms, stdout, stderr FROM store_command_executions WHERE store_id = $1 ORDER BY created_at", [storeId]);
-  assert.equal(executions.rows.length, 2);
+  const executions = await pool.query("SELECT enrollment_id, script_version_id, saved_script_id, saved_script_version_id, saved_at, script_type, script_name, script_platform, script_language, script_version_number, status, elapsed_ms, stdout, stderr FROM store_command_executions WHERE store_id = $1 ORDER BY created_at", [storeId]);
+  assert.equal(executions.rows.length, 3);
   assert.deepEqual({ status: executions.rows[0].status, stdout: executions.rows[0].stdout, stderr: executions.rows[0].stderr }, { status: "succeeded", stdout: "ready\n", stderr: "" });
   assert.equal(typeof executions.rows[0].elapsed_ms, "number");
   assert.deepEqual({ status: executions.rows[1].status, stdout: executions.rows[1].stdout, stderr: executions.rows[1].stderr }, { status: "failed", stdout: "partial\n", stderr: "failed\n" });
   assert.equal(typeof executions.rows[1].elapsed_ms, "number");
+  assert.deepEqual({
+    scriptVersionId: executions.rows[2].script_version_id,
+    scriptType: executions.rows[2].script_type,
+    scriptName: executions.rows[2].script_name,
+    savedScriptId: executions.rows[2].saved_script_id,
+    savedScriptVersionId: executions.rows[2].saved_script_version_id,
+    scriptPlatform: executions.rows[2].script_platform,
+    scriptLanguage: executions.rows[2].script_language,
+    scriptVersion: executions.rows[2].script_version_number,
+    status: executions.rows[2].status,
+    stdout: executions.rows[2].stdout
+  }, {
+    scriptVersionId: null,
+    scriptType: "inline",
+    scriptName: "MCP quick check",
+    savedScriptId: executions.rows[2].saved_script_id,
+    savedScriptVersionId: executions.rows[2].saved_script_version_id,
+    scriptPlatform: "windows",
+    scriptLanguage: "powershell",
+    scriptVersion: null,
+    status: "succeeded",
+    stdout: "inline\n"
+  });
+  assert.match(executions.rows[2].saved_script_id, /^[0-9a-f-]{36}$/);
+  assert.match(executions.rows[2].saved_script_version_id, /^[0-9a-f-]{36}$/);
+  assert.ok(executions.rows[2].saved_at);
   assert.ok(executions.rows.every((execution) => execution.enrollment_id === enrollmentId));
-  assert.ok(executions.rows.every((execution) => execution.script_version_id === scriptVersionId));
+  assert.ok(executions.rows.slice(0, 2).every((execution) => execution.script_version_id === scriptVersionId));
+
+  const refreshedDetail = await app.inject({ method: "GET", url: `/api/stores/${storeId}`, headers: { cookie: sessionCookie } });
+  assert.equal(refreshedDetail.statusCode, 200, refreshedDetail.body);
+  const latestExecution = refreshedDetail.json().store.commandExecutions[0];
+  assert.equal(latestExecution.scriptType, "inline");
+  assert.equal(latestExecution.scriptId, null);
+  assert.equal(latestExecution.scriptVersionId, null);
+  assert.equal(latestExecution.scriptName, "MCP quick check");
+  assert.match(latestExecution.savedScriptId, /^[0-9a-f-]{36}$/);
+  assert.match(latestExecution.savedScriptVersionId, /^[0-9a-f-]{36}$/);
+  assert.ok(latestExecution.savedAt);
+  assert.equal(latestExecution.scriptVersion, null);
+
+  const paginatedHistory = await app.inject({ method: "GET", url: `/api/stores/${storeId}/command-executions?page=1&pageSize=5`, headers: { cookie: sessionCookie } });
+  assert.equal(paginatedHistory.statusCode, 200, paginatedHistory.body);
+  assert.equal(paginatedHistory.json().pagination.total, 3);
+  assert.equal(paginatedHistory.json().pagination.pageSize, 5);
+  assert.equal(paginatedHistory.json().executions.length, 3);
+  assert.equal(paginatedHistory.json().executions[0].id, latestExecution.id);
 });
 
 test("rejects a second command agent route for the same store", async () => {

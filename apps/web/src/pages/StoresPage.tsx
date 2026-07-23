@@ -1,7 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { AlertTriangle, Apple, CheckCircle2, ChevronLeft, ChevronRight, FilePlus2, Monitor, MonitorUp, Plus, RefreshCw, Save, ScrollText, Search, Server, Settings2, ShieldAlert, ShieldCheck, TerminalSquare, Trash2, Unplug } from "lucide-react";
 import { useEffect, useState } from "react";
-import { Link } from "react-router-dom";
+import { Link, useNavigate } from "react-router-dom";
 import { toast } from "sonner";
 import { api } from "../api";
 import { ConnectivityEditor, connectivityPayload, validatePublications, type DraftPublication } from "../components/ConnectivityEditor";
@@ -10,6 +10,7 @@ import { FieldHelp } from "../components/FieldHelp";
 import { Modal } from "../components/Modal";
 import { PageHeader } from "../components/PageHeader";
 import { ScriptEditor } from "../components/ScriptEditor";
+import { SearchableSelect } from "../components/SearchableSelect";
 import { SideDrawer } from "../components/SideDrawer";
 import { StatusBadge } from "../components/StatusBadge";
 import type { AppSettings, EnrollmentResult, ManagedScript, ManagedScriptSummary, Store, StoreCommandExecution, StoreDeletePreflight, StoreEnrollment, StoreRoute, UnenrollmentResult } from "../types";
@@ -25,7 +26,7 @@ type StoreRefreshResponse = {
   failed: number;
 };
 
-type StoreDrawerTab = "overall" | "ingress" | "connect";
+export type StoreDrawerTab = "overall" | "ingress" | "connect";
 
 export function StoresPage() {
   const queryClient = useQueryClient();
@@ -83,7 +84,7 @@ export function StoresPage() {
   );
 }
 
-function StoreDrawer({ store, tab, onTabChange, onClose }: { store: Store | null; tab: StoreDrawerTab; onTabChange: (tab: StoreDrawerTab) => void; onClose: () => void }) {
+export function StoreDrawer({ store, tab, onTabChange, onClose }: { store: Store | null; tab: StoreDrawerTab; onTabChange: (tab: StoreDrawerTab) => void; onClose: () => void }) {
   const queryClient = useQueryClient();
   const [enrollment, setEnrollment] = useState<EnrollmentResult | null>(null);
   const [logEnrollment, setLogEnrollment] = useState<StoreEnrollment | null>(null);
@@ -205,7 +206,15 @@ function StoreDrawer({ store, tab, onTabChange, onClose }: { store: Store | null
           {editingConnectivity ? <EditConnectivityPanel store={currentStore} onClose={() => setEditingConnectivity(false)} /> : <section className="store-drawer-section publication-summary"><header className="store-section-heading"><div><h3>Published endpoints</h3><span>{currentStore.publications.length} hostname{currentStore.publications.length === 1 ? "" : "s"}</span></div><button className="button button-secondary" type="button" onClick={() => setEditingConnectivity(true)}><Settings2 size={15} />Edit connectivity</button></header>{currentStore.publications.map((publication) => <div className="publication-summary-item" key={publication.id}><div className="publication-summary-head"><code>{publication.hostname}</code><StatusBadge status={publication.status} /></div>{publication.routes.map((route) => <div className="publication-route" key={route.id}><code>{route.path}</code><span>→</span><code>{route.kind === "command_agent" ? "Cloudflare Man command agent" : route.serviceUrl}</code><div className="publication-route-actions"><button className="button button-secondary publication-verify-button" type="button" onClick={() => verify.mutate(route.id)} disabled={verify.isPending}><CheckCircle2 size={15} />{verify.isPending && verify.variables === route.id ? "Checking..." : "Verify endpoint"}</button><button className={`button button-secondary publication-waf-button ${route.wafEnabled && route.wafRuleId ? "waf-active" : ""}`} type="button" title={route.wafEnabled && !route.wafRuleId ? "WAF policy is pending application" : "Manage route WAF"} onClick={() => setWafRoute(route)}><ShieldCheck size={15} />WAF</button></div></div>)}</div>)}</section>}
         </div>}
         {tab === "connect" && <div className="store-drawer-tab store-connect-tab">
-          <section className="store-drawer-section rdp-section"><header className="store-section-heading"><div><h3>Remote desktop</h3><span>{currentStore.rdpUrl ? new URL(currentStore.rdpUrl).hostname : "Browser RDP gateway"}</span></div><StatusBadge status={currentStore.rdpStatus} /></header><dl className="detail-list"><div><dt>Target</dt><dd className="mono">{currentStore.rdpTargetIp ? `${currentStore.rdpTargetIp}:3389` : "Awaiting Windows installer"}</dd></div><div><dt>Gateway</dt><dd className="mono">{currentStore.rdpUrl ?? "Not provisioned"}</dd></div></dl>{currentStore.rdpLastError && <div className="inline-alert">{currentStore.rdpLastError}</div>}<div className="detail-actions">{currentStore.rdpStatus === "ready" && currentStore.rdpUrl && <a className="button button-primary" href={currentStore.rdpUrl} target="_blank" rel="noreferrer"><MonitorUp size={16} />Remote desktop</a>}{currentStore.rdpTargetIp && currentStore.rdpStatus !== "ready" && <button className="button button-secondary" onClick={() => retryRdp.mutate()} disabled={retryRdp.isPending}><RefreshCw size={15} />{retryRdp.isPending ? "Retrying..." : "Retry RDP"}</button>}</div></section>
+          <section className="store-drawer-section rdp-section">
+            <header className="store-section-heading"><div><h3>Remote desktop</h3><span>{currentStore.rdpUrl ? new URL(currentStore.rdpUrl).hostname : "Browser RDP gateway"}</span></div><StatusBadge status={currentStore.rdpStatus} /></header>
+            <div className="rdp-connection-row">
+              <div><span>Target</span><code>{currentStore.rdpTargetIp ? `${currentStore.rdpTargetIp}:3389` : "Awaiting Windows installer"}</code></div>
+              <div><span>Gateway</span><code>{currentStore.rdpUrl ?? "Not provisioned"}</code></div>
+              <div className="rdp-connection-action">{currentStore.rdpStatus === "ready" && currentStore.rdpUrl && <a className="button button-primary" href={currentStore.rdpUrl} target="_blank" rel="noreferrer"><MonitorUp size={16} />Remote desktop</a>}{currentStore.rdpTargetIp && currentStore.rdpStatus !== "ready" && <button className="button button-secondary" onClick={() => retryRdp.mutate()} disabled={retryRdp.isPending}><RefreshCw size={15} />{retryRdp.isPending ? "Retrying..." : "Retry RDP"}</button>}</div>
+            </div>
+            {currentStore.rdpLastError && <div className="inline-alert">{currentStore.rdpLastError}</div>}
+          </section>
           {currentStore.commandAgent ? <CommandExecutionPanel store={currentStore} /> : <div className="inline-alert">This store does not have a command agent endpoint.</div>}
         </div>}
       </div>}
@@ -330,14 +339,23 @@ type CommandExecutionResult = {
   executionId: string;
   endpoint: string;
   enrollmentId: string;
-  scriptVersionId: string;
+  scriptType: "managed" | "inline";
+  scriptId: string | null;
+  scriptVersionId: string | null;
   scriptName: string;
-  version: number;
+  version: number | null;
+  platform: "windows" | "unix";
+  language: "powershell" | "bash" | "sh";
   success: boolean;
   exitCode: number | null;
   stdout: string;
   stderr: string;
   durationMs: number;
+};
+
+type CommandExecutionPage = {
+  executions: StoreCommandExecution[];
+  pagination: { page: number; pageSize: number; total: number; totalPages: number };
 };
 
 const quickScriptDefaults = {
@@ -347,10 +365,17 @@ const quickScriptDefaults = {
 
 function CommandExecutionPanel({ store }: { store: Store }) {
   const queryClient = useQueryClient();
+  const navigate = useNavigate();
   const [selectedScriptId, setSelectedScriptId] = useState("");
   const [selectedVersionId, setSelectedVersionId] = useState("");
   const [timeoutSeconds, setTimeoutSeconds] = useState(60);
-  const [result, setResult] = useState<CommandExecutionResult | null>(null);
+  const [executionMode, setExecutionMode] = useState<"saved" | "inline">("saved");
+  const [inlineName, setInlineName] = useState("");
+  const [inlineContent, setInlineContent] = useState(quickScriptDefaults.windows);
+  const [inlineLanguage, setInlineLanguage] = useState<"powershell" | "bash" | "sh">("powershell");
+  const [historyPage, setHistoryPage] = useState(1);
+  const [expandedExecutionId, setExpandedExecutionId] = useState<string | null>(null);
+  const [expandLatestAfterExecution, setExpandLatestAfterExecution] = useState(false);
   const [quickCreateOpen, setQuickCreateOpen] = useState(false);
   const [quickName, setQuickName] = useState("");
   const [quickLanguage, setQuickLanguage] = useState<"powershell" | "bash" | "sh">("powershell");
@@ -358,6 +383,12 @@ function CommandExecutionPanel({ store }: { store: Store }) {
   const [quickContent, setQuickContent] = useState(quickScriptDefaults.windows);
   const activeEnrollment = [...(store.enrollments ?? [])].filter((enrollment) => enrollment.isCurrent && ["ready", "installed"].includes(enrollment.status) && enrollment.unenrolledAt === null && enrollment.deletedAt === null).sort((left, right) => new Date(right.installedAt ?? right.createdAt).getTime() - new Date(left.installedAt ?? left.createdAt).getTime())[0];
   const hostPlatform = activeEnrollment?.platform ?? null;
+  const historyPageSize = 10;
+  const { data: executionData } = useQuery({
+    queryKey: ["command-executions", store.id, historyPage, historyPageSize],
+    queryFn: () => api.get<CommandExecutionPage>(`/api/stores/${store.id}/command-executions?page=${historyPage}&pageSize=${historyPageSize}`),
+    refetchInterval: (query) => query.state.data?.executions.some((execution) => execution.status === "running") ? 2000 : false
+  });
   const { data: scriptData } = useQuery({
     queryKey: ["scripts", "command-agent", hostPlatform],
     queryFn: () => api.get<{ scripts: ManagedScriptSummary[] }>(`/api/scripts${hostPlatform ? `?platform=${hostPlatform}` : ""}`),
@@ -369,13 +400,25 @@ function CommandExecutionPanel({ store }: { store: Store }) {
     enabled: Boolean(selectedScriptId)
   });
   const selectedScript = selectedScriptData?.script;
+  const selectedScriptVersion = selectedScript?.versions.find((version) => version.id === selectedVersionId) ?? selectedScript?.versions[0];
   const scriptOptions = scriptData?.scripts ?? [];
+  const pickerOptions = scriptOptions.map((script) => ({ value: script.id, label: `${script.name} · ${script.platform}` }));
   useEffect(() => {
     if (!selectedScriptId && scriptOptions[0]) setSelectedScriptId(scriptOptions[0].id);
   }, [scriptOptions, selectedScriptId]);
   useEffect(() => {
     if (selectedScript && selectedScript.versions[0] && !selectedScript.versions.some((version) => version.id === selectedVersionId)) setSelectedVersionId(selectedScript.versions[0].id);
   }, [selectedScript, selectedVersionId]);
+  useEffect(() => {
+    if (!hostPlatform) return;
+    const language = hostPlatform === "windows" ? "powershell" : "bash";
+    setInlineLanguage(language);
+    setInlineName("");
+    setInlineContent(quickScriptDefaults[hostPlatform]);
+    setExecutionMode("saved");
+    setHistoryPage(1);
+    setExpandedExecutionId(null);
+  }, [hostPlatform, store.id]);
   const openQuickCreate = () => {
     if (!hostPlatform) return;
     setQuickName("");
@@ -406,37 +449,101 @@ function CommandExecutionPanel({ store }: { store: Store }) {
   });
   const execute = useMutation({
     mutationFn: () => api.post<CommandExecutionResult>(`/api/stores/${store.id}/commands/execute`, {
-      scriptVersionId: selectedVersionId,
+      ...(executionMode === "saved"
+        ? { scriptVersionId: selectedVersionId }
+        : { inlineScript: inlineContent, name: inlineName, language: inlineLanguage }),
       timeoutMs: timeoutSeconds * 1_000
     }),
     onSuccess: async (response) => {
-      setResult(response);
+      setHistoryPage(1);
+      setExpandedExecutionId(response.executionId);
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: ["store-detail", store.id] }),
+        queryClient.invalidateQueries({ queryKey: ["command-executions", store.id] }),
         queryClient.invalidateQueries({ queryKey: ["stores"] })
       ]);
+      setExpandLatestAfterExecution(false);
       if (response.success) toast.success("Script completed successfully");
       else toast.error(`Script exited with code ${response.exitCode ?? "timeout"}`);
     },
     onError: async (error) => {
+      setHistoryPage(1);
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: ["store-detail", store.id] }),
+        queryClient.invalidateQueries({ queryKey: ["command-executions", store.id] }),
         queryClient.invalidateQueries({ queryKey: ["stores"] })
       ]);
+      setExpandLatestAfterExecution(true);
       toast.error(error instanceof Error ? error.message : "Unable to execute script");
     }
   });
+  const refreshHistory = useMutation({
+    mutationFn: () => queryClient.refetchQueries({ queryKey: ["command-executions", store.id], type: "active" }),
+    onError: () => toast.error("Unable to refresh execution history")
+  });
+  const saveInlineExecution = useMutation({
+    mutationFn: (execution: StoreCommandExecution) => api.post<{ executionId: string; scriptId: string; versionId: string; version: number; alreadySaved: boolean }>(`/api/stores/${store.id}/commands/executions/${execution.id}/save-script`, { name: execution.scriptName ?? "Inline script" }),
+    onSuccess: async (saved) => {
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["store-detail", store.id] }),
+        queryClient.invalidateQueries({ queryKey: ["command-executions", store.id] }),
+        queryClient.invalidateQueries({ queryKey: ["scripts"] }),
+        queryClient.invalidateQueries({ queryKey: ["script-detail", saved.scriptId] })
+      ]);
+      toast.success(saved.alreadySaved ? "Script is already in the library" : "Inline script saved to the library");
+    },
+    onError: (error) => toast.error(error instanceof Error ? error.message : "Unable to save inline script")
+  });
   const agent = store.commandAgent!;
-  const executions = store.commandExecutions ?? [];
+  const executions = executionData?.executions ?? [];
+  const historyPagination = executionData?.pagination;
   const enrollmentById = new Map((store.enrollments ?? []).map((enrollment) => [enrollment.id, enrollment]));
-  return <section className="command-agent-panel">
-    <header><div><h3>Command agent</h3><code>{agent.endpoint}</code></div><StatusBadge status={agent.status} /></header>
-    {agent.lastError && <div className="inline-alert">{agent.lastError}</div>}
-    {!hostPlatform ? <div className="inline-alert">An active enrollment is required before running a saved script.</div> : <div className="command-script-picker"><label className="field"><span className="field-label">Saved script <FieldHelp text="Only scripts compatible with the platform reported by this store's active enrollment are listed." /></span><div className="command-script-select-line"><select value={selectedScriptId} onChange={(event) => { setSelectedScriptId(event.target.value); setSelectedVersionId(""); }}>{scriptOptions.length === 0 && <option value="">No compatible scripts</option>}{scriptOptions.map((script) => <option value={script.id} key={script.id}>{script.name} · {script.platform}</option>)}</select><Link className="text-link" to="/scripts">Manage scripts</Link><button className="button button-secondary quick-create-button" type="button" onClick={openQuickCreate}><FilePlus2 size={14} />Quick create new</button></div></label><label className="field"><span className="field-label">Version <FieldHelp text="Select the exact immutable script version to execute. The execution history retains this version reference." /></span><select value={selectedVersionId} onChange={(event) => setSelectedVersionId(event.target.value)}>{!selectedScript?.versions.length && <option value="">No version available</option>}{selectedScript?.versions.map((version) => <option value={version.id} key={version.id}>Version {version.version}</option>)}</select></label><label className="field"><span className="field-label">Timeout (seconds) <FieldHelp text="The maximum time the command agent may let this script run before terminating it. Allowed range: 1 to 300 seconds." /></span><input type="number" min={1} max={300} value={timeoutSeconds} onChange={(event) => setTimeoutSeconds(Math.min(300, Math.max(1, Number(event.target.value) || 1)))} /></label><button className="button button-primary command-execute-button" type="button" disabled={!selectedVersionId || execute.isPending || !hostPlatform} onClick={() => execute.mutate()}><TerminalSquare size={15} />{execute.isPending ? "Executing..." : "Execute script"}</button></div>}
-    {quickCreateOpen && <div className="command-quick-create"><header><div><strong>Quick create new script</strong><span>{hostPlatform === "windows" ? "PowerShell" : "Unix shell"} script for the active enrollment</span></div><button className="button button-secondary" type="button" onClick={() => setQuickCreateOpen(false)}>Cancel</button></header><div className="script-metadata-grid command-quick-create-fields"><label className="field"><span className="field-label">Name <FieldHelp text="The reusable script name shown in the script picker. Names must be unique within the platform." /></span><input value={quickName} onChange={(event) => setQuickName(event.target.value)} placeholder="Store health check" /></label><label className="field"><span className="field-label">Language</span><select value={quickLanguage} onChange={(event) => setQuickLanguage(event.target.value as typeof quickLanguage)}>{hostPlatform === "windows" ? <option value="powershell">PowerShell</option> : <><option value="bash">Bash</option><option value="sh">POSIX sh</option></>}</select></label><label className="field"><span className="field-label">Description</span><input value={quickDescription} onChange={(event) => setQuickDescription(event.target.value)} placeholder="Optional description" /></label></div><ScriptEditor value={quickContent} language={quickLanguage} height="240px" onChange={setQuickContent} /><div className="form-actions"><span className="script-editor-hint">Creates version 1 and selects it for this run</span><button className="button button-primary" type="button" disabled={!quickName.trim() || !quickContent.trim() || quickCreate.isPending} onClick={() => quickCreate.mutate()}><Save size={15} />{quickCreate.isPending ? "Saving..." : "Save script"}</button></div></div>}
-    {result && <div className="command-result"><header><StatusBadge status={result.success ? "completed" : "failed"} /><span>Exit {result.exitCode ?? "timeout"} · {result.durationMs} ms</span></header>{result.stdout && <div><strong>stdout</strong><pre>{result.stdout}</pre></div>}{result.stderr && <div><strong>stderr</strong><pre>{result.stderr}</pre></div>}{!result.stdout && !result.stderr && <div className="quiet-empty">The script produced no output.</div>}</div>}
-    <div className="command-execution-history"><header><h4>Execution history</h4><span>{executions.length} run{executions.length === 1 ? "" : "s"}</span></header>{executions.length ? executions.map((execution: StoreCommandExecution) => { const enrollment = execution.enrollmentId ? enrollmentById.get(execution.enrollmentId) : undefined; const environment = enrollment ? enrollmentEnvironment(enrollment) : "Enrollment unavailable"; const computerName = enrollment ? enrollmentComputerName(enrollment) : "Enrollment unavailable"; return <details className="command-execution" key={execution.id}><summary><span><StatusBadge status={execution.status} /><code>{execution.scriptName ?? "Saved script"} {execution.scriptVersion ? `v${execution.scriptVersion}` : ""} · {computerName} · {environment}</code></span><span>{execution.elapsedMs !== null ? `${execution.elapsedMs} ms` : execution.status === "running" ? "running" : "-"}</span></summary><div className="command-execution-body"><code>{computerName}</code><code>{new Date(execution.startedAt).toLocaleString()}</code><code>{execution.script}</code>{execution.error && <div className="inline-alert">{execution.error}</div>}{execution.stdout && <div><strong>stdout</strong><pre>{execution.stdout}</pre></div>}{execution.stderr && <div><strong>stderr</strong><pre>{execution.stderr}</pre></div>}{!execution.stdout && !execution.stderr && !execution.error && <div className="quiet-empty">The script produced no output.</div>}</div></details>; }) : <div className="quiet-empty">No scripts have been executed for this store.</div>}</div>
-  </section>;
+  useEffect(() => {
+    if (expandLatestAfterExecution && executions[0]) {
+      setExpandedExecutionId(executions[0].id);
+      setExpandLatestAfterExecution(false);
+    }
+  }, [executions, expandLatestAfterExecution]);
+  const canExecute = Boolean(hostPlatform) && !execute.isPending && (executionMode === "saved" ? Boolean(selectedVersionId) : Boolean(inlineName.trim() && inlineContent.trim()));
+  return <>
+    <section className="command-agent-panel">
+      <header><div><h3>Command agent</h3><code>{agent.endpoint}</code></div><StatusBadge status={agent.status} /></header>
+      {agent.lastError && <div className="inline-alert">{agent.lastError}</div>}
+      {!hostPlatform ? <div className="inline-alert">An active enrollment is required before running a script.</div> : <>
+        <div className="command-mode-toggle" role="tablist" aria-label="Script source">
+          <button type="button" role="tab" aria-selected={executionMode === "saved"} className={executionMode === "saved" ? "active" : ""} onClick={() => setExecutionMode("saved")}>Saved script</button>
+          <button type="button" role="tab" aria-selected={executionMode === "inline"} className={executionMode === "inline" ? "active" : ""} onClick={() => setExecutionMode("inline")}>Inline script</button>
+        </div>
+        {executionMode === "saved" ? <div className="command-script-picker">
+          <label className="field command-saved-script-field"><span className="field-label">Saved script <FieldHelp text="Search scripts compatible with the active enrollment. Management and quick-create actions are available inside the dropdown." /></span><SearchableSelect name="commandScript" value={selectedScriptId} options={pickerOptions} ariaLabel="Select saved script" emptyMessage="No compatible scripts" onValueChange={(value) => { setSelectedScriptId(value); setSelectedVersionId(""); }} actions={[
+            { label: "Manage scripts", icon: <Settings2 size={14} />, onSelect: () => navigate("/scripts") },
+            { label: "Create new", icon: <FilePlus2 size={14} />, onSelect: openQuickCreate }
+          ]} /></label>
+          <label className="field"><span className="field-label">Version <FieldHelp text="Select the exact immutable script version to execute. The execution history retains this version reference." /></span><select value={selectedVersionId} onChange={(event) => setSelectedVersionId(event.target.value)}>{!selectedScript?.versions.length && <option value="">No version available</option>}{selectedScript?.versions.map((version) => <option value={version.id} key={version.id}>Version {version.version}</option>)}</select></label>
+        </div> : <div className="command-inline-script">
+          <div className="command-inline-heading"><div><strong>Inline script</strong><span>Runs once and stays outside the library unless saved from history.</span></div></div>
+          <div className="command-inline-metadata"><label className="field"><span className="field-label">Name <FieldHelp text="Identifies this one-off execution in store history. It is also used if you later save the execution to the script library." /></span><input value={inlineName} maxLength={120} onChange={(event) => setInlineName(event.target.value)} placeholder="One-off maintenance" /></label>{hostPlatform === "unix" ? <label className="field"><span className="field-label">Language</span><select aria-label="Inline script language" value={inlineLanguage} onChange={(event) => setInlineLanguage(event.target.value as typeof inlineLanguage)}><option value="bash">Bash</option><option value="sh">POSIX sh</option></select></label> : <label className="field"><span className="field-label">Language</span><input value="PowerShell" disabled /></label>}</div>
+          <ScriptEditor value={inlineContent} language={inlineLanguage} height="220px" onChange={setInlineContent} />
+        </div>}
+        {executionMode === "saved" && selectedScript && selectedScriptVersion && <div className="command-script-preview"><header><div><strong>Script preview</strong><span>{selectedScript.name} · Version {selectedScriptVersion.version}</span></div><code>{selectedScript.language}</code></header><ScriptEditor value={selectedScriptVersion.content} language={selectedScript.language} height="220px" readOnly /></div>}
+        <div className="command-execution-controls"><label className="field"><span className="field-label">Timeout (seconds) <FieldHelp text="The maximum time the command agent may let this script run before terminating it. Allowed range: 1 to 300 seconds." /></span><input type="number" min={1} max={300} value={timeoutSeconds} onChange={(event) => setTimeoutSeconds(Math.min(300, Math.max(1, Number(event.target.value) || 1)))} /></label><button className="button button-primary command-execute-button" type="button" disabled={!canExecute} onClick={() => execute.mutate()}><TerminalSquare size={15} />{execute.isPending ? "Executing..." : "Execute script"}</button></div>
+      </>}
+      <div className="command-execution-history"><header><h4>Execution history</h4><div className="command-history-head-actions"><span>{historyPagination?.total ?? 0} run{historyPagination?.total === 1 ? "" : "s"}</span><button className="icon-button" type="button" title="Refresh execution history" aria-label="Refresh execution history" disabled={refreshHistory.isPending} onClick={() => refreshHistory.mutate()}><RefreshCw size={14} className={refreshHistory.isPending ? "spin-icon" : undefined} /></button></div></header>{executions.length ? executions.map((execution: StoreCommandExecution) => {
+        const enrollment = execution.enrollmentId ? enrollmentById.get(execution.enrollmentId) : undefined;
+        const environment = enrollment ? enrollmentEnvironment(enrollment) : "Enrollment unavailable";
+        const computerName = enrollment ? enrollmentComputerName(enrollment) : "Enrollment unavailable";
+        const statusLabel = execution.status === "succeeded" ? "Succeeded" : execution.status === "failed" ? "Error" : execution.status === "timed_out" ? "Timeout" : "Running";
+        const scriptLabel = `${execution.scriptName ?? "Saved script"}${execution.scriptVersion ? ` v${execution.scriptVersion}` : ""}`;
+        const inlineName = execution.scriptName ?? "Inline script";
+        const isSaving = saveInlineExecution.isPending && saveInlineExecution.variables?.id === execution.id;
+        const executionLanguage = execution.language ?? (execution.platform === "windows" ? "powershell" : "bash");
+        return <details className={`command-execution command-execution-${execution.status}`} key={execution.id} open={expandedExecutionId === execution.id} onToggle={(event) => { if (event.currentTarget.open) setExpandedExecutionId(execution.id); else if (expandedExecutionId === execution.id) setExpandedExecutionId(null); }}><summary><span><StatusBadge status={execution.status} label={statusLabel} />{execution.scriptType === "inline" ? <><span className="command-execution-source-tag">inline</span>{execution.savedScriptId ? <Link className="command-execution-script-link" to={`/scripts?scriptId=${encodeURIComponent(execution.savedScriptId)}&version=1`} onClick={(event) => event.stopPropagation()}>{inlineName}</Link> : <strong className="command-execution-inline-name">{inlineName}</strong>}</> : execution.scriptId ? <Link className="command-execution-script-link" to={`/scripts?scriptId=${encodeURIComponent(execution.scriptId)}${execution.scriptVersion ? `&version=${execution.scriptVersion}` : ""}`} onClick={(event) => event.stopPropagation()}>{scriptLabel}</Link> : <strong>{scriptLabel}</strong>}<code>{computerName} · {environment}</code></span><span className="command-execution-timing"><time>{new Date(execution.startedAt).toLocaleString()}</time><code>{execution.elapsedMs !== null ? `${execution.elapsedMs} ms` : execution.status === "running" ? "running" : "-"}</code></span></summary>{expandedExecutionId === execution.id && <div className="command-execution-body">{execution.scriptType === "inline" && <div className="command-execution-actions">{execution.savedScriptId ? <Link className="button button-secondary button-small" to={`/scripts?scriptId=${encodeURIComponent(execution.savedScriptId)}&version=1`}><ScrollText size={14} />Open saved script</Link> : <button className="button button-secondary button-small" type="button" disabled={isSaving} onClick={() => saveInlineExecution.mutate(execution)}><Save size={14} />{isSaving ? "Saving..." : "Save script"}</button>}</div>}<ScriptEditor value={execution.script} language={executionLanguage} height="200px" readOnly />{execution.error && <div className="inline-alert">{execution.error}</div>}{execution.stdout && <div className="command-output-block"><header><strong>stdout</strong><CopyButton value={execution.stdout} label="Copy stdout" iconOnly /></header><pre>{execution.stdout}</pre></div>}{execution.stderr && <div className="command-output-block"><header><strong>stderr</strong><CopyButton value={execution.stderr} label="Copy stderr" iconOnly /></header><pre>{execution.stderr}</pre></div>}{!execution.stdout && !execution.stderr && !execution.error && <div className="quiet-empty">The script produced no output.</div>}</div>}</details>;
+      }) : <div className="quiet-empty">No scripts have been executed for this store.</div>}{historyPagination && historyPagination.totalPages > 1 && <div className="command-history-pagination"><button className="icon-button" type="button" title="Previous execution page" aria-label="Previous execution page" disabled={historyPagination.page <= 1} onClick={() => { setExpandedExecutionId(null); setHistoryPage((page) => Math.max(1, page - 1)); }}><ChevronLeft size={15} /></button><span>Page {historyPagination.page} of {historyPagination.totalPages}</span><button className="icon-button" type="button" title="Next execution page" aria-label="Next execution page" disabled={historyPagination.page >= historyPagination.totalPages} onClick={() => { setExpandedExecutionId(null); setHistoryPage((page) => page + 1); }}><ChevronRight size={15} /></button></div>}</div>
+    </section>
+    <Modal open={quickCreateOpen} title="Create new script" onClose={() => setQuickCreateOpen(false)} width="wide">
+      <div className="command-quick-create"><div className="script-metadata-grid command-quick-create-fields"><label className="field"><span className="field-label">Name <FieldHelp text="The reusable script name shown in the script picker. Names must be unique within the platform." /></span><input value={quickName} onChange={(event) => setQuickName(event.target.value)} placeholder="Store health check" /></label><label className="field"><span className="field-label">Language</span><select value={quickLanguage} onChange={(event) => setQuickLanguage(event.target.value as typeof quickLanguage)}>{hostPlatform === "windows" ? <option value="powershell">PowerShell</option> : <><option value="bash">Bash</option><option value="sh">POSIX sh</option></>}</select></label><label className="field"><span className="field-label">Description</span><input value={quickDescription} onChange={(event) => setQuickDescription(event.target.value)} placeholder="Optional description" /></label></div><ScriptEditor value={quickContent} language={quickLanguage} height="300px" onChange={setQuickContent} /><div className="form-actions"><span className="script-editor-hint">Creates version 1 and selects it for this run</span><button className="button button-primary" type="button" disabled={!quickName.trim() || !quickContent.trim() || quickCreate.isPending} onClick={() => quickCreate.mutate()}><Save size={15} />{quickCreate.isPending ? "Saving..." : "Save script"}</button></div></div>
+    </Modal>
+  </>;
 }
 
 function EditConnectivityPanel({ store, onClose }: { store: Store; onClose: () => void }) {
