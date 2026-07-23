@@ -383,6 +383,7 @@ test("creates and versions a platform-specific managed script", async () => {
   assert.equal(list.statusCode, 200, list.body);
   assert.equal(list.json().scripts.length, 1);
   assert.equal(list.json().scripts[0].latestVersion, 2);
+  assert.equal(list.json().scripts[0].versionCount, 2);
   assert.deepEqual(list.json().pagination, { page: 1, pageSize: 100, total: 1, totalPages: 1 });
   assert.equal(list.json().scripts[0].latestVersionId, scriptVersionId);
   const noMatch = await app.inject({ method: "GET", url: "/api/scripts?platform=windows&name=missing", headers: { cookie: sessionCookie } });

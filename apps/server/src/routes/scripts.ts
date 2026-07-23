@@ -40,6 +40,7 @@ const scriptSummary = `jsonb_build_object(
   'description', s.description,
   'latestVersion', latest.version,
   'latestVersionId', latest.id,
+  'versionCount', COALESCE(latest."versionCount", 0),
   'executionStats', jsonb_build_object(
     'total', execution_stats.total,
     'succeeded', execution_stats.succeeded,
@@ -65,7 +66,7 @@ export async function scriptRoutes(app: FastifyInstance): Promise<void> {
         `SELECT ${scriptSummary} AS script
          FROM managed_scripts s
          LEFT JOIN LATERAL (
-           SELECT v.id, v.version
+           SELECT v.id, v.version, count(*) OVER()::int AS "versionCount"
              FROM managed_script_versions v
             WHERE v.script_id = s.id
             ORDER BY v.version DESC

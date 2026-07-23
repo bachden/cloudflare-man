@@ -198,6 +198,7 @@ export type ManagedScriptSummary = {
   description: string;
   latestVersion: number | null;
   latestVersionId: string | null;
+  versionCount: number;
   executionStats: ExecutionStats;
   updatedAt: string;
   createdAt: string;
