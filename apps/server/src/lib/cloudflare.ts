@@ -1,0 +1,405 @@
+import { randomUUID } from "node:crypto";
+
+type CloudflareEnvelope<T> = {
+  success: boolean;
+  result: T;
+  errors?: Array<{ code: number; message: string }>;
+  result_info?: { page: number; total_pages: number };
+};
+
+export type CloudflareZone = {
+  id: string;
+  name: string;
+  status: string;
+};
+
+export type TunnelStatus = "inactive" | "healthy" | "degraded" | "down";
+
+export type CloudflareTunnel = {
+  id: string;
+  name: string;
+  status?: TunnelStatus;
+  token?: string;
+  conns_active_at?: string;
+};
+
+type CloudflareDnsRecord = {
+  id: string;
+  name: string;
+  type: string;
+  content: string;
+  proxied?: boolean;
+  ttl?: number;
+  comment?: string | null;
+};
+
+export type CloudflareVirtualNetwork = {
+  id: string;
+  name: string;
+  is_default_network?: boolean;
+};
+
+export type CloudflareTunnelRoute = {
+  id: string;
+  network: string;
+  tunnel_id: string;
+  virtual_network_id?: string;
+};
+
+export type CloudflareInfrastructureTarget = {
+  id: string;
+  hostname: string;
+  ip: { ipv4?: { ip_addr: string; virtual_network_id?: string } };
+};
+
+export type CloudflareAccessPolicy = {
+  id: string;
+  name: string;
+};
+
+export type CloudflareAccessApplication = {
+  id: string;
+  name: string;
+  domain: string;
+  type: string;
+};
+
+export type CloudflareTokenVerification = {
+  id: string;
+  status: string;
+  not_before?: string;
+  expires_on?: string;
+};
+
+export type CloudflareIngressRule = {
+  hostname: string;
+  service: string;
+  path?: string;
+};
+
+const MAX_RETRIES = 3;
+const RETRYABLE_STATUS = new Set([429, 500, 502, 503, 504]);
+
+function retryDelay(response: Response, attempt: number): number {
+  const retryAfter = response.headers.get("retry-after");
+  const seconds = retryAfter ? Number(retryAfter) : Number.NaN;
+  if (Number.isFinite(seconds)) return Math.min(Math.max(seconds * 1_000, 250), 5_000);
+  return Math.min(250 * 2 ** attempt, 5_000);
+}
+
+function statusOfTunnel(value: string | undefined): TunnelStatus {
+  if (value === "healthy" || value === "degraded" || value === "down" || value === "inactive") return value;
+  return "inactive";
+}
+
+export class CloudflareClient {
+  constructor(
+    private readonly accountId: string,
+    private readonly apiToken: string,
+    private readonly mode: "live" | "mock"
+  ) {}
+
+  private async requestPage<T>(path: string, init?: RequestInit): Promise<CloudflareEnvelope<T>> {
+    const headers = new Headers(init?.headers);
+    headers.set("Authorization", `Bearer ${this.apiToken}`);
+    headers.set("Content-Type", "application/json");
+    for (let attempt = 0; attempt < MAX_RETRIES; attempt += 1) {
+      let response: Response;
+      try {
+        response = await fetch(`https://api.cloudflare.com/client/v4${path}`, {
+          ...init,
+          headers,
+          signal: AbortSignal.timeout(20_000)
+        });
+      } catch (error) {
+        if (attempt < MAX_RETRIES - 1) {
+          await new Promise((resolve) => setTimeout(resolve, Math.min(250 * 2 ** attempt, 5_000)));
+          continue;
+        }
+        throw error;
+      }
+      const payload = (await response.json().catch(() => ({}))) as CloudflareEnvelope<T>;
+      if (response.ok && payload.success) return payload;
+      if (RETRYABLE_STATUS.has(response.status) && attempt < MAX_RETRIES - 1) {
+        await new Promise((resolve) => setTimeout(resolve, retryDelay(response, attempt)));
+        continue;
+      }
+      const message = payload.errors?.map((error) => error.message).join("; ") || `Cloudflare API returned ${response.status}`;
+      throw new Error(message);
+    }
+    throw new Error("Cloudflare request failed after retries");
+  }
+
+  private async request<T>(path: string, init?: RequestInit): Promise<T> {
+    const payload = await this.requestPage<T>(path, init);
+    return payload.result;
+  }
+
+  private async listPages<T>(path: string, query: URLSearchParams): Promise<T[]> {
+    const values: T[] = [];
+    for (let page = 1; page <= 100; page += 1) {
+      query.set("page", String(page));
+      const payload = await this.requestPage<T[]>(`${path}?${query.toString()}`);
+      values.push(...payload.result);
+      if (!payload.result_info || page >= payload.result_info.total_pages) break;
+    }
+    return values;
+  }
+
+  async verifyAccount(): Promise<void> {
+    if (this.mode === "mock") return;
+    await this.request(`/accounts/${this.accountId}`);
+  }
+
+  async verifyToken(): Promise<CloudflareTokenVerification> {
+    if (this.mode === "mock") return { id: randomUUID(), status: "active" };
+    return this.request<CloudflareTokenVerification>(`/accounts/${this.accountId}/tokens/verify`);
+  }
+
+  async listZones(): Promise<CloudflareZone[]> {
+    if (this.mode === "mock") return [];
+    const query = new URLSearchParams({ "account.id": this.accountId, per_page: "50" });
+    return this.listPages<CloudflareZone>("/zones", query);
+  }
+
+  async listTunnels(): Promise<CloudflareTunnel[]> {
+    if (this.mode === "mock") return [];
+    const query = new URLSearchParams({ is_deleted: "false", per_page: "1000" });
+    const tunnels = await this.listPages<CloudflareTunnel>(`/accounts/${this.accountId}/cfd_tunnel`, query);
+    return tunnels.map((tunnel) => ({ ...tunnel, status: statusOfTunnel(tunnel.status) }));
+  }
+
+  async createTunnel(name: string): Promise<CloudflareTunnel> {
+    if (this.mode === "mock") {
+      return { id: randomUUID(), name, status: "inactive", token: `mock-${randomUUID()}` };
+    }
+    return this.request<CloudflareTunnel>(`/accounts/${this.accountId}/cfd_tunnel`, {
+      method: "POST",
+      body: JSON.stringify({ name, config_src: "cloudflare" })
+    });
+  }
+
+  async getTunnelToken(tunnelId: string): Promise<string> {
+    if (this.mode === "mock") return `mock-${tunnelId}`;
+    return this.request<string>(`/accounts/${this.accountId}/cfd_tunnel/${tunnelId}/token`);
+  }
+
+  async configureTunnel(tunnelId: string, ingress: CloudflareIngressRule[]): Promise<void> {
+    if (this.mode === "mock") return;
+    await this.request(`/accounts/${this.accountId}/cfd_tunnel/${tunnelId}/configurations`, {
+      method: "PUT",
+      body: JSON.stringify({
+        config: {
+          "warp-routing": { enabled: true },
+          ingress: [
+            ...ingress,
+            { service: "http_status:404" }
+          ]
+        }
+      })
+    });
+  }
+
+  async createDnsRecord(zoneId: string, hostname: string, tunnelId: string): Promise<{ id: string }> {
+    if (this.mode === "mock") return { id: randomUUID() };
+    return this.upsertDnsRecord(zoneId, hostname, "CNAME", `${tunnelId}.cfargotunnel.com`);
+  }
+
+  async deleteDnsRecord(zoneId: string, recordId: string): Promise<void> {
+    if (this.mode === "mock") return;
+    await this.request(`/zones/${zoneId}/dns_records/${recordId}`, { method: "DELETE" });
+  }
+
+  async ensureBrowserRdpDnsRecord(zoneId: string, hostname: string): Promise<{ id: string }> {
+    if (this.mode === "mock") return { id: randomUUID() };
+    return this.upsertDnsRecord(zoneId, hostname, "A", "240.0.0.0");
+  }
+
+  private async upsertDnsRecord(zoneId: string, hostname: string, type: "A" | "CNAME", content: string): Promise<{ id: string }> {
+    const existing = await this.request<CloudflareDnsRecord[]>(
+      `/zones/${zoneId}/dns_records?${new URLSearchParams({ name: hostname, per_page: "100" }).toString()}`
+    );
+    const normalizeName = (name: string) => name.replace(/\.$/, "").toLowerCase();
+    const record = existing.find((candidate) => normalizeName(candidate.name) === normalizeName(hostname));
+    const body = {
+      type,
+      name: hostname,
+      content,
+      proxied: true,
+      ttl: 1,
+      comment: "Managed by cloudflare-man"
+    };
+    if (record && record.type !== type) {
+      throw new Error(`DNS record ${hostname} already exists as ${record.type}`);
+    }
+    if (record && record.content !== content && record.comment !== "Managed by cloudflare-man") {
+      throw new Error(`DNS record ${hostname} already exists and is not managed by cloudflare-man`);
+    }
+    if (record) {
+      return this.request<{ id: string }>(`/zones/${zoneId}/dns_records/${record.id}`, {
+        method: "PUT",
+        body: JSON.stringify(body)
+      });
+    }
+    return this.request<{ id: string }>(`/zones/${zoneId}/dns_records`, {
+      method: "POST",
+      body: JSON.stringify(body)
+    });
+  }
+
+  async ensureVirtualNetwork(name: string): Promise<CloudflareVirtualNetwork> {
+    if (this.mode === "mock") return { id: randomUUID(), name };
+    const query = new URLSearchParams({ name, is_deleted: "false" });
+    const existing = await this.request<CloudflareVirtualNetwork[]>(
+      `/accounts/${this.accountId}/teamnet/virtual_networks?${query.toString()}`
+    );
+    const match = existing.find((network) => network.name === name);
+    if (match) return match;
+    return this.request<CloudflareVirtualNetwork>(`/accounts/${this.accountId}/teamnet/virtual_networks`, {
+      method: "POST",
+      body: JSON.stringify({ name, comment: "Managed by cloudflare-man", is_default_network: false })
+    });
+  }
+
+  async ensureTunnelRoute(tunnelId: string, virtualNetworkId: string, targetIp: string): Promise<CloudflareTunnelRoute> {
+    if (this.mode === "mock") {
+      return { id: randomUUID(), network: `${targetIp}/32`, tunnel_id: tunnelId, virtual_network_id: virtualNetworkId };
+    }
+    const network = `${targetIp}/32`;
+    const query = new URLSearchParams({
+      network_subset: network,
+      network_superset: network,
+      virtual_network_id: virtualNetworkId,
+      is_deleted: "false",
+      per_page: "100"
+    });
+    const routes = await this.request<CloudflareTunnelRoute[]>(
+      `/accounts/${this.accountId}/teamnet/routes?${query.toString()}`
+    );
+    const existing = routes.find((route) => route.network === network && route.virtual_network_id === virtualNetworkId);
+    if (existing) {
+      if (existing.tunnel_id !== tunnelId) throw new Error(`RDP route ${network} is assigned to another tunnel`);
+      return existing;
+    }
+    return this.request<CloudflareTunnelRoute>(`/accounts/${this.accountId}/teamnet/routes`, {
+      method: "POST",
+      body: JSON.stringify({
+        network,
+        tunnel_id: tunnelId,
+        virtual_network_id: virtualNetworkId,
+        comment: "Managed by cloudflare-man"
+      })
+    });
+  }
+
+  async ensureInfrastructureTarget(
+    hostname: string,
+    targetIp: string,
+    virtualNetworkId: string
+  ): Promise<CloudflareInfrastructureTarget> {
+    if (this.mode === "mock") {
+      return { id: randomUUID(), hostname, ip: { ipv4: { ip_addr: targetIp, virtual_network_id: virtualNetworkId } } };
+    }
+    const query = new URLSearchParams({
+      hostname,
+      ip_v4: targetIp,
+      virtual_network_id: virtualNetworkId,
+      per_page: "1000"
+    });
+    const targets = await this.request<CloudflareInfrastructureTarget[]>(
+      `/accounts/${this.accountId}/infrastructure/targets?${query.toString()}`
+    );
+    const existing = targets.find((target) =>
+      target.hostname === hostname &&
+      target.ip.ipv4?.ip_addr === targetIp &&
+      target.ip.ipv4?.virtual_network_id === virtualNetworkId
+    );
+    if (existing) return existing;
+    return this.request<CloudflareInfrastructureTarget>(`/accounts/${this.accountId}/infrastructure/targets`, {
+      method: "POST",
+      body: JSON.stringify({
+        hostname,
+        ip: { ipv4: { ip_addr: targetIp, virtual_network_id: virtualNetworkId } }
+      })
+    });
+  }
+
+  async ensureRdpAccessPolicy(existingId: string | null, allowedEmails: string[]): Promise<CloudflareAccessPolicy> {
+    if (this.mode === "mock") return { id: existingId ?? randomUUID(), name: "cloudflare-man RDP operators" };
+    const name = "cloudflare-man RDP operators";
+    const body = {
+      name,
+      decision: "allow",
+      include: allowedEmails.map((email) => ({ email: { email } })),
+      session_duration: "8h",
+      connection_rules: {
+        rdp: {
+          allowed_clipboard_local_to_remote_formats: ["text"],
+          allowed_clipboard_remote_to_local_formats: ["text"]
+        }
+      }
+    };
+    let policyId = existingId;
+    if (!policyId) {
+      const policies = await this.listPages<CloudflareAccessPolicy>(
+        `/accounts/${this.accountId}/access/policies`,
+        new URLSearchParams({ per_page: "100" })
+      );
+      policyId = policies.find((policy) => policy.name === name)?.id ?? null;
+    }
+    if (policyId) {
+      return this.request<CloudflareAccessPolicy>(`/accounts/${this.accountId}/access/policies/${policyId}`, {
+        method: "PUT",
+        body: JSON.stringify(body)
+      });
+    }
+    return this.request<CloudflareAccessPolicy>(`/accounts/${this.accountId}/access/policies`, {
+      method: "POST",
+      body: JSON.stringify(body)
+    });
+  }
+
+  async ensureBrowserRdpApplication(input: {
+    existingId: string | null;
+    name: string;
+    domain: string;
+    policyId: string;
+    targetHostnames: string[];
+  }): Promise<CloudflareAccessApplication> {
+    if (this.mode === "mock") {
+      return { id: input.existingId ?? randomUUID(), name: input.name, domain: input.domain, type: "rdp" };
+    }
+    const body = {
+      name: input.name,
+      type: "rdp",
+      domain: input.domain,
+      destinations: [{ type: "public", uri: input.domain }],
+      target_criteria: [{
+        target_attributes: { hostname: input.targetHostnames },
+        port: 3389,
+        protocol: "RDP"
+      }],
+      policies: [{ id: input.policyId, precedence: 1 }],
+      session_duration: "8h",
+      app_launcher_visible: true
+    };
+    let applicationId = input.existingId;
+    if (!applicationId) {
+      const query = new URLSearchParams({ domain: input.domain, exact: "true", per_page: "50" });
+      const applications = await this.request<CloudflareAccessApplication[]>(
+        `/accounts/${this.accountId}/access/apps?${query.toString()}`
+      );
+      applicationId = applications.find((application) => application.type === "rdp" && application.domain === input.domain)?.id ?? null;
+    }
+    if (applicationId) {
+      return this.request<CloudflareAccessApplication>(`/accounts/${this.accountId}/access/apps/${applicationId}`, {
+        method: "PUT",
+        body: JSON.stringify(body)
+      });
+    }
+    return this.request<CloudflareAccessApplication>(`/accounts/${this.accountId}/access/apps`, {
+      method: "POST",
+      body: JSON.stringify(body)
+    });
+  }
+}

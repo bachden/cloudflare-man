@@ -1,0 +1,393 @@
+import assert from "node:assert/strict";
+import { after, before, test } from "node:test";
+import type { FastifyInstance } from "fastify";
+
+let app: FastifyInstance;
+let pool: (typeof import("../src/lib/database.js"))["pool"];
+let sessionCookie = "";
+let accountId = "";
+let storeId = "";
+let enrollmentToken = "";
+let enrollmentId = "";
+
+before(async () => {
+  const database = await import("../src/lib/database.js");
+  pool = database.pool;
+  await database.runMigrations();
+  await database.seedRootUser();
+  await pool.query(`
+    TRUNCATE audit_logs, app_settings, enrollments, stores, zones, cloudflare_accounts, sessions RESTART IDENTITY CASCADE
+  `);
+  const { buildApp } = await import("../src/app.js");
+  app = await buildApp();
+  await app.ready();
+});
+
+after(async () => {
+  if (app) await app.close();
+  if (pool) await pool.end();
+});
+
+test("default root account can sign in", async () => {
+  const response = await app.inject({
+    method: "POST",
+    url: "/api/auth/login",
+    payload: { username: "root", password: "12345678" }
+  });
+  assert.equal(response.statusCode, 200);
+  assert.equal(response.json().user.mustChangePassword, true);
+  sessionCookie = response.headers["set-cookie"]!.split(";")[0]!;
+});
+
+test("updates the public base URL used by enrollment URLs", async () => {
+  const response = await app.inject({
+    method: "PUT",
+    url: "/api/settings",
+    headers: { cookie: sessionCookie },
+    payload: { publicBaseUrl: "cfman.example.test" }
+  });
+  assert.equal(response.statusCode, 200, response.body);
+  assert.equal(response.json().settings.publicBaseUrl, "https://cfman.example.test");
+
+  const allowedHost = await app.inject({ method: "GET", url: "/api/accounts", headers: { host: "cfman.example.test", cookie: sessionCookie } });
+  assert.equal(allowedHost.statusCode, 200, allowedHost.body);
+  const blockedHost = await app.inject({ method: "GET", url: "/api/accounts", headers: { host: "unexpected.example.test", cookie: sessionCookie } });
+  assert.equal(blockedHost.statusCode, 421, blockedHost.body);
+});
+
+test("creates a mock account with its first zone", async () => {
+  const response = await app.inject({
+    method: "POST",
+    url: "/api/accounts",
+    headers: { cookie: sessionCookie },
+    payload: {
+      name: "Test Account A",
+      providerMode: "mock",
+      initialZoneName: "stores-a.example",
+      softTunnelLimit: 750
+    }
+  });
+  assert.equal(response.statusCode, 201, response.body);
+  accountId = response.json().id;
+  assert.match(accountId, /^[0-9a-f-]{36}$/);
+});
+
+test("deletes an empty account and its zones", async () => {
+  const createResponse = await app.inject({
+    method: "POST",
+    url: "/api/accounts",
+    headers: { cookie: sessionCookie },
+    payload: {
+      name: "Disposable Account",
+      providerMode: "mock",
+      initialZoneName: "disposable.example",
+      softTunnelLimit: 10
+    }
+  });
+  assert.equal(createResponse.statusCode, 201, createResponse.body);
+  const disposableAccountId = createResponse.json().id;
+
+  const response = await app.inject({
+    method: "DELETE",
+    url: `/api/accounts/${disposableAccountId}`,
+    headers: { cookie: sessionCookie }
+  });
+  assert.equal(response.statusCode, 204, response.body);
+  const account = await pool.query("SELECT 1 FROM cloudflare_accounts WHERE id = $1", [disposableAccountId]);
+  const zones = await pool.query("SELECT 1 FROM zones WHERE account_id = $1", [disposableAccountId]);
+  const audit = await pool.query("SELECT details FROM audit_logs WHERE action = 'account.deleted' AND entity_id = $1", [disposableAccountId]);
+  assert.equal(account.rowCount, 0);
+  assert.equal(zones.rowCount, 0);
+  assert.equal(audit.rowCount, 1);
+  assert.equal(audit.rows[0].details.cloudflareResourcesDeleted, false);
+});
+
+test("validates an account-owned Cloudflare API token", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input, init) => {
+    assert.equal(String(input), "https://api.cloudflare.com/client/v4/accounts/cloudflare-account-id/tokens/verify");
+    assert.equal(new Headers(init?.headers).get("Authorization"), "Bearer cloudflare-api-token");
+    return new Response(JSON.stringify({
+      success: true,
+      errors: [],
+      messages: [],
+      result: { id: "token-id", status: "active" }
+    }), { status: 200, headers: { "Content-Type": "application/json" } });
+  };
+  try {
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/accounts/validate-token",
+      headers: { cookie: sessionCookie },
+      payload: { cfAccountId: "cloudflare-account-id", apiToken: "cloudflare-api-token" }
+    });
+    assert.equal(response.statusCode, 200, response.body);
+    assert.deepEqual(response.json(), { valid: true, status: "active" });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("synchronizes the account pool", async () => {
+  const response = await app.inject({
+    method: "POST",
+    url: "/api/accounts/sync-all",
+    headers: { cookie: sessionCookie }
+  });
+  assert.equal(response.statusCode, 200, response.body);
+  assert.equal(response.json().success, true);
+  assert.equal(response.json().results[0].id, accountId);
+});
+
+test("configures RDP operator access", async () => {
+  const response = await app.inject({
+    method: "PATCH",
+    url: `/api/accounts/${accountId}/rdp-settings`,
+    headers: { cookie: sessionCookie },
+    payload: { rdpAllowedEmails: ["ops@dcorp.example"] }
+  });
+  assert.equal(response.statusCode, 200, response.body);
+  const result = await pool.query("SELECT rdp_allowed_emails FROM cloudflare_accounts WHERE id = $1", [accountId]);
+  assert.deepEqual(result.rows[0].rdp_allowed_emails, ["ops@dcorp.example"]);
+});
+
+test("allocates a store and issues bootstrap URLs", async () => {
+  const createResponse = await app.inject({
+    method: "POST",
+    url: "/api/stores",
+    headers: { cookie: sessionCookie },
+    payload: {
+      tenantCode: "HLC",
+      storeCode: "0001",
+      displayName: "Highlands Test Store",
+      publications: [
+        {
+          suffix: "",
+          routes: [
+            { path: "/", serviceUrl: "http://localhost:8080" },
+            { path: "/api", serviceUrl: "http://localhost:8081" }
+          ]
+        },
+        {
+          suffix: "admin",
+          routes: [{ path: "/", serviceUrl: "http://192.168.10.20:9000" }]
+        }
+      ]
+    }
+  });
+  assert.equal(createResponse.statusCode, 201, createResponse.body);
+  const store = createResponse.json().store;
+  storeId = store.id;
+  assert.equal(store.accountId, accountId);
+  assert.equal(store.hostname, "0001.stores-a.example");
+  assert.equal(store.publications.length, 2);
+  assert.equal(store.publications[0].routes.length, 2);
+
+  const enrollmentResponse = await app.inject({
+    method: "POST",
+    url: `/api/stores/${storeId}/enrollments`,
+    headers: { cookie: sessionCookie },
+    payload: { expiresInHours: 24 }
+  });
+  assert.equal(enrollmentResponse.statusCode, 201, enrollmentResponse.body);
+  const enrollment = enrollmentResponse.json();
+  enrollmentId = enrollment.id;
+  assert.match(enrollment.urls.shell, /^https:\/\/cfman\.example\.test\/e\//);
+  const match = enrollment.urls.shell.match(/\/e\/([^/]+)\/install\.sh$/);
+  assert.ok(match);
+  enrollmentToken = match[1];
+
+  const scriptResponse = await app.inject({ method: "GET", url: `/e/${enrollmentToken}/install.sh` });
+  assert.equal(scriptResponse.statusCode, 200);
+  assert.match(scriptResponse.body, /cloudflared service install/);
+  assert.match(scriptResponse.body, /0001\.stores-a\.example/);
+  assert.match(scriptResponse.body, /install-id/);
+  assert.match(scriptResponse.body, /status\\":\\"failed/);
+  assert.match(scriptResponse.body, /https:\/\/cfman\.example\.test\/api\/public\/enrollments\/claim/);
+  assert.match(scriptResponse.body, /api\/public\/enrollments\/logs/);
+  assert.match(scriptResponse.body, /Cleanup and override it\? \[y\/N\]/);
+  assert.match(scriptResponse.body, /overrideExisting/);
+
+  const windowsScript = await app.inject({ method: "GET", url: `/e/${enrollmentToken}/install.ps1` });
+  assert.equal(windowsScript.statusCode, 200);
+  assert.match(windowsScript.body, /fDenyTSConnections/);
+  assert.match(windowsScript.body, /RemoteDesktop\*/);
+  assert.match(windowsScript.body, /rdpTargetIp/);
+  assert.match(windowsScript.body, /HKLM:\\SYSTEM\\CurrentControlSet\\Control\\Terminal Server/);
+  assert.match(windowsScript.body, /WinStations\\RDP-Tcp/);
+  assert.match(windowsScript.body, /https:\/\/cfman\.example\.test\/api\/public\/enrollments\/report/);
+  assert.match(windowsScript.body, /Send-InstallLog/);
+  assert.match(windowsScript.body, /Read-Host "Cleanup and override/);
+  assert.match(windowsScript.body, /overrideExisting/);
+});
+
+test("paginates and refreshes the visible store list", async () => {
+  const list = await app.inject({
+    method: "GET",
+    url: "/api/stores?page=1&pageSize=10",
+    headers: { cookie: sessionCookie }
+  });
+  assert.equal(list.statusCode, 200, list.body);
+  assert.equal(list.json().stores.length, 1);
+  assert.deepEqual(list.json().pagination, { page: 1, pageSize: 10, total: 1, totalPages: 1 });
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response("ok", { status: 200 });
+  try {
+    const refresh = await app.inject({
+      method: "POST",
+      url: "/api/stores/refresh",
+      headers: { cookie: sessionCookie },
+      payload: { storeIds: [storeId] }
+    });
+    assert.equal(refresh.statusCode, 200, refresh.body);
+    assert.deepEqual(
+      { success: refresh.json().success, refreshed: refresh.json().refreshed, failed: refresh.json().failed },
+      { success: true, refreshed: 1, failed: 0 }
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("stores structured installer logs", async () => {
+  const response = await app.inject({
+    method: "POST",
+    url: "/api/public/enrollments/logs",
+    payload: {
+      token: enrollmentToken,
+      events: [
+        { level: "info", step: "preflight", message: "Installer started" },
+        { level: "warn", step: "rdp", messageBase64: Buffer.from("RDP warning").toString("base64") }
+      ]
+    }
+  });
+  assert.equal(response.statusCode, 202, response.body);
+  assert.equal(response.json().accepted, 2);
+  const logs = await pool.query("SELECT level, step, message FROM enrollment_logs WHERE enrollment_id = $1 ORDER BY id", [enrollmentId]);
+  assert.deepEqual(logs.rows, [
+    { level: "info", step: "preflight", message: "Installer started" },
+    { level: "warn", step: "rdp", message: "RDP warning" }
+  ]);
+});
+
+test("keeps installer preflight failures retryable", async () => {
+  const report = await app.inject({
+    method: "POST",
+    url: "/api/public/enrollments/report",
+    payload: { token: enrollmentToken, status: "failed", error: "Run PowerShell as Administrator." }
+  });
+  assert.equal(report.statusCode, 200, report.body);
+  const retryable = await pool.query("SELECT status, last_error FROM enrollments WHERE id = $1", [enrollmentId]);
+  assert.equal(retryable.rows[0].status, "url_issued");
+  assert.equal(retryable.rows[0].last_error, "Run PowerShell as Administrator.");
+
+  await pool.query("UPDATE enrollments SET status = 'failed' WHERE id = $1", [enrollmentId]);
+  const legacyRetry = await app.inject({ method: "GET", url: `/e/${enrollmentToken}/install.ps1` });
+  assert.equal(legacyRetry.statusCode, 200, legacyRetry.body);
+});
+
+test("does not delete an account that still has stores", async () => {
+  const response = await app.inject({
+    method: "DELETE",
+    url: `/api/accounts/${accountId}`,
+    headers: { cookie: sessionCookie }
+  });
+  assert.equal(response.statusCode, 409, response.body);
+  assert.match(response.json().error, /assigned to 1 store/);
+  const account = await pool.query("SELECT 1 FROM cloudflare_accounts WHERE id = $1", [accountId]);
+  assert.equal(account.rowCount, 1);
+});
+
+test("claim is atomic and provisions a tunnel once", async () => {
+  const claimResponse = await app.inject({
+    method: "POST",
+    url: "/api/public/enrollments/claim",
+    payload: { token: enrollmentToken, platform: "windows", architecture: "amd64", installId: "installer-a" }
+  });
+  assert.equal(claimResponse.statusCode, 200, claimResponse.body);
+  assert.match(claimResponse.json().tunnelToken, /^mock-/);
+
+  const retryClaim = await app.inject({
+    method: "POST",
+    url: "/api/public/enrollments/claim",
+    payload: { token: enrollmentToken, platform: "windows", architecture: "amd64" }
+  });
+  assert.equal(retryClaim.statusCode, 409);
+
+  const sameInstallerRetry = await app.inject({
+    method: "POST",
+    url: "/api/public/enrollments/claim",
+    payload: { token: enrollmentToken, platform: "windows", architecture: "amd64", installId: "installer-a" }
+  });
+  assert.equal(sameInstallerRetry.statusCode, 200, sameInstallerRetry.body);
+  assert.match(sameInstallerRetry.json().tunnelToken, /^mock-/);
+
+  const approvedOverride = await app.inject({
+    method: "POST",
+    url: "/api/public/enrollments/claim",
+    payload: { token: enrollmentToken, platform: "windows", architecture: "amd64", installId: "installer-b", overrideExisting: true }
+  });
+  assert.equal(approvedOverride.statusCode, 200, approvedOverride.body);
+  const overridden = await pool.query("SELECT install_id FROM enrollments WHERE id = $1", [enrollmentId]);
+  assert.equal(overridden.rows[0].install_id, "installer-b");
+});
+
+test("updates all ingress routes on an existing tunnel", async () => {
+  const response = await app.inject({
+    method: "PUT",
+    url: `/api/stores/${storeId}/connectivity`,
+    headers: { cookie: sessionCookie },
+    payload: {
+      publications: [
+        { suffix: "", routes: [{ path: "/", serviceUrl: "http://localhost:8080" }] },
+        {
+          suffix: "pos",
+          routes: [
+            { path: "/api", serviceUrl: "http://localhost:8081" },
+            { path: "/admin", serviceUrl: "http://localhost:8082" }
+          ]
+        }
+      ]
+    }
+  });
+  assert.equal(response.statusCode, 200, response.body);
+  assert.equal(response.json().applied, true);
+  const publications = await pool.query("SELECT suffix, hostname, status FROM store_publications WHERE store_id = $1 ORDER BY created_at", [storeId]);
+  const routes = await pool.query("SELECT path, service_url FROM store_routes WHERE publication_id IN (SELECT id FROM store_publications WHERE store_id = $1) ORDER BY path", [storeId]);
+  assert.deepEqual(publications.rows.map((publication) => publication.suffix), ["", "pos"]);
+  assert.equal(publications.rows[1].hostname, "0001-pos.stores-a.example");
+  assert.ok(publications.rows.every((publication) => publication.status === "active"));
+  assert.deepEqual(routes.rows.map((route) => route.path), ["/", "/admin", "/api"]);
+});
+
+test("installer report activates a mock store", async () => {
+  const report = await app.inject({
+    method: "POST",
+    url: "/api/public/enrollments/report",
+    payload: {
+      token: enrollmentToken,
+      status: "installed",
+      version: "cloudflared test",
+      rdpEnabled: true,
+      rdpTargetIp: "192.168.10.25",
+      rdpPort: 3389
+    }
+  });
+  assert.equal(report.statusCode, 200, report.body);
+  assert.equal(report.json().rdp.ready, true);
+  const result = await pool.query("SELECT onboarding_status, tunnel_status, rdp_status, rdp_target_ip::text, rdp_url FROM stores WHERE id = $1", [storeId]);
+  assert.equal(result.rows[0].onboarding_status, "active");
+  assert.equal(result.rows[0].tunnel_status, "healthy");
+  assert.equal(result.rows[0].rdp_status, "ready");
+  assert.equal(result.rows[0].rdp_target_ip, "192.168.10.25/32");
+  assert.match(result.rows[0].rdp_url, /^https:\/\/rdp\.stores-a\.example\/rdp\//);
+
+  const retry = await app.inject({
+    method: "POST",
+    url: `/api/stores/${storeId}/rdp/retry`,
+    headers: { cookie: sessionCookie }
+  });
+  assert.equal(retry.statusCode, 200, retry.body);
+  assert.equal(retry.json().ready, true);
+});

@@ -1,0 +1,39 @@
+import type { Pool, PoolClient } from "pg";
+import { config } from "../config.js";
+import { pool } from "./database.js";
+
+type QueryExecutor = Pick<Pool | PoolClient, "query">;
+
+const PUBLIC_BASE_URL_KEY = "public_base_url";
+
+export function normalizePublicBaseUrl(value: string): string {
+  const candidate = value.trim().includes("://") ? value.trim() : `https://${value.trim()}`;
+  const url = new URL(candidate);
+  if (!["http:", "https:"].includes(url.protocol)) throw new Error("Public base URL must use HTTP or HTTPS");
+  if (url.username || url.password) throw new Error("Public base URL cannot include credentials");
+  if (url.pathname !== "/" || url.search || url.hash) throw new Error("Public base URL cannot include a path, query, or fragment");
+  return url.origin;
+}
+
+export async function getPublicBaseUrlSetting(executor: QueryExecutor = pool): Promise<{ publicBaseUrl: string; configured: boolean }> {
+  const result = await executor.query("SELECT value FROM app_settings WHERE key = $1", [PUBLIC_BASE_URL_KEY]);
+  return {
+    publicBaseUrl: normalizePublicBaseUrl(result.rows[0]?.value ?? config.PUBLIC_BASE_URL),
+    configured: Boolean(result.rows[0])
+  };
+}
+
+export async function getPublicBaseUrl(executor: QueryExecutor = pool): Promise<string> {
+  return (await getPublicBaseUrlSetting(executor)).publicBaseUrl;
+}
+
+export async function setPublicBaseUrl(value: string, userId: string, executor: QueryExecutor = pool): Promise<string> {
+  const normalized = normalizePublicBaseUrl(value);
+  await executor.query(
+    `INSERT INTO app_settings(key, value, updated_by, updated_at)
+     VALUES ($1, $2, $3, now())
+     ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_by = EXCLUDED.updated_by, updated_at = now()`,
+    [PUBLIC_BASE_URL_KEY, normalized, userId]
+  );
+  return normalized;
+}

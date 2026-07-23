@@ -1,0 +1,7 @@
+tunnel: 37ece366-b762-46f4-b702-2e5a3015cfb5
+credentials-file: /Users/bachnguyen/.cloudflared/37ece366-b762-46f4-b702-2e5a3015cfb5.json
+
+ingress:
+  - hostname: bachmbp-cfman.myidealab.dev
+    service: http://127.0.0.1:5173
+  - service: http_status:404
