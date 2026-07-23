@@ -67,6 +67,7 @@ export type Store = {
   onboardingStatus: string;
   latestEnrollmentStatus?: string | null;
   accountId: string;
+  cfAccountId: string | null;
   accountName: string;
   zoneId: string;
   zoneName: string;

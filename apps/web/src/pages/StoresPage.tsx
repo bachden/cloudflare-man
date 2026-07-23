@@ -191,7 +191,7 @@ function StoreDrawer({ store, tab, onTabChange, onClose }: { store: Store | null
               <div><dt>Store code</dt><dd>{currentStore.tenantCode} / {currentStore.storeCode}</dd></div>
               <div><dt>Account</dt><dd>{currentStore.accountName}</dd></div>
               <div><dt>Zone</dt><dd>{currentStore.zoneName}</dd></div>
-              <div><dt>Tunnel ID</dt><dd>{currentStore.tunnelId ? <a className="mono detail-link" href="https://dash.cloudflare.com/?to=%2F%3Aaccount%2Ftunnels" target="_blank" rel="noreferrer" title="Open Networking > Tunnels in Cloudflare">{currentStore.tunnelId}</a> : "Not provisioned"}</dd></div>
+              <div><dt>Tunnel ID</dt><dd>{currentStore.tunnelId ? currentStore.cfAccountId ? <a className="mono detail-link" href={`https://dash.cloudflare.com/${encodeURIComponent(currentStore.cfAccountId)}/tunnels/${encodeURIComponent(currentStore.tunnelId)}/overview`} target="_blank" rel="noreferrer" title="Open tunnel details in Cloudflare">{currentStore.tunnelId}</a> : <span className="mono">{currentStore.tunnelId}</span> : "Not provisioned"}</dd></div>
             </dl>
           </section>
           <EnrollmentHistory enrollments={currentStore.enrollments ?? []} onViewLog={setLogEnrollment} onDelete={(enrollment) => setDeleteEnrollmentTarget(enrollment)} onUnenroll={(enrollment) => issueUnenrollment.mutate(enrollment.id)} deleting={deleteEnrollment.isPending} unenrolling={issueUnenrollment.isPending} />
