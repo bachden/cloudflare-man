@@ -11,12 +11,14 @@ export function SearchableSelect({
   options,
   defaultValue = "",
   ariaLabel,
+  emptyMessage = "No matching options",
   onValueChange
 }: {
   name: string;
   options: SearchableSelectOption[];
   defaultValue?: string;
   ariaLabel: string;
+  emptyMessage?: string;
   onValueChange?: (value: string) => void;
 }) {
   const initial = options.find((option) => option.value === defaultValue) ?? options[0];
@@ -109,7 +111,7 @@ export function SearchableSelect({
       {open && (
         <div className="searchable-select-menu" id={listId} role="listbox">
           {filteredOptions.length === 0 ? (
-            <div className="searchable-select-empty">No matching account or zone</div>
+            <div className="searchable-select-empty">{emptyMessage}</div>
           ) : filteredOptions.map((option, index) => (
             <button
               id={`${listId}-${index}`}

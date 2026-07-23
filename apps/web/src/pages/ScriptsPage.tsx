@@ -5,6 +5,7 @@ import { toast } from "sonner";
 import { api } from "../api";
 import { FieldHelp } from "../components/FieldHelp";
 import { PageHeader } from "../components/PageHeader";
+import { SearchableSelect } from "../components/SearchableSelect";
 import { ScriptEditor } from "../components/ScriptEditor";
 import { StatusBadge } from "../components/StatusBadge";
 import type { ManagedScript, ManagedScriptSummary } from "../types";
@@ -13,6 +14,12 @@ const defaultContent = {
   windows: "Write-Output \"Store: $env:COMPUTERNAME\"\n",
   unix: "printf 'Store: %s\\n' \"$(hostname)\"\n"
 };
+
+const platformFilterOptions = [
+  { value: "", label: "All platforms" },
+  { value: "windows", label: "Windows" },
+  { value: "unix", label: "Unix" }
+];
 
 export function ScriptsPage() {
   const queryClient = useQueryClient();
@@ -121,7 +128,7 @@ export function ScriptsPage() {
     <PageHeader title="Script library" eyebrow="Versioned store automation" actions={<><button className="button button-secondary" type="button" onClick={() => refresh.mutate()} disabled={refresh.isPending}><RefreshCw size={15} className={refresh.isPending ? "spin-icon" : undefined} />{refresh.isPending ? "Refreshing..." : "Refresh"}</button><button className="button button-primary" type="button" onClick={openNew}><FilePlus2 size={16} />New script</button></>} />
     <div className="scripts-layout">
       <section className="panel script-list-panel">
-        <div className="script-list-toolbar"><label className="search-box"><Search size={15} /><input value={nameFilter} onChange={(event) => setNameFilter(event.target.value)} placeholder="Search script names" /></label><select value={platformFilter} onChange={(event) => setPlatformFilter(event.target.value as typeof platformFilter)} aria-label="Filter scripts by platform"><option value="">All platforms</option><option value="windows">Windows</option><option value="unix">Unix</option></select><span>{scripts.length} script{scripts.length === 1 ? "" : "s"}</span></div>
+        <div className="script-list-toolbar"><label className="search-box"><Search size={15} /><input value={nameFilter} onChange={(event) => setNameFilter(event.target.value)} placeholder="Search script names" /></label><div className="script-platform-filter"><SearchableSelect name="platformFilter" options={platformFilterOptions} ariaLabel="Filter scripts by platform" emptyMessage="No matching platforms" onValueChange={(value) => setPlatformFilter(value as typeof platformFilter)} /></div><span>{scripts.length} script{scripts.length === 1 ? "" : "s"}</span></div>
         {isLoading ? <div className="quiet-empty">Loading scripts...</div> : scripts.length ? <div className="script-list">{scripts.map((script) => <button className={`script-list-item ${selectedId === script.id && !draft ? "active" : ""}`} key={script.id} type="button" onClick={() => selectScript(script)}><span className="script-list-icon"><Code2 size={15} /></span><span><strong>{script.name}</strong><small>{script.platform} · v{script.latestVersion ?? "-"}</small></span><StatusBadge status={script.platform === "windows" ? "windows" : "unix"} /></button>)}</div> : <div className="quiet-empty">No scripts saved yet.</div>}
       </section>
       <section className="panel script-editor-panel">

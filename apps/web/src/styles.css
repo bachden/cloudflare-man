@@ -323,7 +323,11 @@ tbody tr:hover td { background: #fbfcfb; }
 .script-list-panel { padding: 0; overflow: hidden; }
 .script-list-toolbar { min-height: 52px; display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; padding: 10px 12px; border-bottom: 1px solid var(--line); }
 .script-list-toolbar .search-box { width: 100%; }
-.script-list-toolbar select { min-width: 0; flex: 1; }
+.script-platform-filter { min-width: 0; flex: 1; }
+.script-platform-filter .searchable-select-control > input { width: 100%; height: 34px; padding: 0 36px 0 10px; color: #465249; background: white; border: 1px solid var(--line-strong); border-radius: 5px; outline: none; font-size: 11px; font-weight: 500; }
+.script-platform-filter .searchable-select-control > input:hover { border-color: #aebbb3; }
+.script-platform-filter .searchable-select-control > input:focus { border-color: var(--green); box-shadow: 0 0 0 3px rgba(8, 127, 91, .1); }
+.script-platform-filter .searchable-select-control > button { top: 0; right: 0; height: 34px; }
 .script-list-toolbar span { color: var(--muted); font-size: 9px; white-space: nowrap; }
 .script-list { display: flex; flex-direction: column; }
 .script-list-item { width: 100%; min-height: 60px; display: grid; grid-template-columns: 28px minmax(0, 1fr) auto; align-items: center; gap: 9px; padding: 9px 12px; color: var(--ink); text-align: left; background: transparent; border: 0; border-bottom: 1px solid var(--line); cursor: pointer; }
