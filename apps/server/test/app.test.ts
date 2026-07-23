@@ -598,6 +598,20 @@ test("tracks enrollment history and issues cleanup for a running tunnel", async 
   });
   assert.equal(response.statusCode, 201, response.body);
   const issued = response.json();
+  const waitingState = await pool.query("SELECT onboarding_status FROM stores WHERE id = $1", [storeId]);
+  assert.equal(waitingState.rows[0].onboarding_status, "waiting_for_new_enrollment");
+  const deletedPending = await app.inject({
+    method: "DELETE",
+    url: `/api/stores/${storeId}/enrollments/${issued.id}`,
+    headers: { cookie: sessionCookie },
+    payload: { mode: "soft" }
+  });
+  assert.equal(deletedPending.statusCode, 200, deletedPending.body);
+  assert.equal(deletedPending.json().hardDeleted, true);
+  const restoredState = await pool.query("SELECT onboarding_status FROM stores WHERE id = $1", [storeId]);
+  assert.equal(restoredState.rows[0].onboarding_status, "verified");
+  const pendingRow = await pool.query("SELECT 1 FROM enrollments WHERE id = $1", [issued.id]);
+  assert.equal(pendingRow.rowCount, 0);
   assert.equal(issued.unenrollCommands.length, 1);
   assert.equal(issued.unenrollCommands[0].enrollmentId, enrollmentId);
   assert.match(issued.unenrollCommands[0].urls.shell, /\/unenroll\.sh$/);
@@ -622,8 +636,8 @@ test("tracks enrollment history and issues cleanup for a running tunnel", async 
 
   const detail = await app.inject({ method: "GET", url: `/api/stores/${storeId}`, headers: { cookie: sessionCookie } });
   assert.equal(detail.statusCode, 200, detail.body);
-  assert.equal(detail.json().store.enrollments.length, 2);
-  assert.equal(detail.json().store.enrollments[1].unenrollStatus, "pending");
+  assert.equal(detail.json().store.enrollments.length, 1);
+  assert.equal(detail.json().store.enrollments[0].unenrollStatus, "pending");
 
   const cleanupLog = await app.inject({
     method: "POST",

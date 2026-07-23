@@ -100,6 +100,10 @@ const enrollmentSchema = z.object({
   expiresInHours: z.number().int().min(1).max(168).default(24)
 });
 
+const enrollmentDeleteSchema = z.object({
+  mode: z.enum(["soft", "hard"]).default("soft")
+});
+
 const executeScriptSchema = z.object({
   scriptVersionId: z.string().uuid(),
   timeoutMs: z.number().int().min(1_000).max(300_000).default(60_000)
@@ -491,9 +495,11 @@ export async function storeRoutes(app: FastifyInstance): Promise<void> {
       storeId: z.string().uuid(),
       enrollmentId: z.string().uuid()
     }).parse(request.params);
+    const body = enrollmentDeleteSchema.parse(request.body ?? {});
     const deleted = await withTransaction(async (client) => {
       const result = await client.query(
         `SELECT e.id, e.deleted_at,
+                (SELECT count(*)::int FROM enrollment_logs l WHERE l.enrollment_id = e.id) AS log_count,
                 e.deleted_at IS NULL
                 AND e.unenrolled_at IS NULL
                 AND e.status IN ('ready', 'installed')
@@ -516,25 +522,49 @@ export async function storeRoutes(app: FastifyInstance): Promise<void> {
       if (!enrollment) return { kind: "missing" as const };
       if (enrollment.is_current) return { kind: "current" as const };
       if (enrollment.deleted_at) return { kind: "already_deleted" as const, deletedAt: enrollment.deleted_at as string };
-      const updated = await client.query(
-        `UPDATE enrollments
-            SET deleted_at = now(), deleted_by = $3, updated_at = now()
-          WHERE store_id = $1 AND id = $2
-          RETURNING deleted_at`,
-        [storeId, enrollmentId, request.authUser!.id]
+      const hardDelete = body.mode === "hard" || enrollment.log_count === 0;
+      const deletedAt = new Date().toISOString();
+      if (hardDelete) {
+        await client.query("DELETE FROM enrollments WHERE store_id = $1 AND id = $2", [storeId, enrollmentId]);
+      } else {
+        await client.query(
+          `UPDATE enrollments
+              SET deleted_at = $3, deleted_by = $4, updated_at = now()
+            WHERE store_id = $1 AND id = $2`,
+          [storeId, enrollmentId, deletedAt, request.authUser!.id]
+        );
+      }
+      const activeEnrollment = await client.query(
+        `SELECT 1
+           FROM enrollments
+          WHERE store_id = $1
+            AND deleted_at IS NULL
+            AND unenrolled_at IS NULL
+            AND status IN ('ready', 'installed')
+          ORDER BY COALESCE(installed_at, claimed_at, created_at) DESC
+          LIMIT 1`,
+        [storeId]
+      );
+      await client.query(
+        `UPDATE stores
+            SET onboarding_status = CASE WHEN $2 THEN 'verified' ELSE 'revoked' END,
+                last_error = null, updated_at = now()
+          WHERE id = $1 AND onboarding_status = 'waiting_for_new_enrollment'`,
+        [storeId, Boolean(activeEnrollment.rowCount)]
       );
       await writeAudit({
         actorUserId: request.authUser!.id,
         action: "enrollment.deleted",
         entityType: "enrollment",
         entityId: enrollmentId,
-        details: { storeId, softDelete: true }
+        details: { storeId, hardDelete, logCount: enrollment.log_count }
       }, client);
-      return { kind: "deleted" as const, deletedAt: updated.rows[0].deleted_at as string };
+      return { kind: "deleted" as const, deletedAt, hardDelete, logCount: enrollment.log_count as number };
     });
     if (deleted.kind === "missing") return reply.code(404).send({ error: "Enrollment not found" });
     if (deleted.kind === "current") return reply.code(409).send({ error: "The current connected enrollment cannot be deleted" });
-    return { success: true, deletedAt: deleted.deletedAt, alreadyDeleted: deleted.kind === "already_deleted" };
+    if (deleted.kind === "already_deleted") return { success: true, deletedAt: deleted.deletedAt, hardDeleted: false, alreadyDeleted: true };
+    return { success: true, deletedAt: deleted.deletedAt, hardDeleted: deleted.hardDelete, logCount: deleted.logCount, alreadyDeleted: false };
   });
 
   app.post("/api/stores/:storeId/enrollments/:enrollmentId/unenroll", { preHandler: requireAuth }, async (request, reply) => {
@@ -929,8 +959,8 @@ export async function storeRoutes(app: FastifyInstance): Promise<void> {
         [result.rows[0].id]
       );
       await client.query(
-        "UPDATE stores SET onboarding_status = 'url_issued', last_error = null, updated_at = now() WHERE id = $1",
-        [id]
+        "UPDATE stores SET onboarding_status = $1, last_error = null, updated_at = now() WHERE id = $2",
+        [previous.length ? "waiting_for_new_enrollment" : "url_issued", id]
       );
       await writeAudit({
         actorUserId: request.authUser!.id,

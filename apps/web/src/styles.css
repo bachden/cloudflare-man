@@ -316,16 +316,27 @@ tbody tr:hover td { background: #fbfcfb; }
 .enrollment-history-field { min-width: 0; display: flex; align-items: center; gap: 9px; }
 .enrollment-computer-field { display: grid; grid-template-columns: minmax(0, 1fr) auto; }
 .enrollment-computer-summary { min-width: 0; display: flex; align-items: center; gap: 9px; }
-.enrollment-computer-summary strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ink); font-size: 11px; }
+.enrollment-computer-summary strong { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ink); font-size: 11px; }
 .enrollment-platform-icon { display: inline-flex; flex: 0 0 auto; color: #536159; }
+.enrollment-unenroll-link { flex: 0 0 auto; padding: 0; color: var(--muted); font-size: 10px; }
+.enrollment-unenroll-link:hover { color: var(--ink); }
 .enrollment-event-time { color: var(--muted); font-size: 10px; white-space: nowrap; }
 .enrollment-status-cell { gap: 10px; }
-.enrollment-unenroll-link { padding: 0; font-size: 10px; }
 .enrollment-history-actions { width: 133px; display: grid; grid-template-columns: 98px 30px; align-items: center; gap: 5px; }
 .enrollment-log-button { width: 98px; }
 .enrollment-delete-placeholder { width: 30px; height: 30px; }
 .enrollment-delete-button { color: var(--red); }
 .enrollment-delete-button:hover { color: var(--red); background: var(--red-soft); }
+.enrollment-delete-dialog { display: flex; flex-direction: column; gap: 16px; }
+.enrollment-delete-dialog > p { margin: 0; color: #536058; font-size: 11px; line-height: 1.55; }
+.enrollment-delete-options { display: flex; flex-direction: column; gap: 8px; }
+.enrollment-delete-option { display: flex; align-items: flex-start; gap: 10px; padding: 12px; border: 1px solid var(--line); border-radius: 5px; cursor: pointer; }
+.enrollment-delete-option.selected { border-color: #9bcbb4; background: #f4fbf7; }
+.enrollment-delete-option input { margin-top: 2px; accent-color: var(--green); }
+.enrollment-delete-option span { display: flex; flex-direction: column; gap: 4px; }
+.enrollment-delete-option strong { color: var(--ink); font-size: 11px; }
+.enrollment-delete-option small { color: var(--muted); font-size: 10px; line-height: 1.4; }
+.enrollment-delete-no-logs { margin: 0; display: flex; align-items: flex-start; gap: 8px; }
 .enrollment-log-list { display: flex; flex-direction: column; gap: 8px; }
 .enrollment-log { padding: 11px 12px; border: 1px solid var(--line); border-left: 3px solid var(--line-strong); border-radius: 4px; background: #fbfcfb; }
 .enrollment-log-error { border-left-color: #c75a4e; }

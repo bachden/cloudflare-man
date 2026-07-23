@@ -8,7 +8,7 @@ export async function dashboardRoutes(app: FastifyInstance): Promise<void> {
       pool.query(`
         SELECT (SELECT count(*)::int FROM stores) AS "totalStores",
                (SELECT count(*)::int FROM stores WHERE tunnel_status = 'healthy') AS "healthyStores",
-               (SELECT count(*)::int FROM stores WHERE onboarding_status IN ('url_issued', 'claimed', 'provisioning', 'connector_online')) AS "onboardingStores",
+               (SELECT count(*)::int FROM stores WHERE onboarding_status IN ('url_issued', 'waiting_for_new_enrollment', 'claimed', 'provisioning', 'connector_online')) AS "onboardingStores",
                (SELECT count(*)::int FROM stores WHERE onboarding_status = 'failed' OR tunnel_status IN ('down', 'degraded') OR rdp_status = 'failed') AS "attentionStores",
                (SELECT count(*)::int FROM cloudflare_accounts WHERE status = 'active') AS "activeAccounts",
                (SELECT count(*)::int FROM zones WHERE status = 'active') AS "activeZones"

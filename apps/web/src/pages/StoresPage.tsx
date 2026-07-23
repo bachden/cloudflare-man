@@ -68,7 +68,7 @@ export function StoresPage() {
       <PageHeader title="Stores" eyebrow="Tunnel inventory" actions={<><button className="button button-secondary" onClick={() => refresh.mutate()} disabled={refresh.isPending || !data?.stores.length}><RefreshCw size={15} className={refresh.isPending ? "spin-icon" : undefined} />{refresh.isPending ? "Refreshing..." : "Refresh"}</button><Link className="button button-primary" to="/onboarding"><Plus size={16} />Onboard store</Link></>} />
       <div className="toolbar">
         <label className="search-box"><Search size={16} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search stores or hostnames" /></label>
-        <select value={status} onChange={(event) => setStatus(event.target.value)} aria-label="Filter onboarding status"><option value="">All statuses</option><option value="active">Active</option><option value="verified">Verified</option><option value="url_issued">URL issued</option><option value="provisioning">Provisioning</option><option value="connector_online">Connector online</option><option value="failed">Failed</option><option value="revoked">Revoked</option></select>
+        <select value={status} onChange={(event) => setStatus(event.target.value)} aria-label="Filter onboarding status"><option value="">All statuses</option><option value="active">Active</option><option value="verified">Verified</option><option value="waiting_for_new_enrollment">Waiting for new enrollment</option><option value="url_issued">URL issued</option><option value="provisioning">Provisioning</option><option value="connector_online">Connector online</option><option value="failed">Failed</option><option value="revoked">Revoked</option></select>
         <span className="result-count">{pagination?.total ?? 0} stores</span>
       </div>
       <section className="panel table-panel store-table-panel">
@@ -90,6 +90,8 @@ function StoreDrawer({ store, tab, onTabChange, onClose, onEditConnectivity }: {
   const [enrollment, setEnrollment] = useState<EnrollmentResult | null>(null);
   const [logEnrollment, setLogEnrollment] = useState<StoreEnrollment | null>(null);
   const [unenrollment, setUnenrollment] = useState<UnenrollmentResult | null>(null);
+  const [deleteEnrollmentTarget, setDeleteEnrollmentTarget] = useState<StoreEnrollment | null>(null);
+  const [deleteEnrollmentMode, setDeleteEnrollmentMode] = useState<"soft" | "hard">("soft");
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [deletePreflight, setDeletePreflight] = useState<StoreDeletePreflight | null>(null);
   const [deleteName, setDeleteName] = useState("");
@@ -115,19 +117,15 @@ function StoreDrawer({ store, tab, onTabChange, onClose, onEditConnectivity }: {
     onSuccess: async (result) => { await Promise.all([queryClient.invalidateQueries({ queryKey: ["stores"] }), queryClient.invalidateQueries({ queryKey: ["store-detail", store?.id] })]); if (result.success) toast.success("Endpoint verified"); else toast.error(result.check.error ?? "Endpoint is unreachable"); },
     onError: (error) => toast.error(error instanceof Error ? error.message : "Verification failed")
   });
-  const revoke = useMutation({
-    mutationFn: () => api.post(`/api/stores/${store!.id}/enrollments/revoke`),
-    onSuccess: async () => { setEnrollment(null); await queryClient.invalidateQueries({ queryKey: ["stores"] }); toast.success("Enrollment revoked"); },
-    onError: (error) => toast.error(error instanceof Error ? error.message : "Unable to revoke enrollment")
-  });
   const deleteEnrollment = useMutation({
-    mutationFn: (enrollmentId: string) => api.delete(`/api/stores/${store!.id}/enrollments/${enrollmentId}`),
-    onSuccess: async () => {
+    mutationFn: ({ enrollmentId, mode }: { enrollmentId: string; mode: "soft" | "hard" }) => api.delete<{ hardDeleted: boolean; logCount?: number }>(`/api/stores/${store!.id}/enrollments/${enrollmentId}`, { mode }),
+    onSuccess: async (result) => {
+      setDeleteEnrollmentTarget(null);
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: ["store-detail", store?.id] }),
         queryClient.invalidateQueries({ queryKey: ["stores"] })
       ]);
-      toast.success("Enrollment deleted from active history");
+      toast.success(result.hardDeleted ? "Enrollment permanently deleted" : "Enrollment soft-deleted; logs retained");
     },
     onError: (error) => toast.error(error instanceof Error ? error.message : "Unable to delete enrollment")
   });
@@ -176,8 +174,7 @@ function StoreDrawer({ store, tab, onTabChange, onClose, onEditConnectivity }: {
     setDeleteOpen(true);
     deletePreflightMutation.mutate();
   };
-  const close = () => { setEnrollment(null); setUnenrollment(null); setLogEnrollment(null); setDeleteOpen(false); setDeletePreflight(null); setDeleteName(""); onClose(); };
-  const canRevoke = ["url_issued", "claimed", "provisioning", "failed"].includes(currentStore?.onboardingStatus ?? "");
+  const close = () => { setEnrollment(null); setUnenrollment(null); setLogEnrollment(null); setDeleteEnrollmentTarget(null); setDeleteOpen(false); setDeletePreflight(null); setDeleteName(""); onClose(); };
   return (
     <>
     <SideDrawer open={Boolean(store)} title={<div className="store-drawer-heading"><strong>{currentStore?.displayName ?? "Store details"}</strong>{currentStore && <div className="store-drawer-statuses"><div><span>Onboarding</span><StatusBadge status={currentStore.onboardingStatus} /></div><div><span>Tunnel</span><StatusBadge status={currentStore.tunnelStatus} /></div><div><span>RDP</span><StatusBadge status={currentStore.rdpStatus} /></div></div>}</div>} onClose={close}>
@@ -199,11 +196,10 @@ function StoreDrawer({ store, tab, onTabChange, onClose, onEditConnectivity }: {
               <div><dt>RDP gateway</dt><dd className="mono">{currentStore.rdpUrl ? new URL(currentStore.rdpUrl).hostname : "Not provisioned"}</dd></div>
             </dl>
           </section>
-          <EnrollmentHistory enrollments={currentStore.enrollments ?? []} onViewLog={setLogEnrollment} onDelete={(enrollment) => { if (window.confirm(`Soft-delete the enrollment for ${enrollmentComputerName(enrollment)}? Execution history will be retained.`)) deleteEnrollment.mutate(enrollment.id); }} onUnenroll={(enrollment) => issueUnenrollment.mutate(enrollment.id)} deleting={deleteEnrollment.isPending} unenrolling={issueUnenrollment.isPending} />
+          <EnrollmentHistory enrollments={currentStore.enrollments ?? []} onViewLog={setLogEnrollment} onDelete={(enrollment) => { setDeleteEnrollmentMode(enrollment.logCount > 0 ? "soft" : "hard"); setDeleteEnrollmentTarget(enrollment); }} onUnenroll={(enrollment) => issueUnenrollment.mutate(enrollment.id)} deleting={deleteEnrollment.isPending} unenrolling={issueUnenrollment.isPending} />
           {unenrollment && <UnenrollmentCommands result={unenrollment} />}
           {enrollment ? <EnrollmentCommands result={enrollment} /> : <div className="detail-actions">
             <button className="button button-primary" onClick={() => mutation.mutate()} disabled={mutation.isPending}><TerminalSquare size={16} />{mutation.isPending ? "Issuing..." : "New enrollment"}</button>
-            {canRevoke && <button className="button button-danger" onClick={() => { if (window.confirm("Revoke this enrollment URL?")) revoke.mutate(); }} disabled={revoke.isPending}><ShieldAlert size={15} />Revoke</button>}
             <button className="button button-danger" onClick={openDelete} disabled={deletePreflightMutation.isPending || deleteStore.isPending}><Trash2 size={15} />Delete store</button>
           </div>}
         </div>}
@@ -216,6 +212,7 @@ function StoreDrawer({ store, tab, onTabChange, onClose, onEditConnectivity }: {
         </div>}
       </div>}
     </SideDrawer>
+    <EnrollmentDeleteDialog enrollment={deleteEnrollmentTarget} mode={deleteEnrollmentMode} onModeChange={setDeleteEnrollmentMode} onClose={() => setDeleteEnrollmentTarget(null)} onConfirm={() => deleteEnrollmentTarget && deleteEnrollment.mutate({ enrollmentId: deleteEnrollmentTarget.id, mode: deleteEnrollmentMode })} deleting={deleteEnrollment.isPending} />
     <StoreDeleteDialog open={deleteOpen} preflight={deletePreflight} loading={deletePreflightMutation.isPending} confirmationName={deleteName} onConfirmationNameChange={setDeleteName} onClose={() => { setDeleteOpen(false); setDeletePreflight(null); setDeleteName(""); }} onConfirm={() => deleteStore.mutate()} deleting={deleteStore.isPending} />
     <Modal open={Boolean(logEnrollment)} title={`Enrollment log · ${logEnrollment ? new Date(logEnrollment.createdAt).toLocaleString() : ""}`} onClose={() => setLogEnrollment(null)} width="wide">
       {logsLoading ? <div className="quiet-empty">Loading logs...</div> : logData?.logs.length ? <div className="enrollment-log-list">{logData.logs.map((log) => <article key={log.id} className={`enrollment-log enrollment-log-${log.level}`}><header><StatusBadge status={log.level} /><strong>{log.step ?? "installer"}</strong><time>{new Date(log.createdAt).toLocaleString()}</time></header><p>{log.message}</p></article>)}</div> : <div className="quiet-empty">No logs have been reported for this enrollment.</div>}
@@ -255,14 +252,30 @@ function StoreDeleteDialog({
   </Modal>;
 }
 
+function EnrollmentDeleteDialog({ enrollment, mode, onModeChange, onClose, onConfirm, deleting }: { enrollment: StoreEnrollment | null; mode: "soft" | "hard"; onModeChange: (mode: "soft" | "hard") => void; onClose: () => void; onConfirm: () => void; deleting: boolean }) {
+  const hasLogs = Boolean(enrollment?.logCount);
+  return <Modal open={Boolean(enrollment)} title={`Delete enrollment · ${enrollment ? enrollmentComputerName(enrollment) : ""}`} onClose={onClose}>
+    <div className="enrollment-delete-dialog">
+      {hasLogs ? <>
+        <p>This enrollment has {enrollment?.logCount} log{enrollment?.logCount === 1 ? "" : "s"}. Choose whether to keep the history or remove it permanently.</p>
+        <div className="enrollment-delete-options" role="radiogroup" aria-label="Enrollment delete mode">
+          <label className={`enrollment-delete-option ${mode === "soft" ? "selected" : ""}`}><input type="radio" name="enrollment-delete-mode" checked={mode === "soft"} onChange={() => onModeChange("soft")} /><span><strong>Soft-delete</strong><small>Remove it from active history and retain all logs.</small></span></label>
+          <label className={`enrollment-delete-option ${mode === "hard" ? "selected" : ""}`}><input type="radio" name="enrollment-delete-mode" checked={mode === "hard"} onChange={() => onModeChange("hard")} /><span><strong>Delete permanently</strong><small>Remove the enrollment and its logs. This cannot be undone.</small></span></label>
+        </div>
+      </> : <div className="inline-alert enrollment-delete-no-logs"><Trash2 size={15} />This enrollment has no logs and will be deleted permanently. It will disappear from enrollment history.</div>}
+      <div className="form-actions"><button className="button button-secondary" type="button" onClick={onClose}>Cancel</button><button className="button button-danger" type="button" onClick={onConfirm} disabled={deleting}><Trash2 size={15} />{deleting ? "Deleting..." : hasLogs && mode === "soft" ? "Soft-delete enrollment" : "Delete permanently"}</button></div>
+    </div>
+  </Modal>;
+}
+
 function EnrollmentHistory({ enrollments, onViewLog, onDelete, onUnenroll, deleting, unenrolling }: { enrollments: StoreEnrollment[]; onViewLog: (enrollment: StoreEnrollment) => void; onDelete: (enrollment: StoreEnrollment) => void; onUnenroll: (enrollment: StoreEnrollment) => void; deleting: boolean; unenrolling: boolean }) {
   return <section className="enrollment-history"><header><h3>Enrollment history</h3><span>{enrollments.length} attempt{enrollments.length === 1 ? "" : "s"}</span></header>{enrollments.length ? <div className="enrollment-history-list">{enrollments.map((enrollment) => {
     const environment = enrollmentEnvironment(enrollment);
     const displayStatus = enrollmentDisplayStatus(enrollment);
     const displayTime = enrollmentDisplayTime(enrollment, displayStatus);
     return <div className="enrollment-history-row" key={enrollment.id}>
-      <div className="enrollment-history-field enrollment-computer-field"><div className="enrollment-computer-summary" title={environment} aria-label={`${environment} · ${enrollmentComputerName(enrollment)}`}><span className="enrollment-platform-icon">{enrollmentPlatformIcon(enrollment)}</span><strong>{enrollmentComputerName(enrollment)}</strong></div></div>
-      <div className="enrollment-history-field enrollment-status-cell"><StatusBadge status={displayStatus} />{enrollment.isCurrent && <button className="text-link enrollment-unenroll-link" type="button" onClick={() => onUnenroll(enrollment)} disabled={unenrolling}>{unenrolling ? "Issuing..." : "Unenroll"}</button>}</div>
+      <div className="enrollment-history-field enrollment-computer-field"><div className="enrollment-computer-summary" title={environment} aria-label={`${environment} · ${enrollmentComputerName(enrollment)}`}><span className="enrollment-platform-icon">{enrollmentPlatformIcon(enrollment)}</span><strong>{enrollmentComputerName(enrollment)}</strong>{enrollment.isCurrent && <button className="text-link enrollment-unenroll-link" type="button" onClick={() => onUnenroll(enrollment)} disabled={unenrolling}>{unenrolling ? "Issuing..." : "Unenroll"}</button>}</div></div>
+      <div className="enrollment-history-field enrollment-status-cell"><StatusBadge status={displayStatus} /></div>
       <time className="enrollment-event-time" dateTime={displayTime ?? undefined}>{displayTime ? new Date(displayTime).toLocaleString() : "-"}</time>
       <div className="enrollment-history-actions"><button className="button button-secondary enrollment-log-button" type="button" onClick={() => onViewLog(enrollment)}><ScrollText size={15} />View log</button>{!enrollment.isCurrent && !enrollment.deletedAt ? <button className="icon-button enrollment-delete-button" type="button" title="Delete enrollment" aria-label={`Delete enrollment for ${enrollmentComputerName(enrollment)}`} onClick={() => onDelete(enrollment)} disabled={deleting}><Trash2 size={15} /></button> : <span className="enrollment-delete-placeholder" aria-hidden="true" />}</div>
     </div>;
