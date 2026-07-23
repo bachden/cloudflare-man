@@ -155,6 +155,7 @@ const apiTokenPermissions = [
   ["Account", "Access: Apps and Policies", "Write", "Protect browser RDP sessions"],
   ["Zone", "DNS", "Write", "Create and update store hostnames"],
   ["Zone", "Zone", "Read", "Synchronize available zones"],
+  ["Zone", "WAF", "Write", "Manage per-route source IP policies"],
 ] as const;
 
 function ApiTokenGuide({ accountId }: { accountId: string }) {

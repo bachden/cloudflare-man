@@ -4,8 +4,19 @@ import { pool } from "./database.js";
 import { decryptSecret } from "./security.js";
 import { slugifyLabel } from "./stores.js";
 import { COMMAND_AGENT_SERVICE_URL } from "./command-agent.js";
+import { resolveWafAllowedIps } from "./route-waf.js";
 
-type PublicationRoute = { path: string; serviceUrl: string; routeKind: "service" | "command_agent"; sortOrder: number };
+type PublicationRoute = {
+  id: string;
+  path: string;
+  serviceUrl: string;
+  routeKind: "service" | "command_agent";
+  sortOrder: number;
+  wafEnabled: boolean;
+  wafAllowedIps: string[];
+  wafRulesetId: string | null;
+  wafRuleId: string | null;
+};
 type Publication = { id: string; hostname: string; dnsRecordId: string | null; routes: PublicationRoute[] };
 type StoreConnectivity = {
   id: string;
@@ -55,8 +66,8 @@ function ingressRules(publications: Publication[]): CloudflareIngressRule[] {
 
 async function loadPublications(storeId: string): Promise<Publication[]> {
   const publicationRows = await pool.query(
-    `SELECT p.id, p.hostname, p.dns_record_id, r.path, r.service_url, r.sort_order,
-              r.route_kind
+    `SELECT p.id, p.hostname, p.dns_record_id, r.id AS route_id, r.path, r.service_url, r.sort_order,
+              r.route_kind, r.waf_enabled, r.waf_allowed_ips, r.waf_ruleset_id, r.waf_rule_id
        FROM store_publications p
        JOIN store_routes r ON r.publication_id = p.id
       WHERE p.store_id = $1
@@ -72,10 +83,15 @@ async function loadPublications(storeId: string): Promise<Publication[]> {
       routes: []
     };
     publication.routes.push({
+      id: row.route_id,
       path: row.path,
       serviceUrl: row.route_kind === "command_agent" ? COMMAND_AGENT_SERVICE_URL : row.service_url,
       routeKind: row.route_kind,
-      sortOrder: row.sort_order
+      sortOrder: row.sort_order,
+      wafEnabled: row.waf_enabled,
+      wafAllowedIps: row.waf_allowed_ips ?? [],
+      wafRulesetId: row.waf_ruleset_id,
+      wafRuleId: row.waf_rule_id
     });
     byPublication.set(row.id, publication);
   }
@@ -102,6 +118,34 @@ async function applyConnectivity(
   const primaryRoute = primary.routes.find((route) => route.path === "/") ?? primary.routes[0];
   if (!primaryRoute) throw new Error(`Published endpoint ${primary.hostname} has no routes`);
   await client.configureTunnel(tunnelId, ingressRules(publications));
+  let defaultAllowedIps: Promise<string[]> | undefined;
+  for (const publication of publications) {
+    for (const route of publication.routes) {
+      if (!route.wafEnabled && !route.wafRuleId) continue;
+      const allowedIps = route.wafEnabled
+        ? route.wafAllowedIps.length
+          ? await resolveWafAllowedIps(route.wafAllowedIps, store.provider_mode)
+          : await (defaultAllowedIps ??= resolveWafAllowedIps([], store.provider_mode))
+        : route.wafAllowedIps;
+      const applied = await client.configureRouteWaf({
+        zoneId: store.cf_zone_id ?? "mock-zone",
+        hostname: publication.hostname,
+        path: route.path,
+        enabled: route.wafEnabled,
+        allowedIps,
+        rulesetId: route.wafRulesetId
+      });
+      route.wafAllowedIps = allowedIps;
+      route.wafRulesetId = applied.rulesetId;
+      route.wafRuleId = applied.ruleId;
+      await pool.query(
+        `UPDATE store_routes
+            SET waf_allowed_ips = $1, waf_ruleset_id = $2, waf_rule_id = $3, updated_at = now()
+          WHERE id = $4`,
+        [allowedIps, applied.rulesetId, applied.ruleId, route.id]
+      );
+    }
+  }
   for (const publication of publications) {
     if (!publication.dnsRecordId) {
       const record = await client.createDnsRecord(store.cf_zone_id ?? "mock-zone", publication.hostname, tunnelId);
@@ -120,7 +164,11 @@ async function applyConnectivity(
   );
 }
 
-export async function reconfigureStore(storeId: string, removedDnsRecordIds: string[] = []): Promise<boolean> {
+export async function reconfigureStore(
+  storeId: string,
+  removedDnsRecordIds: string[] = [],
+  removedWafRoutes: Array<{ hostname: string; path: string; rulesetId: string | null }> = []
+): Promise<boolean> {
   const result = await pool.query(
     `SELECT s.id, s.tenant_code, s.store_code, s.tunnel_id,
             a.id AS account_row_id, a.provider_mode, a.cf_account_id, a.api_token_encrypted,
@@ -141,6 +189,16 @@ export async function reconfigureStore(storeId: string, removedDnsRecordIds: str
   if (publications.length === 0) throw new Error("Store has no published endpoints");
   const client = cloudflareClient(store);
   try {
+    for (const route of removedWafRoutes) {
+      await client.configureRouteWaf({
+        zoneId: store.cf_zone_id ?? "mock-zone",
+        hostname: route.hostname,
+        path: route.path,
+        enabled: false,
+        allowedIps: [],
+        rulesetId: route.rulesetId
+      });
+    }
     await applyConnectivity(storeId, store, client, store.tunnel_id, publications);
     for (const recordId of removedDnsRecordIds) {
       await client.deleteDnsRecord(store.cf_zone_id ?? "mock-zone", recordId);

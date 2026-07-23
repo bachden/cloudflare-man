@@ -77,6 +77,22 @@ export type CloudflareIngressRule = {
   path?: string;
 };
 
+type CloudflareRulesetRule = {
+  id?: string;
+  action: string;
+  expression: string;
+  description?: string;
+  enabled?: boolean;
+};
+
+type CloudflareRuleset = {
+  id: string;
+  name: string;
+  kind?: string;
+  phase?: string;
+  rules?: CloudflareRulesetRule[];
+};
+
 const MAX_RETRIES = 3;
 const RETRYABLE_STATUS = new Set([429, 500, 502, 503, 504]);
 
@@ -200,6 +216,75 @@ export class CloudflareClient {
         }
       })
     });
+  }
+
+  async configureRouteWaf(input: {
+    zoneId: string;
+    hostname: string;
+    path: string;
+    enabled: boolean;
+    allowedIps: string[];
+    rulesetId?: string | null;
+  }): Promise<{ rulesetId: string | null; ruleId: string | null }> {
+    const description = `cloudflare-man route WAF: ${input.hostname}${input.path}`;
+    if (this.mode === "mock") {
+      return input.enabled
+        ? { rulesetId: input.rulesetId ?? randomUUID(), ruleId: randomUUID() }
+        : { rulesetId: input.rulesetId ?? null, ruleId: null };
+    }
+
+    let ruleset: CloudflareRuleset | undefined;
+    if (input.rulesetId) {
+      const candidate = await this.request<CloudflareRuleset>(`/zones/${input.zoneId}/rulesets/${input.rulesetId}`);
+      if (candidate.kind === "zone" && candidate.phase === "http_request_firewall_custom") ruleset = candidate;
+    }
+    if (!ruleset) {
+      const summaries = await this.request<CloudflareRuleset[]>(
+        `/zones/${input.zoneId}/rulesets?${new URLSearchParams({ per_page: "50" }).toString()}`
+      );
+      const entrypoint = summaries.find((candidate) => candidate.kind === "zone" && candidate.phase === "http_request_firewall_custom");
+      if (entrypoint) {
+        ruleset = await this.request<CloudflareRuleset>(`/zones/${input.zoneId}/rulesets/${entrypoint.id}`);
+      }
+    }
+    const existingRules = (ruleset?.rules ?? []).filter((rule) => rule.description !== description);
+    if (input.enabled) {
+      const escapedHostname = input.hostname.replaceAll("\\", "\\\\").replaceAll('"', '\\"');
+      const escapedPath = input.path.replaceAll("\\", "\\\\").replaceAll('"', '\\"');
+      const pathExpression = input.path === "/"
+        ? `http.request.uri.path eq "${escapedPath}"`
+        : `(http.request.uri.path eq "${escapedPath}" or starts_with(http.request.uri.path, "${escapedPath}/"))`;
+      const sourceExpression = input.allowedIps.length ? `not ip.src in { ${input.allowedIps.join(" ")} }` : "true";
+      existingRules.push({
+        action: "block",
+        expression: `(http.host eq "${escapedHostname}" and ${pathExpression} and ${sourceExpression})`,
+        description,
+        enabled: true
+      });
+    }
+    if (!ruleset && !input.enabled) return { rulesetId: null, ruleId: null };
+    if (!ruleset) {
+      ruleset = await this.request<CloudflareRuleset>(`/zones/${input.zoneId}/rulesets`, {
+        method: "POST",
+        body: JSON.stringify({
+          name: "zone",
+          description: "Zone-level phase entry point",
+          kind: "zone",
+          phase: "http_request_firewall_custom",
+          rules: existingRules
+        })
+      });
+    } else {
+      ruleset = await this.request<CloudflareRuleset>(`/zones/${input.zoneId}/rulesets/${ruleset.id}`, {
+        method: "PUT",
+        body: JSON.stringify({
+          description: ruleset.name === "zone" ? "Zone-level phase entry point" : undefined,
+          rules: existingRules
+        })
+      });
+    }
+    const managedRule = (ruleset.rules ?? []).find((rule) => rule.description === description);
+    return { rulesetId: ruleset.id, ruleId: managedRule?.id ?? null };
   }
 
   async createDnsRecord(zoneId: string, hostname: string, tunnelId: string): Promise<{ id: string }> {

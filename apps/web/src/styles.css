@@ -427,13 +427,23 @@ tbody tr:hover td { background: #fbfcfb; }
 .publication-summary-head .status { margin-left: auto; }
 .publication-route { display: grid; grid-template-columns: minmax(55px, .22fr) 12px minmax(0, 1fr) auto; gap: 7px; align-items: center; color: var(--muted); font-size: 9px; }
 .publication-route code:last-child { overflow-wrap: anywhere; }
-.publication-verify-button { min-height: 30px; padding: 0 8px; white-space: nowrap; }
-.connectivity-modal { display: flex; flex-direction: column; gap: 18px; }
+.publication-route-actions { display: flex; align-items: center; justify-content: flex-end; gap: 6px; flex-wrap: wrap; }
+.publication-verify-button, .publication-waf-button { min-height: 30px; padding: 0 8px; white-space: nowrap; }
+.publication-waf-button.waf-active { color: var(--green); border-color: #a9d7bf; background: #f2fbf6; }
+.connectivity-inline-editor { display: flex; flex-direction: column; gap: 18px; }
+.detail-link { color: var(--green); text-decoration: none; }
+.detail-link:hover { text-decoration: underline; }
 .connectivity-scope { display: grid; grid-template-columns: 1fr 1fr 1.3fr; border: 1px solid var(--line); border-radius: 5px; }
 .connectivity-scope > div { min-width: 0; padding: 10px 12px; display: flex; flex-direction: column; gap: 4px; border-right: 1px solid var(--line); }
 .connectivity-scope > div:last-child { border-right: 0; }
 .connectivity-scope span { color: var(--muted); font-size: 8px; font-weight: 800; text-transform: uppercase; }
 .connectivity-scope strong { font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.route-waf-dialog { display: flex; flex-direction: column; gap: 16px; }
+.checkbox-field { display: flex; align-items: flex-start; gap: 10px; padding: 12px; border: 1px solid var(--line); border-radius: 5px; }
+.checkbox-field input { margin-top: 2px; accent-color: var(--green); }
+.checkbox-field span { display: flex; flex-direction: column; gap: 4px; }
+.checkbox-field strong { color: var(--ink); font-size: 11px; }
+.checkbox-field small { color: var(--muted); font-size: 10px; line-height: 1.4; }
 .command-section { border: 1px solid #cad4cd; border-radius: 6px; overflow: hidden; }
 .enrollment-command-stack { display: flex; flex-direction: column; gap: 12px; }
 .unenroll-command-panel { display: flex; flex-direction: column; gap: 9px; padding: 11px; border: 1px solid #edcf9c; border-radius: 6px; background: #fffaf0; }
@@ -626,7 +636,7 @@ tbody tr:hover td { background: #fbfcfb; }
   .store-drawer-tabs { margin: 0 -15px; padding-left: 15px; padding-right: 15px; overflow-x: auto; }
   .store-drawer-tabs button { flex: 0 0 auto; }
   .publication-route { grid-template-columns: 55px 12px minmax(0, 1fr); }
-  .publication-verify-button { grid-column: 1 / -1; justify-self: start; }
+  .publication-route-actions { grid-column: 1 / -1; justify-content: flex-start; }
   .stepper > i { width: 28px; }
   .step strong { display: none; }
   .connection-track { padding: 12px 5px; }

@@ -39,6 +39,10 @@ export type StoreRoute = {
   path: string;
   serviceUrl: string;
   kind: "service" | "command_agent";
+  wafEnabled: boolean;
+  wafAllowedIps: string[];
+  wafRulesetId: string | null;
+  wafRuleId: string | null;
 };
 
 export type StorePublication = {

@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { AlertTriangle, Apple, CheckCircle2, ChevronLeft, ChevronRight, FilePlus2, Monitor, MonitorUp, Plus, RefreshCw, Save, ScrollText, Search, Server, Settings2, ShieldAlert, TerminalSquare, Trash2, Unplug } from "lucide-react";
+import { AlertTriangle, Apple, CheckCircle2, ChevronLeft, ChevronRight, FilePlus2, Monitor, MonitorUp, Plus, RefreshCw, Save, ScrollText, Search, Server, Settings2, ShieldAlert, ShieldCheck, TerminalSquare, Trash2, Unplug } from "lucide-react";
 import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { toast } from "sonner";
@@ -12,7 +12,7 @@ import { PageHeader } from "../components/PageHeader";
 import { ScriptEditor } from "../components/ScriptEditor";
 import { SideDrawer } from "../components/SideDrawer";
 import { StatusBadge } from "../components/StatusBadge";
-import type { AppSettings, EnrollmentResult, ManagedScript, ManagedScriptSummary, Store, StoreCommandExecution, StoreDeletePreflight, StoreEnrollment, UnenrollmentResult } from "../types";
+import type { AppSettings, EnrollmentResult, ManagedScript, ManagedScriptSummary, Store, StoreCommandExecution, StoreDeletePreflight, StoreEnrollment, StoreRoute, UnenrollmentResult } from "../types";
 
 type StoreListResponse = {
   stores: Store[];
@@ -34,7 +34,6 @@ export function StoresPage() {
   const [page, setPage] = useState(1);
   const [selected, setSelected] = useState<Store | null>(null);
   const [selectedTab, setSelectedTab] = useState<StoreDrawerTab>("overall");
-  const [connectivityStore, setConnectivityStore] = useState<Store | null>(null);
   const pageSize = 25;
   const params = new URLSearchParams({ page: String(page), pageSize: String(pageSize) });
   if (search) params.set("search", search);
@@ -79,13 +78,12 @@ export function StoresPage() {
         </tbody></table></div>
         {pagination && pagination.total > 0 && <div className="table-pagination"><span>{firstResult}-{lastResult} of {pagination.total}</span><div><button className="icon-button" title="Previous page" aria-label="Previous page" disabled={pagination.page <= 1} onClick={() => setPage((current) => Math.max(1, current - 1))}><ChevronLeft size={17} /></button><span>Page {pagination.page} of {pagination.totalPages}</span><button className="icon-button" title="Next page" aria-label="Next page" disabled={pagination.page >= pagination.totalPages} onClick={() => setPage((current) => current + 1)}><ChevronRight size={17} /></button></div></div>}
       </section>
-      <StoreDrawer store={selected} tab={selectedTab} onTabChange={setSelectedTab} onClose={() => setSelected(null)} onEditConnectivity={(store) => { setSelected(null); setConnectivityStore(store); }} />
-      <EditConnectivityModal store={connectivityStore} onClose={() => setConnectivityStore(null)} />
+      <StoreDrawer store={selected} tab={selectedTab} onTabChange={setSelectedTab} onClose={() => setSelected(null)} />
     </div>
   );
 }
 
-function StoreDrawer({ store, tab, onTabChange, onClose, onEditConnectivity }: { store: Store | null; tab: StoreDrawerTab; onTabChange: (tab: StoreDrawerTab) => void; onClose: () => void; onEditConnectivity: (store: Store) => void }) {
+function StoreDrawer({ store, tab, onTabChange, onClose }: { store: Store | null; tab: StoreDrawerTab; onTabChange: (tab: StoreDrawerTab) => void; onClose: () => void }) {
   const queryClient = useQueryClient();
   const [enrollment, setEnrollment] = useState<EnrollmentResult | null>(null);
   const [logEnrollment, setLogEnrollment] = useState<StoreEnrollment | null>(null);
@@ -94,6 +92,8 @@ function StoreDrawer({ store, tab, onTabChange, onClose, onEditConnectivity }: {
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [deletePreflight, setDeletePreflight] = useState<StoreDeletePreflight | null>(null);
   const [deleteName, setDeleteName] = useState("");
+  const [editingConnectivity, setEditingConnectivity] = useState(false);
+  const [wafRoute, setWafRoute] = useState<StoreRoute | null>(null);
   const { data: detailData } = useQuery({
     queryKey: ["store-detail", store?.id],
     queryFn: () => api.get<{ store: Store }>(`/api/stores/${store!.id}`),
@@ -101,6 +101,7 @@ function StoreDrawer({ store, tab, onTabChange, onClose, onEditConnectivity }: {
     refetchInterval: (query) => query.state.data?.store.commandExecutions?.some((execution) => execution.status === "running") ? 2000 : false
   });
   const currentStore = detailData?.store ?? store;
+  useEffect(() => setEditingConnectivity(false), [store?.id]);
   const { data: logData, isLoading: logsLoading } = useQuery({
     queryKey: ["enrollment-logs", store?.id, logEnrollment?.id],
     queryFn: () => api.get<{ logs: Array<{ id: number; level: string; step: string | null; message: string; metadata: Record<string, unknown>; createdAt: string }> }>(`/api/stores/${store!.id}/enrollments/${logEnrollment!.id}/logs`),
@@ -173,7 +174,7 @@ function StoreDrawer({ store, tab, onTabChange, onClose, onEditConnectivity }: {
     setDeleteOpen(true);
     deletePreflightMutation.mutate();
   };
-  const close = () => { setEnrollment(null); setUnenrollment(null); setLogEnrollment(null); setDeleteEnrollmentTarget(null); setDeleteOpen(false); setDeletePreflight(null); setDeleteName(""); onClose(); };
+  const close = () => { setEnrollment(null); setUnenrollment(null); setLogEnrollment(null); setDeleteEnrollmentTarget(null); setDeleteOpen(false); setDeletePreflight(null); setDeleteName(""); setEditingConnectivity(false); setWafRoute(null); onClose(); };
   return (
     <>
     <SideDrawer open={Boolean(store)} title={<div className="store-drawer-heading"><strong>{currentStore?.displayName ?? "Store details"}</strong>{currentStore && <div className="store-drawer-statuses"><div><span>Onboarding</span><StatusBadge status={currentStore.onboardingStatus} /></div><div><span>Tunnel</span><StatusBadge status={currentStore.tunnelStatus} /></div><div><span>RDP</span><StatusBadge status={currentStore.rdpStatus} /></div></div>}</div>} onClose={close}>
@@ -190,9 +191,7 @@ function StoreDrawer({ store, tab, onTabChange, onClose, onEditConnectivity }: {
               <div><dt>Store code</dt><dd>{currentStore.tenantCode} / {currentStore.storeCode}</dd></div>
               <div><dt>Account</dt><dd>{currentStore.accountName}</dd></div>
               <div><dt>Zone</dt><dd>{currentStore.zoneName}</dd></div>
-              <div><dt>Tunnel ID</dt><dd className="mono">{currentStore.tunnelId ?? "Not provisioned"}</dd></div>
-              <div><dt>RDP target</dt><dd className="mono">{currentStore.rdpTargetIp ? `${currentStore.rdpTargetIp}:3389` : "Awaiting Windows installer"}</dd></div>
-              <div><dt>RDP gateway</dt><dd className="mono">{currentStore.rdpUrl ? new URL(currentStore.rdpUrl).hostname : "Not provisioned"}</dd></div>
+              <div><dt>Tunnel ID</dt><dd>{currentStore.tunnelId ? <a className="mono detail-link" href="https://dash.cloudflare.com/?to=%2F%3Aaccount%2Ftunnels" target="_blank" rel="noreferrer" title="Open Networking > Tunnels in Cloudflare">{currentStore.tunnelId}</a> : "Not provisioned"}</dd></div>
             </dl>
           </section>
           <EnrollmentHistory enrollments={currentStore.enrollments ?? []} onViewLog={setLogEnrollment} onDelete={(enrollment) => setDeleteEnrollmentTarget(enrollment)} onUnenroll={(enrollment) => issueUnenrollment.mutate(enrollment.id)} deleting={deleteEnrollment.isPending} unenrolling={issueUnenrollment.isPending} />
@@ -203,7 +202,7 @@ function StoreDrawer({ store, tab, onTabChange, onClose, onEditConnectivity }: {
           </div>}
         </div>}
         {tab === "ingress" && <div className="store-drawer-tab">
-          <section className="store-drawer-section publication-summary"><header className="store-section-heading"><div><h3>Published endpoints</h3><span>{currentStore.publications.length} hostname{currentStore.publications.length === 1 ? "" : "s"}</span></div><button className="button button-secondary" type="button" onClick={() => onEditConnectivity(currentStore)}><Settings2 size={15} />Edit connectivity</button></header>{currentStore.publications.map((publication) => <div className="publication-summary-item" key={publication.id}><div className="publication-summary-head"><code>{publication.hostname}</code><StatusBadge status={publication.status} /></div>{publication.routes.map((route) => <div className="publication-route" key={route.id}><code>{route.path}</code><span>→</span><code>{route.kind === "command_agent" ? "Cloudflare Man command agent" : route.serviceUrl}</code><button className="button button-secondary publication-verify-button" type="button" onClick={() => verify.mutate(route.id)} disabled={verify.isPending}><CheckCircle2 size={15} />{verify.isPending && verify.variables === route.id ? "Checking..." : "Verify endpoint"}</button></div>)}</div>)}</section>
+          {editingConnectivity ? <EditConnectivityPanel store={currentStore} onClose={() => setEditingConnectivity(false)} /> : <section className="store-drawer-section publication-summary"><header className="store-section-heading"><div><h3>Published endpoints</h3><span>{currentStore.publications.length} hostname{currentStore.publications.length === 1 ? "" : "s"}</span></div><button className="button button-secondary" type="button" onClick={() => setEditingConnectivity(true)}><Settings2 size={15} />Edit connectivity</button></header>{currentStore.publications.map((publication) => <div className="publication-summary-item" key={publication.id}><div className="publication-summary-head"><code>{publication.hostname}</code><StatusBadge status={publication.status} /></div>{publication.routes.map((route) => <div className="publication-route" key={route.id}><code>{route.path}</code><span>→</span><code>{route.kind === "command_agent" ? "Cloudflare Man command agent" : route.serviceUrl}</code><div className="publication-route-actions"><button className="button button-secondary publication-verify-button" type="button" onClick={() => verify.mutate(route.id)} disabled={verify.isPending}><CheckCircle2 size={15} />{verify.isPending && verify.variables === route.id ? "Checking..." : "Verify endpoint"}</button><button className={`button button-secondary publication-waf-button ${route.wafEnabled && route.wafRuleId ? "waf-active" : ""}`} type="button" title={route.wafEnabled && !route.wafRuleId ? "WAF policy is pending application" : "Manage route WAF"} onClick={() => setWafRoute(route)}><ShieldCheck size={15} />WAF</button></div></div>)}</div>)}</section>}
         </div>}
         {tab === "connect" && <div className="store-drawer-tab store-connect-tab">
           <section className="store-drawer-section rdp-section"><header className="store-section-heading"><div><h3>Remote desktop</h3><span>{currentStore.rdpUrl ? new URL(currentStore.rdpUrl).hostname : "Browser RDP gateway"}</span></div><StatusBadge status={currentStore.rdpStatus} /></header><dl className="detail-list"><div><dt>Target</dt><dd className="mono">{currentStore.rdpTargetIp ? `${currentStore.rdpTargetIp}:3389` : "Awaiting Windows installer"}</dd></div><div><dt>Gateway</dt><dd className="mono">{currentStore.rdpUrl ?? "Not provisioned"}</dd></div></dl>{currentStore.rdpLastError && <div className="inline-alert">{currentStore.rdpLastError}</div>}<div className="detail-actions">{currentStore.rdpStatus === "ready" && currentStore.rdpUrl && <a className="button button-primary" href={currentStore.rdpUrl} target="_blank" rel="noreferrer"><MonitorUp size={16} />Remote desktop</a>}{currentStore.rdpTargetIp && currentStore.rdpStatus !== "ready" && <button className="button button-secondary" onClick={() => retryRdp.mutate()} disabled={retryRdp.isPending}><RefreshCw size={15} />{retryRdp.isPending ? "Retrying..." : "Retry RDP"}</button>}</div></section>
@@ -213,6 +212,7 @@ function StoreDrawer({ store, tab, onTabChange, onClose, onEditConnectivity }: {
     </SideDrawer>
     <EnrollmentDeleteDialog enrollment={deleteEnrollmentTarget} onClose={() => setDeleteEnrollmentTarget(null)} onConfirm={() => deleteEnrollmentTarget && deleteEnrollment.mutate(deleteEnrollmentTarget.id)} deleting={deleteEnrollment.isPending} />
     <StoreDeleteDialog open={deleteOpen} preflight={deletePreflight} loading={deletePreflightMutation.isPending} confirmationName={deleteName} onConfirmationNameChange={setDeleteName} onClose={() => { setDeleteOpen(false); setDeletePreflight(null); setDeleteName(""); }} onConfirm={() => deleteStore.mutate()} deleting={deleteStore.isPending} />
+    <RouteWafDialog store={currentStore} route={wafRoute} onClose={() => setWafRoute(null)} />
     <Modal open={Boolean(logEnrollment)} title={`Enrollment log · ${logEnrollment ? new Date(logEnrollment.createdAt).toLocaleString() : ""}`} onClose={() => setLogEnrollment(null)} width="wide">
       {logsLoading ? <div className="quiet-empty">Loading logs...</div> : logData?.logs.length ? <div className="enrollment-log-list">{logData.logs.map((log) => <article key={log.id} className={`enrollment-log enrollment-log-${log.level}`}><header><StatusBadge status={log.level} /><strong>{log.step ?? "installer"}</strong><time>{new Date(log.createdAt).toLocaleString()}</time></header><p>{log.message}</p></article>)}</div> : <div className="quiet-empty">No logs have been reported for this enrollment.</div>}
     </Modal>
@@ -439,7 +439,7 @@ function CommandExecutionPanel({ store }: { store: Store }) {
   </section>;
 }
 
-function EditConnectivityModal({ store, onClose }: { store: Store | null; onClose: () => void }) {
+function EditConnectivityPanel({ store, onClose }: { store: Store; onClose: () => void }) {
   const queryClient = useQueryClient();
   const [publications, setPublications] = useState<DraftPublication[]>([]);
   const [error, setError] = useState("");
@@ -450,13 +450,14 @@ function EditConnectivityModal({ store, onClose }: { store: Store | null; onClos
       suffix: publication.suffix,
       routes: publication.routes.map((route) => ({ key: route.id, path: route.path, serviceUrl: route.serviceUrl, kind: route.kind ?? "service" }))
     })) ?? []);
-  }, [store]);
+  }, [store.id]);
   const mutation = useMutation({
     mutationFn: () => api.put<{ success: boolean; applied: boolean }>(`/api/stores/${store!.id}/connectivity`, { publications: connectivityPayload(publications) }),
     onSuccess: async (result) => {
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: ["stores"] }),
-        queryClient.invalidateQueries({ queryKey: ["dashboard"] })
+        queryClient.invalidateQueries({ queryKey: ["dashboard"] }),
+        queryClient.invalidateQueries({ queryKey: ["store-detail", store.id] })
       ]);
       toast.success(result.applied ? "Tunnel connectivity updated" : "Connectivity saved for provisioning");
       onClose();
@@ -472,16 +473,63 @@ function EditConnectivityModal({ store, onClose }: { store: Store | null; onClos
     setError("");
     mutation.mutate();
   };
-  return (
-    <Modal open={Boolean(store)} title={`Edit connectivity · ${store?.displayName ?? "store"}`} onClose={onClose} width="wide">
-      {store && <div className="connectivity-modal">
-        {error && <div className="form-error">{error}</div>}
-        <div className="connectivity-scope"><div><span>Cloudflare account</span><strong>{store.accountName}</strong></div><div><span>DNS zone</span><strong>{store.zoneName}</strong></div><div><span>Tunnel</span><strong className="mono">{store.tunnelId ?? "Pending installation"}</strong></div></div>
-        <ConnectivityEditor storeId={store.storeCode} zoneName={store.zoneName} publications={publications} onChange={setPublications} />
-        <div className="form-actions"><button className="button button-secondary" type="button" onClick={onClose}>Cancel</button><button className="button button-primary" type="button" onClick={save} disabled={mutation.isPending}>{mutation.isPending ? "Updating..." : "Save connectivity"}</button></div>
-      </div>}
-    </Modal>
-  );
+  return <section className="store-drawer-section connectivity-inline-editor">
+    <header className="store-section-heading"><div><h3>Edit connectivity</h3><span>{store.displayName} · update published subdomains and ingress paths</span></div><button className="button button-secondary" type="button" onClick={onClose}>Cancel</button></header>
+    {error && <div className="form-error">{error}</div>}
+    <div className="connectivity-scope"><div><span>Cloudflare account</span><strong>{store.accountName}</strong></div><div><span>DNS zone</span><strong>{store.zoneName}</strong></div><div><span>Tunnel</span><strong className="mono">{store.tunnelId ?? "Pending installation"}</strong></div></div>
+    <ConnectivityEditor storeId={store.storeCode} zoneName={store.zoneName} publications={publications} onChange={setPublications} />
+    <div className="form-actions"><button className="button button-secondary" type="button" onClick={onClose}>Cancel</button><button className="button button-primary" type="button" onClick={save} disabled={mutation.isPending}>{mutation.isPending ? "Updating..." : "Save connectivity"}</button></div>
+  </section>;
+}
+
+function RouteWafDialog({ store, route, onClose }: { store: Store | null; route: StoreRoute | null; onClose: () => void }) {
+  const queryClient = useQueryClient();
+  const [enabled, setEnabled] = useState(true);
+  const [allowedIps, setAllowedIps] = useState("");
+  const [error, setError] = useState("");
+  const { data, isLoading } = useQuery({
+    queryKey: ["route-waf", store?.id, route?.id],
+    queryFn: () => api.get<{ waf: { enabled: boolean; allowedIps: string[]; defaulted: boolean } }>(`/api/stores/${store!.id}/routes/${route!.id}/waf`),
+    enabled: Boolean(store && route)
+  });
+  useEffect(() => {
+    if (!route) return;
+    setEnabled(route.wafEnabled);
+    setAllowedIps(route.wafAllowedIps.join("\n"));
+    setError("");
+  }, [route]);
+  useEffect(() => {
+    if (!data?.waf) return;
+    setEnabled(data.waf.enabled);
+    setAllowedIps(data.waf.allowedIps.join("\n"));
+  }, [data]);
+  const mutation = useMutation({
+    mutationFn: () => api.patch<{ waf: { enabled: boolean; allowedIps: string[] } }>(`/api/stores/${store!.id}/routes/${route!.id}/waf`, {
+      enabled,
+      allowedIps: allowedIps.split(/[\n,]+/).map((value) => value.trim()).filter(Boolean)
+    }),
+    onSuccess: async () => {
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["store-detail", store?.id] }),
+        queryClient.invalidateQueries({ queryKey: ["stores"] }),
+        queryClient.invalidateQueries({ queryKey: ["route-waf", store?.id, route?.id] })
+      ]);
+      toast.success("Route WAF updated");
+      onClose();
+    },
+    onError: (requestError) => setError(requestError instanceof Error ? requestError.message : "Unable to update route WAF")
+  });
+  return <Modal open={Boolean(store && route)} title={`Route WAF · ${route?.path ?? ""}`} onClose={onClose}>
+    {route && <div className="route-waf-dialog">
+      {error && <div className="form-error">{error}</div>}
+      {isLoading ? <div className="quiet-empty">Loading WAF policy...</div> : <>
+        <label className="checkbox-field"><input type="checkbox" checked={enabled} onChange={(event) => setEnabled(event.target.checked)} /><span><strong>Allow-list protection</strong><small>When enabled, Cloudflare blocks every source IP except the addresses below.</small></span></label>
+        <label className="field"><span className="field-label">Allowed Cloudflare Man IPs or CIDRs <FieldHelp text="Use one public IPv4, IPv6, or CIDR per line. Leave the list unchanged to use the server's configured Cloudflare Man source IP. Never use 0.0.0.0/0 unless this route is intentionally public." /></span><textarea value={allowedIps} onChange={(event) => setAllowedIps(event.target.value)} rows={4} placeholder="203.0.113.10/32" disabled={!enabled} /></label>
+        {data?.waf.defaulted && <div className="inline-alert"><ShieldCheck size={15} />The addresses were resolved from CFMAN_WAF_ALLOWED_IPS or the Cloudflare Man server's public IP.</div>}
+      </>}
+      <div className="form-actions"><button className="button button-secondary" type="button" onClick={onClose}>Cancel</button><button className="button button-primary" type="button" onClick={() => mutation.mutate()} disabled={isLoading || mutation.isPending}>{mutation.isPending ? "Updating..." : "Save WAF policy"}</button></div>
+    </div>}
+  </Modal>;
 }
 
 export function EnrollmentCommands({ result }: { result: EnrollmentResult }) {

@@ -75,8 +75,11 @@ Store Windows host              Head Office browser RDP
   - Access: Apps and Policies: Write
   - DNS: Write
   - Zone: Read
+  - Zone WAF: Write
 
 For browser RDP, configure at least one operator email per live account. The email is used in the Cloudflare Access allow policy.
+
+Route WAF policies use Cloudflare custom rules. The Free plan currently allows five custom rules per zone, so include that limit in domain-pool capacity planning.
 
 ## Local setup
 

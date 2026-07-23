@@ -8,6 +8,7 @@ import { CloudflareClient } from "../lib/cloudflare.js";
 import { pool, withTransaction } from "../lib/database.js";
 import { decryptSecret } from "../lib/security.js";
 import { reconfigureStore } from "../lib/provisioning.js";
+import { isValidIpOrCidr, resolveWafAllowedIps } from "../lib/route-waf.js";
 import { provisionBrowserRdp } from "../lib/rdp.js";
 import { verifyStoreEndpoints } from "../lib/store-verification.js";
 import { createOpaqueToken, hashToken } from "../lib/security.js";
@@ -85,6 +86,12 @@ const createStoreSchema = z.object({
 
 const connectivitySchema = z.object({ publications: publicationsSchema });
 
+const CIDR_MAX_LENGTH = 64;
+const routeWafSchema = z.object({
+  enabled: z.boolean().default(true),
+  allowedIps: z.array(z.string().trim().min(1).max(CIDR_MAX_LENGTH)).max(20).default([])
+});
+
 const listQuerySchema = z.object({
   search: z.string().trim().max(120).optional(),
   status: z.string().trim().max(40).optional(),
@@ -130,7 +137,13 @@ type StoreDeleteContext = {
   runningCommandCount: number;
   commandAgentStatus: string | null;
   commandAgentLastSeenAt: string | null;
-  publications: Array<{ hostname: string; dnsRecordId: string | null }>;
+  publications: Array<{
+    hostname: string;
+    dnsRecordId: string | null;
+    path: string;
+    wafRulesetId: string | null;
+    wafRuleId: string | null;
+  }>;
 };
 
 type StoreDeleteCheck = {
@@ -195,10 +208,12 @@ async function loadStoreDeleteContext(executor: StoreDeleteExecutor, storeId: st
   );
   if (!storeResult.rowCount) return null;
   const publicationResult = await executor.query(
-    `SELECT hostname, dns_record_id AS "dnsRecordId"
-       FROM store_publications
-      WHERE store_id = $1
-      ORDER BY created_at`,
+    `SELECT p.hostname, p.dns_record_id AS "dnsRecordId", r.path,
+            r.waf_ruleset_id AS "wafRulesetId", r.waf_rule_id AS "wafRuleId"
+       FROM store_publications p
+       JOIN store_routes r ON r.publication_id = p.id
+      WHERE p.store_id = $1
+      ORDER BY p.created_at, r.sort_order, r.created_at`,
     [storeId]
   );
   return { ...storeResult.rows[0], publications: publicationResult.rows } as StoreDeleteContext;
@@ -264,7 +279,22 @@ async function cleanupStoreResources(context: StoreDeleteContext): Promise<void>
     context.providerMode
   );
   for (const publication of context.publications) {
-    if (publication.dnsRecordId && context.cfZoneId) await client.deleteDnsRecord(context.cfZoneId, publication.dnsRecordId);
+    if (!publication.wafRuleId || !context.cfZoneId) continue;
+    await client.configureRouteWaf({
+      zoneId: context.cfZoneId,
+      hostname: publication.hostname,
+      path: publication.path,
+      enabled: false,
+      allowedIps: [],
+      rulesetId: publication.wafRulesetId
+    });
+  }
+  const deletedDnsRecords = new Set<string>();
+  for (const publication of context.publications) {
+    if (publication.dnsRecordId && context.cfZoneId && !deletedDnsRecords.has(publication.dnsRecordId)) {
+      await client.deleteDnsRecord(context.cfZoneId, publication.dnsRecordId);
+      deletedDnsRecords.add(publication.dnsRecordId);
+    }
   }
   if (context.rdpRouteId) await client.deleteTunnelRoute(context.rdpRouteId);
   if (context.rdpTargetId) await client.deleteInfrastructureTarget(context.rdpTargetId);
@@ -287,7 +317,11 @@ const publicationsJson = `COALESCE((
         'id', r.id,
         'path', r.path,
         'serviceUrl', r.service_url,
-        'kind', r.route_kind
+        'kind', r.route_kind,
+        'wafEnabled', r.waf_enabled,
+        'wafAllowedIps', r.waf_allowed_ips,
+        'wafRulesetId', r.waf_ruleset_id,
+        'wafRuleId', r.waf_rule_id
       ) ORDER BY r.sort_order, r.created_at)
       FROM store_routes r WHERE r.publication_id = p.id
     ), '[]'::jsonb)
@@ -495,7 +529,8 @@ export async function storeRoutes(app: FastifyInstance): Promise<void> {
     const result = await pool.query(`
       SELECT s.id, s.tenant_code AS "tenantCode", s.store_code AS "storeCode", s.display_name AS "displayName",
              s.origin_url AS "originUrl", s.hostname, s.tunnel_id AS "tunnelId", s.tunnel_name AS "tunnelName",
-             s.tunnel_status AS "tunnelStatus", s.onboarding_status AS "onboardingStatus",
+             s.tunnel_status AS "tunnelStatus", ${onboardingStatusExpression} AS "onboardingStatus",
+             latest_enrollment.status AS "latestEnrollmentStatus",
              s.rdp_status AS "rdpStatus", s.rdp_target_ip::text AS "rdpTargetIp",
              s.rdp_url AS "rdpUrl", s.rdp_last_error AS "rdpLastError",
              s.last_connected_at AS "lastConnectedAt", s.last_verified_at AS "lastVerifiedAt", s.last_error AS "lastError",
@@ -507,10 +542,102 @@ export async function storeRoutes(app: FastifyInstance): Promise<void> {
         FROM stores s
         JOIN cloudflare_accounts a ON a.id = s.account_id
         JOIN zones z ON z.id = s.zone_id
+        ${latestEnrollmentJoin}
        WHERE s.id = $1
     `, [id]);
     if (!result.rowCount) return reply.code(404).send({ error: "Store not found" });
     return { store: result.rows[0] };
+  });
+
+  app.get("/api/stores/:storeId/routes/:routeId/waf", { preHandler: requireAuth }, async (request, reply) => {
+    const { storeId, routeId } = z.object({ storeId: z.string().uuid(), routeId: z.string().uuid() }).parse(request.params);
+    const result = await pool.query(
+      `SELECT r.id, r.waf_enabled, r.waf_allowed_ips, r.waf_ruleset_id, r.waf_rule_id,
+              a.provider_mode AS "providerMode"
+         FROM store_routes r
+         JOIN store_publications p ON p.id = r.publication_id
+         JOIN stores s ON s.id = p.store_id
+         JOIN cloudflare_accounts a ON a.id = s.account_id
+        WHERE p.store_id = $1 AND r.id = $2`,
+      [storeId, routeId]
+    );
+    if (!result.rowCount) return reply.code(404).send({ error: "Ingress route not found" });
+    const row = result.rows[0];
+    try {
+      const allowedIps = await resolveWafAllowedIps(row.waf_allowed_ips ?? [], row.providerMode);
+      return { waf: { enabled: row.waf_enabled, allowedIps, rulesetId: row.waf_ruleset_id, ruleId: row.waf_rule_id, defaulted: !(row.waf_allowed_ips?.length) } };
+    } catch (error) {
+      return reply.code(502).send({ error: error instanceof Error ? error.message : "Unable to resolve WAF source IP" });
+    }
+  });
+
+  app.patch("/api/stores/:storeId/routes/:routeId/waf", { preHandler: requireAuth }, async (request, reply) => {
+    const { storeId, routeId } = z.object({ storeId: z.string().uuid(), routeId: z.string().uuid() }).parse(request.params);
+    const body = routeWafSchema.parse(request.body ?? {});
+    const result = await pool.query(
+      `SELECT r.id, r.path, r.waf_allowed_ips, r.waf_ruleset_id,
+              p.hostname, z.cf_zone_id AS "cfZoneId",
+              a.id AS "accountRowId", a.cf_account_id AS "cfAccountId", a.api_token_encrypted AS "apiTokenEncrypted",
+              a.provider_mode AS "providerMode"
+         FROM store_routes r
+         JOIN store_publications p ON p.id = r.publication_id
+         JOIN stores s ON s.id = p.store_id
+         JOIN cloudflare_accounts a ON a.id = s.account_id
+         JOIN zones z ON z.id = s.zone_id
+        WHERE p.store_id = $1 AND r.id = $2`,
+      [storeId, routeId]
+    );
+    if (!result.rowCount) return reply.code(404).send({ error: "Ingress route not found" });
+    const route = result.rows[0] as {
+      path: string;
+      hostname: string;
+      cfZoneId: string | null;
+      accountRowId: string;
+      cfAccountId: string | null;
+      apiTokenEncrypted: string | null;
+      providerMode: "live" | "mock";
+      waf_allowed_ips: string[] | null;
+      waf_ruleset_id: string | null;
+    };
+    const invalidInput = body.allowedIps.find((value) => !isValidIpOrCidr(value));
+    if (invalidInput) return reply.code(400).send({ error: `Invalid WAF allowed IP or CIDR: ${invalidInput}` });
+    const allowedIps = body.enabled
+      ? await resolveWafAllowedIps(body.allowedIps, route.providerMode)
+      : [...new Set(body.allowedIps.length ? body.allowedIps : (route.waf_allowed_ips ?? []))];
+    const invalid = allowedIps.find((value) => !isValidIpOrCidr(value));
+    if (invalid) return reply.code(400).send({ error: `Invalid WAF allowed IP or CIDR: ${invalid}` });
+    if (body.enabled && !allowedIps.length) return reply.code(400).send({ error: "At least one allowed IP or CIDR is required when WAF is enabled" });
+    try {
+      const client = new CloudflareClient(
+        route.cfAccountId ?? route.accountRowId,
+        route.apiTokenEncrypted ? decryptSecret(route.apiTokenEncrypted) : "mock",
+        route.providerMode
+      );
+      const applied = await client.configureRouteWaf({
+        zoneId: route.cfZoneId ?? "mock-zone",
+        hostname: route.hostname,
+        path: route.path,
+        enabled: body.enabled,
+        allowedIps,
+        rulesetId: route.waf_ruleset_id
+      });
+      await pool.query(
+        `UPDATE store_routes
+            SET waf_enabled = $1, waf_allowed_ips = $2, waf_ruleset_id = $3, waf_rule_id = $4, updated_at = now()
+          WHERE id = $5`,
+        [body.enabled, allowedIps, applied.rulesetId, applied.ruleId, routeId]
+      );
+      await writeAudit({
+        actorUserId: request.authUser!.id,
+        action: body.enabled ? "route.waf_enabled" : "route.waf_disabled",
+        entityType: "store_route",
+        entityId: routeId,
+        details: { storeId, hostname: route.hostname, path: route.path, allowedIps, rulesetId: applied.rulesetId, ruleId: applied.ruleId }
+      });
+      return { success: true, waf: { enabled: body.enabled, allowedIps, rulesetId: applied.rulesetId, ruleId: applied.ruleId } };
+    } catch (error) {
+      return reply.code(502).send({ error: error instanceof Error ? error.message : "Unable to apply route WAF" });
+    }
   });
 
   app.delete("/api/stores/:storeId/enrollments/:enrollmentId", { preHandler: requireAuth }, async (request, reply) => {
@@ -853,17 +980,38 @@ export async function storeRoutes(app: FastifyInstance): Promise<void> {
       if (!store) return null;
 
       const existingResult = await client.query(
-        "SELECT hostname, dns_record_id FROM store_publications WHERE store_id = $1 ORDER BY created_at",
+        `SELECT p.hostname, p.dns_record_id,
+                r.path, r.waf_enabled, r.waf_allowed_ips, r.waf_ruleset_id, r.waf_rule_id
+           FROM store_publications p
+           LEFT JOIN store_routes r ON r.publication_id = p.id
+          WHERE p.store_id = $1
+          ORDER BY p.created_at, r.sort_order, r.created_at`,
         [id]
       );
       const existingByHostname = new Map<string, { dnsRecordId: string | null }>(
-        existingResult.rows.map((publication) => [publication.hostname, { dnsRecordId: publication.dns_record_id }])
+        existingResult.rows.filter((publication) => publication.dns_record_id || publication.path === null).map((publication) => [publication.hostname, { dnsRecordId: publication.dns_record_id }])
+      );
+      const existingWafByRoute = new Map<string, { enabled: boolean; allowedIps: string[]; rulesetId: string | null; ruleId: string | null }>(
+        existingResult.rows.filter((route) => route.path !== null).map((route) => [`${route.hostname}${route.path}`, {
+          enabled: route.waf_enabled,
+          allowedIps: route.waf_allowed_ips ?? [],
+          rulesetId: route.waf_ruleset_id,
+          ruleId: route.waf_rule_id
+        }])
       );
       const prepared = preparePublications(store.store_code, store.zone_name, body.publications);
       const desiredHostnames = new Set(prepared.map((publication) => publication.hostname));
-      const removedDnsRecordIds = existingResult.rows
+      const desiredRouteKeys = new Set(prepared.flatMap((publication) => publication.routes.map((route) => `${publication.hostname}${route.path}`)));
+      const removedDnsRecordIds = [...new Set<string>(existingResult.rows
         .filter((publication) => publication.dns_record_id && !desiredHostnames.has(publication.hostname))
-        .map((publication) => publication.dns_record_id as string);
+        .map((publication) => publication.dns_record_id as string))];
+      const removedWafRoutes = existingResult.rows
+        .filter((route) => route.path !== null && route.waf_rule_id && !desiredRouteKeys.has(`${route.hostname}${route.path}`))
+        .map((route) => ({
+          hostname: route.hostname as string,
+          path: route.path as string,
+          rulesetId: route.waf_ruleset_id as string | null
+        }));
 
       await client.query("DELETE FROM store_publications WHERE store_id = $1", [id]);
       for (const publication of prepared) {
@@ -874,10 +1022,11 @@ export async function storeRoutes(app: FastifyInstance): Promise<void> {
           [id, publication.suffix, publication.hostname, existing?.dnsRecordId ?? null, existing?.dnsRecordId ? "active" : "pending"]
         );
         for (const [index, route] of publication.routes.entries()) {
+          const waf = existingWafByRoute.get(`${publication.hostname}${route.path}`);
           await client.query(
-            `INSERT INTO store_routes(publication_id, path, service_url, route_kind, sort_order)
-             VALUES ($1, $2, $3, $4, $5)`,
-            [inserted.rows[0].id, route.path, route.serviceUrl, route.kind, index]
+            `INSERT INTO store_routes(publication_id, path, service_url, route_kind, sort_order, waf_enabled, waf_allowed_ips, waf_ruleset_id, waf_rule_id)
+             VALUES ($1, $2, $3, $4, $5, COALESCE($6, true), COALESCE($7, ARRAY[]::text[]), $8, $9)`,
+            [inserted.rows[0].id, route.path, route.serviceUrl, route.kind, index, waf?.enabled ?? null, waf?.allowedIps ?? null, waf?.rulesetId ?? null, waf?.ruleId ?? null]
           );
         }
       }
@@ -897,15 +1046,16 @@ export async function storeRoutes(app: FastifyInstance): Promise<void> {
         details: {
           hostnames: prepared.map((publication) => publication.hostname),
           routeCount: prepared.reduce((total, publication) => total + publication.routes.length, 0),
-          removedHostnameCount: existingResult.rows.length - existingResult.rows.filter((publication) => desiredHostnames.has(publication.hostname)).length
+          removedHostnameCount: new Set(existingResult.rows.filter((publication) => !desiredHostnames.has(publication.hostname)).map((publication) => publication.hostname)).size,
+          removedWafRouteCount: removedWafRoutes.length
         }
       }, client);
-      return { tunnelId: store.tunnel_id as string | null, removedDnsRecordIds };
+      return { tunnelId: store.tunnel_id as string | null, removedDnsRecordIds, removedWafRoutes };
     });
     if (!update) return reply.code(404).send({ error: "Store not found" });
 
     try {
-      const applied = update.tunnelId ? await reconfigureStore(id, update.removedDnsRecordIds) : false;
+      const applied = update.tunnelId ? await reconfigureStore(id, update.removedDnsRecordIds, update.removedWafRoutes) : false;
       return { success: true, applied };
     } catch (error) {
       const message = error instanceof Error ? error.message : "Connectivity update failed";

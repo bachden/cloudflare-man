@@ -19,6 +19,7 @@ const schema = z.object({
   ENCRYPTION_KEY: z.string().regex(/^[a-fA-F0-9]{64}$/),
   SESSION_TTL_HOURS: z.coerce.number().int().positive().default(12),
   CLOUDFLARED_VERSION: z.string().min(1),
+  CFMAN_WAF_ALLOWED_IPS: z.string().default(""),
   ALLOW_MOCK_ACCOUNTS: booleanFromString.default(false)
 });
 

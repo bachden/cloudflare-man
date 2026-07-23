@@ -129,6 +129,73 @@ test("validates an account-owned Cloudflare API token", async () => {
   }
 });
 
+test("updates only the selected route in the active Cloudflare WAF ruleset", async () => {
+  const { CloudflareClient } = await import("../src/lib/cloudflare.js");
+  const originalFetch = globalThis.fetch;
+  const requests: Array<{ url: string; method: string; body?: Record<string, unknown> }> = [];
+  globalThis.fetch = async (input, init) => {
+    const url = String(input);
+    const method = init?.method ?? "GET";
+    requests.push({ url, method, ...(init?.body ? { body: JSON.parse(String(init.body)) } : {}) });
+    if (url.includes("/rulesets?") && method === "GET") {
+      return Response.json({ success: true, result: [{ id: "entrypoint-id", name: "zone", kind: "zone", phase: "http_request_firewall_custom" }] });
+    }
+    if (url.endsWith("/rulesets/entrypoint-id") && method === "GET") {
+      return Response.json({
+        success: true,
+        result: {
+          id: "entrypoint-id",
+          name: "zone",
+          kind: "zone",
+          phase: "http_request_firewall_custom",
+          rules: [
+            { id: "manual-rule", action: "block", expression: "ip.src eq 192.0.2.1", description: "Manual rule" },
+            { id: "other-route", action: "block", expression: "true", description: "cloudflare-man route WAF: other.example.test/" },
+            { id: "old-route", action: "block", expression: "true", description: "cloudflare-man route WAF: store.example.test/api" }
+          ]
+        }
+      });
+    }
+    if (url.endsWith("/rulesets/entrypoint-id") && method === "PUT") {
+      const body = JSON.parse(String(init?.body)) as { rules: Array<Record<string, unknown>> };
+      return Response.json({
+        success: true,
+        result: {
+          id: "entrypoint-id",
+          name: "zone",
+          kind: "zone",
+          phase: "http_request_firewall_custom",
+          rules: body.rules.map((rule, index) => ({ ...rule, id: String(rule.id ?? `created-${index}`) }))
+        }
+      });
+    }
+    throw new Error(`Unexpected Cloudflare request: ${method} ${url}`);
+  };
+  try {
+    const client = new CloudflareClient("account-id", "api-token", "live");
+    const result = await client.configureRouteWaf({
+      zoneId: "zone-id",
+      hostname: "store.example.test",
+      path: "/api",
+      enabled: true,
+      allowedIps: ["203.0.113.10/32"]
+    });
+    assert.equal(result.rulesetId, "entrypoint-id");
+    assert.ok(result.ruleId);
+    const update = requests.find((request) => request.method === "PUT");
+    assert.ok(update?.body);
+    const rules = update.body.rules as Array<{ description: string; expression: string }>;
+    assert.deepEqual(rules.map((rule) => rule.description), [
+      "Manual rule",
+      "cloudflare-man route WAF: other.example.test/",
+      "cloudflare-man route WAF: store.example.test/api"
+    ]);
+    assert.match(rules[2]!.expression, /203\.0\.113\.10\/32/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("synchronizes the account pool", async () => {
   const response = await app.inject({
     method: "POST",
@@ -302,6 +369,42 @@ test("paginates and refreshes the visible store list", async () => {
   } finally {
     globalThis.fetch = originalFetch;
   }
+});
+
+test("manages a source-IP WAF policy for each ingress route", async () => {
+  const detail = await app.inject({ method: "GET", url: `/api/stores/${storeId}`, headers: { cookie: sessionCookie } });
+  assert.equal(detail.statusCode, 200, detail.body);
+  const route = detail.json().store.publications[0].routes[0];
+  assert.equal(route.wafEnabled, true);
+  assert.deepEqual(route.wafAllowedIps, []);
+
+  const defaults = await app.inject({ method: "GET", url: `/api/stores/${storeId}/routes/${route.id}/waf`, headers: { cookie: sessionCookie } });
+  assert.equal(defaults.statusCode, 200, defaults.body);
+  assert.deepEqual(defaults.json().waf.allowedIps, ["127.0.0.1/32"]);
+  assert.equal(defaults.json().waf.defaulted, true);
+
+  const updated = await app.inject({
+    method: "PATCH",
+    url: `/api/stores/${storeId}/routes/${route.id}/waf`,
+    headers: { cookie: sessionCookie },
+    payload: { enabled: true, allowedIps: ["10.20.0.0/16", "2001:db8::/64"] }
+  });
+  assert.equal(updated.statusCode, 200, updated.body);
+  assert.deepEqual(updated.json().waf.allowedIps, ["10.20.0.0/16", "2001:db8::/64"]);
+  assert.match(updated.json().waf.rulesetId, /^[0-9a-f-]{36}$/);
+  const stored = await pool.query("SELECT waf_enabled, waf_allowed_ips, waf_ruleset_id, waf_rule_id FROM store_routes WHERE id = $1", [route.id]);
+  assert.equal(stored.rows[0].waf_enabled, true);
+  assert.deepEqual(stored.rows[0].waf_allowed_ips, ["10.20.0.0/16", "2001:db8::/64"]);
+  assert.ok(stored.rows[0].waf_ruleset_id);
+  assert.ok(stored.rows[0].waf_rule_id);
+
+  const invalid = await app.inject({
+    method: "PATCH",
+    url: `/api/stores/${storeId}/routes/${route.id}/waf`,
+    headers: { cookie: sessionCookie },
+    payload: { enabled: true, allowedIps: ["not-an-ip"] }
+  });
+  assert.equal(invalid.statusCode, 400, invalid.body);
 });
 
 test("stores structured installer logs", async () => {
