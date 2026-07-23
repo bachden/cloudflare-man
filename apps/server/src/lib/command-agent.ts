@@ -68,12 +68,19 @@ export type CommandExecutionResult = {
   durationMs: number;
 };
 
-export async function createCommandExecution(storeId: string, requestedBy: string, script: string, timeoutMs: number): Promise<string> {
+export async function createCommandExecution(
+  storeId: string,
+  enrollmentId: string,
+  scriptVersionId: string,
+  requestedBy: string,
+  script: string,
+  timeoutMs: number
+): Promise<string> {
   const result = await pool.query(
-    `INSERT INTO store_command_executions(store_id, requested_by, script, timeout_ms)
-     VALUES ($1, $2, $3, $4)
+    `INSERT INTO store_command_executions(store_id, enrollment_id, script_version_id, requested_by, script, timeout_ms)
+     VALUES ($1, $2, $3, $4, $5, $6)
      RETURNING id`,
-    [storeId, requestedBy, script, timeoutMs]
+    [storeId, enrollmentId, scriptVersionId, requestedBy, script, timeoutMs]
   );
   return result.rows[0].id as string;
 }

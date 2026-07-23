@@ -13,6 +13,7 @@ import { authRoutes } from "./routes/auth.js";
 import { dashboardRoutes } from "./routes/dashboard.js";
 import { enrollmentRoutes } from "./routes/enrollment.js";
 import { settingsRoutes } from "./routes/settings.js";
+import { scriptRoutes } from "./routes/scripts.js";
 import { storeRoutes } from "./routes/stores.js";
 
 export async function buildApp() {
@@ -46,6 +47,7 @@ export async function buildApp() {
   await authRoutes(app);
   await accountRoutes(app);
   await storeRoutes(app);
+  await scriptRoutes(app);
   await enrollmentRoutes(app);
   await dashboardRoutes(app);
   await settingsRoutes(app);

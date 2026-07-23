@@ -6,10 +6,11 @@ import { toast } from "sonner";
 import { api } from "../api";
 import { ConnectivityEditor, connectivityPayload, validatePublications, type DraftPublication } from "../components/ConnectivityEditor";
 import { CopyButton } from "../components/CopyButton";
+import { FieldHelp } from "../components/FieldHelp";
 import { Modal } from "../components/Modal";
 import { PageHeader } from "../components/PageHeader";
 import { StatusBadge } from "../components/StatusBadge";
-import type { AppSettings, EnrollmentResult, Store, StoreCommandExecution, StoreEnrollment } from "../types";
+import type { AppSettings, EnrollmentResult, ManagedScript, ManagedScriptSummary, Store, StoreCommandExecution, StoreEnrollment } from "../types";
 
 type StoreListResponse = {
   stores: Store[];
@@ -171,6 +172,10 @@ function EnrollmentHistory({ enrollments, onViewLog }: { enrollments: StoreEnrol
 type CommandExecutionResult = {
   executionId: string;
   endpoint: string;
+  enrollmentId: string;
+  scriptVersionId: string;
+  scriptName: string;
+  version: number;
   success: boolean;
   exitCode: number | null;
   stdout: string;
@@ -180,12 +185,33 @@ type CommandExecutionResult = {
 
 function CommandExecutionPanel({ store }: { store: Store }) {
   const queryClient = useQueryClient();
-  const [script, setScript] = useState("");
+  const [selectedScriptId, setSelectedScriptId] = useState("");
+  const [selectedVersionId, setSelectedVersionId] = useState("");
   const [timeoutSeconds, setTimeoutSeconds] = useState(60);
   const [result, setResult] = useState<CommandExecutionResult | null>(null);
+  const activeEnrollment = [...(store.enrollments ?? [])].filter((enrollment) => ["ready", "installed"].includes(enrollment.status) && enrollment.unenrolledAt === null).sort((left, right) => new Date(right.installedAt ?? right.createdAt).getTime() - new Date(left.installedAt ?? left.createdAt).getTime())[0];
+  const hostPlatform = activeEnrollment?.platform ?? null;
+  const { data: scriptData } = useQuery({
+    queryKey: ["scripts", "command-agent", hostPlatform],
+    queryFn: () => api.get<{ scripts: ManagedScriptSummary[] }>(`/api/scripts${hostPlatform ? `?platform=${hostPlatform}` : ""}`),
+    enabled: Boolean(hostPlatform)
+  });
+  const { data: selectedScriptData } = useQuery({
+    queryKey: ["script-detail", selectedScriptId],
+    queryFn: () => api.get<{ script: ManagedScript }>(`/api/scripts/${selectedScriptId}`),
+    enabled: Boolean(selectedScriptId)
+  });
+  const selectedScript = selectedScriptData?.script;
+  const scriptOptions = scriptData?.scripts ?? [];
+  useEffect(() => {
+    if (!selectedScriptId && scriptOptions[0]) setSelectedScriptId(scriptOptions[0].id);
+  }, [scriptOptions, selectedScriptId]);
+  useEffect(() => {
+    if (selectedScript && selectedScript.versions[0] && !selectedScript.versions.some((version) => version.id === selectedVersionId)) setSelectedVersionId(selectedScript.versions[0].id);
+  }, [selectedScript, selectedVersionId]);
   const execute = useMutation({
     mutationFn: () => api.post<CommandExecutionResult>(`/api/stores/${store.id}/commands/execute`, {
-      script,
+      scriptVersionId: selectedVersionId,
       timeoutMs: timeoutSeconds * 1_000
     }),
     onSuccess: async (response) => {
@@ -201,10 +227,10 @@ function CommandExecutionPanel({ store }: { store: Store }) {
   return <section className="command-agent-panel">
     <header><div><h3>Command agent</h3><code>{agent.endpoint}</code></div><StatusBadge status={agent.status} /></header>
     {agent.lastError && <div className="inline-alert">{agent.lastError}</div>}
-    <label className="field command-script-field"><span className="field-label">Store script</span><textarea className="mono-input" value={script} onChange={(event) => setScript(event.target.value)} placeholder="Write-Output 'Store ready'" spellCheck={false} /></label>
-    <div className="command-agent-controls"><label className="field"><span className="field-label">Timeout (seconds)</span><input type="number" min={1} max={300} value={timeoutSeconds} onChange={(event) => setTimeoutSeconds(Math.min(300, Math.max(1, Number(event.target.value) || 1)))} /></label><button className="button button-primary" type="button" disabled={!script.trim() || execute.isPending} onClick={() => execute.mutate()}><TerminalSquare size={15} />{execute.isPending ? "Executing..." : "Execute script"}</button></div>
+    {!hostPlatform ? <div className="inline-alert">An active enrollment is required before running a saved script.</div> : <div className="command-script-picker"><label className="field"><span className="field-label">Saved script <FieldHelp text="Only scripts compatible with the platform reported by this store's active enrollment are listed." /></span><select value={selectedScriptId} onChange={(event) => { setSelectedScriptId(event.target.value); setSelectedVersionId(""); }}>{scriptOptions.length === 0 && <option value="">No compatible scripts</option>}{scriptOptions.map((script) => <option value={script.id} key={script.id}>{script.name} · {script.platform}</option>)}</select></label><label className="field"><span className="field-label">Version <FieldHelp text="Select the exact immutable script version to execute. The execution history retains this version reference." /></span><select value={selectedVersionId} onChange={(event) => setSelectedVersionId(event.target.value)}>{!selectedScript?.versions.length && <option value="">No version available</option>}{selectedScript?.versions.map((version) => <option value={version.id} key={version.id}>Version {version.version}</option>)}</select></label><Link className="text-link" to="/scripts">Manage scripts</Link></div>}
+    <div className="command-agent-controls"><label className="field"><span className="field-label">Timeout (seconds) <FieldHelp text="The maximum time the command agent may let this script run before terminating it. Allowed range: 1 to 300 seconds." /></span><input type="number" min={1} max={300} value={timeoutSeconds} onChange={(event) => setTimeoutSeconds(Math.min(300, Math.max(1, Number(event.target.value) || 1)))} /></label><button className="button button-primary" type="button" disabled={!selectedVersionId || execute.isPending || !hostPlatform} onClick={() => execute.mutate()}><TerminalSquare size={15} />{execute.isPending ? "Executing..." : "Execute script"}</button></div>
     {result && <div className="command-result"><header><StatusBadge status={result.success ? "completed" : "failed"} /><span>Exit {result.exitCode ?? "timeout"} · {result.durationMs} ms</span></header>{result.stdout && <div><strong>stdout</strong><pre>{result.stdout}</pre></div>}{result.stderr && <div><strong>stderr</strong><pre>{result.stderr}</pre></div>}{!result.stdout && !result.stderr && <div className="quiet-empty">The script produced no output.</div>}</div>}
-    <div className="command-execution-history"><header><h4>Execution history</h4><span>{executions.length} run{executions.length === 1 ? "" : "s"}</span></header>{executions.length ? executions.map((execution: StoreCommandExecution) => <details className="command-execution" key={execution.id}><summary><span><StatusBadge status={execution.status} /><code>{new Date(execution.startedAt).toLocaleString()}</code></span><span>{execution.elapsedMs !== null ? `${execution.elapsedMs} ms` : execution.status === "running" ? "running" : "-"}</span></summary><div className="command-execution-body"><code>{execution.script}</code>{execution.error && <div className="inline-alert">{execution.error}</div>}{execution.stdout && <div><strong>stdout</strong><pre>{execution.stdout}</pre></div>}{execution.stderr && <div><strong>stderr</strong><pre>{execution.stderr}</pre></div>}{!execution.stdout && !execution.stderr && !execution.error && <div className="quiet-empty">The script produced no output.</div>}</div></details>) : <div className="quiet-empty">No scripts have been executed for this store.</div>}</div>
+    <div className="command-execution-history"><header><h4>Execution history</h4><span>{executions.length} run{executions.length === 1 ? "" : "s"}</span></header>{executions.length ? executions.map((execution: StoreCommandExecution) => <details className="command-execution" key={execution.id}><summary><span><StatusBadge status={execution.status} /><code>{execution.scriptName ?? "Saved script"} {execution.scriptVersion ? `v${execution.scriptVersion}` : ""} · {new Date(execution.startedAt).toLocaleString()}</code></span><span>{execution.elapsedMs !== null ? `${execution.elapsedMs} ms` : execution.status === "running" ? "running" : "-"}</span></summary><div className="command-execution-body"><code>{execution.enrollmentId ? `Enrollment ${execution.enrollmentId}` : "Enrollment unavailable"}</code><code>{execution.script}</code>{execution.error && <div className="inline-alert">{execution.error}</div>}{execution.stdout && <div><strong>stdout</strong><pre>{execution.stdout}</pre></div>}{execution.stderr && <div><strong>stderr</strong><pre>{execution.stderr}</pre></div>}{!execution.stdout && !execution.stderr && !execution.error && <div className="quiet-empty">The script produced no output.</div>}</div></details>) : <div className="quiet-empty">No scripts have been executed for this store.</div>}</div>
   </section>;
 }
 

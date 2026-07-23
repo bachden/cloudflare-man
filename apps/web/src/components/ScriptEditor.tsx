@@ -1,0 +1,40 @@
+import Editor, { loader } from "@monaco-editor/react";
+import * as monaco from "monaco-editor/editor/editor.api";
+import EditorWorker from "monaco-editor/editor/editor.worker?worker";
+import "monaco-editor/languages/definitions/powershell/register";
+import "monaco-editor/languages/definitions/shell/register";
+
+(globalThis as typeof globalThis & { MonacoEnvironment?: { getWorker: () => Worker } }).MonacoEnvironment = {
+  getWorker: () => new EditorWorker()
+};
+loader.config({ monaco });
+
+type ScriptEditorProps = {
+  value: string;
+  language: "powershell" | "bash" | "sh";
+  onChange?: (value: string) => void;
+  readOnly?: boolean;
+  height?: string;
+};
+
+export function ScriptEditor({ value, language, onChange, readOnly = false, height = "420px" }: ScriptEditorProps) {
+  const monacoLanguage = language === "powershell" ? "powershell" : "shell";
+  return <div className="script-editor"><Editor
+    height={height}
+    language={monacoLanguage}
+    theme="vs-dark"
+    value={value}
+    onChange={(next) => onChange?.(next ?? "")}
+    options={{
+      readOnly,
+      minimap: { enabled: false },
+      fontSize: 13,
+      lineNumbers: "on",
+      scrollBeyondLastLine: false,
+      wordWrap: "on",
+      padding: { top: 12, bottom: 12 },
+      automaticLayout: true,
+      tabSize: 2
+    }}
+  /></div>;
+}

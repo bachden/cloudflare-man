@@ -9,6 +9,7 @@ let accountId = "";
 let storeId = "";
 let enrollmentToken = "";
 let enrollmentId = "";
+let scriptVersionId = "";
 
 before(async () => {
   const database = await import("../src/lib/database.js");
@@ -16,7 +17,7 @@ before(async () => {
   await database.runMigrations();
   await database.seedRootUser();
   await pool.query(`
-    TRUNCATE audit_logs, app_settings, enrollments, stores, zones, cloudflare_accounts, sessions RESTART IDENTITY CASCADE
+    TRUNCATE audit_logs, store_command_executions, managed_script_versions, managed_scripts, app_settings, enrollments, stores, zones, cloudflare_accounts, sessions RESTART IDENTITY CASCADE
   `);
   const { buildApp } = await import("../src/app.js");
   app = await buildApp();
@@ -149,6 +150,44 @@ test("configures RDP operator access", async () => {
   assert.equal(response.statusCode, 200, response.body);
   const result = await pool.query("SELECT rdp_allowed_emails FROM cloudflare_accounts WHERE id = $1", [accountId]);
   assert.deepEqual(result.rows[0].rdp_allowed_emails, ["ops@dcorp.example"]);
+});
+
+test("creates and versions a platform-specific managed script", async () => {
+  const created = await app.inject({
+    method: "POST",
+    url: "/api/scripts",
+    headers: { cookie: sessionCookie },
+    payload: {
+      name: "Store readiness check",
+      platform: "windows",
+      language: "powershell",
+      description: "Checks the active store host",
+      content: "Write-Output 'ready v1'"
+    }
+  });
+  assert.equal(created.statusCode, 201, created.body);
+  assert.match(created.json().id, /^[0-9a-f-]{36}$/);
+  const version = await app.inject({
+    method: "POST",
+    url: `/api/scripts/${created.json().id}/versions`,
+    headers: { cookie: sessionCookie },
+    payload: { content: "Write-Output 'ready v2'" }
+  });
+  assert.equal(version.statusCode, 201, version.body);
+  assert.equal(version.json().version, 2);
+  scriptVersionId = version.json().versionId;
+
+  const list = await app.inject({ method: "GET", url: "/api/scripts?platform=windows&name=READINESS", headers: { cookie: sessionCookie } });
+  assert.equal(list.statusCode, 200, list.body);
+  assert.equal(list.json().scripts.length, 1);
+  assert.equal(list.json().scripts[0].latestVersion, 2);
+  assert.equal(list.json().scripts[0].latestVersionId, scriptVersionId);
+  const noMatch = await app.inject({ method: "GET", url: "/api/scripts?platform=windows&name=missing", headers: { cookie: sessionCookie } });
+  assert.equal(noMatch.statusCode, 200, noMatch.body);
+  assert.equal(noMatch.json().scripts.length, 0);
+  const detail = await app.inject({ method: "GET", url: `/api/scripts/${created.json().id}`, headers: { cookie: sessionCookie } });
+  assert.equal(detail.statusCode, 200, detail.body);
+  assert.deepEqual(detail.json().script.versions.map((item: { version: number }) => item.version), [2, 1]);
 });
 
 test("allocates a store and issues bootstrap URLs", async () => {
@@ -451,7 +490,7 @@ test("executes a script through the configured store command agent", async () =>
     assert.equal(String(input), "https://0001-ops.stores-a.example/agent/exec");
     const headers = new Headers(init?.headers);
     assert.match(headers.get("X-Cloudflare-Man-Agent-Token") ?? "", /^[A-Za-z0-9_-]{40,}$/);
-    assert.deepEqual(JSON.parse(String(init?.body)), { script: executionCall === 0 ? "Write-Output 'ready'" : "exit 2", timeoutMs: 30000 });
+    assert.deepEqual(JSON.parse(String(init?.body)), { script: "Write-Output 'ready v2'", timeoutMs: 30000 });
     executionCall += 1;
     return new Response(JSON.stringify(executionCall === 1
       ? { success: true, exitCode: 0, stdout: "ready\n", stderr: "", durationMs: 25 }
@@ -465,24 +504,34 @@ test("executes a script through the configured store command agent", async () =>
       method: "POST",
       url: `/api/stores/${storeId}/commands/execute`,
       headers: { cookie: sessionCookie },
-      payload: { script: "Write-Output 'ready'", timeoutMs: 30000 }
+      payload: { scriptVersionId, timeoutMs: 30000 }
     });
     assert.equal(response.statusCode, 200, response.body);
-    assert.deepEqual({ ...response.json(), executionId: undefined }, {
+    assert.deepEqual({
+      endpoint: response.json().endpoint,
+      success: response.json().success,
+      exitCode: response.json().exitCode,
+      stdout: response.json().stdout,
+      stderr: response.json().stderr,
+      durationMs: response.json().durationMs
+    }, {
       endpoint: "https://0001-ops.stores-a.example/agent/exec",
       success: true,
       exitCode: 0,
       stdout: "ready\n",
       stderr: "",
-      durationMs: 25,
-      executionId: undefined
+      durationMs: 25
     });
     assert.match(response.json().executionId, /^[0-9a-f-]{36}$/);
+    assert.equal(response.json().enrollmentId, enrollmentId);
+    assert.equal(response.json().scriptVersionId, scriptVersionId);
+    assert.equal(response.json().scriptName, "Store readiness check");
+    assert.equal(response.json().version, 2);
     const failed = await app.inject({
       method: "POST",
       url: `/api/stores/${storeId}/commands/execute`,
       headers: { cookie: sessionCookie },
-      payload: { script: "exit 2", timeoutMs: 30000 }
+      payload: { scriptVersionId, timeoutMs: 30000 }
     });
     assert.equal(failed.statusCode, 200, failed.body);
     assert.equal(failed.json().success, false);
@@ -492,12 +541,14 @@ test("executes a script through the configured store command agent", async () =>
   const audit = await pool.query("SELECT details FROM audit_logs WHERE action = 'store.command_executed' AND entity_id = $1", [storeId]);
   assert.equal(audit.rowCount, 2);
   assert.equal(audit.rows[0].details.success, true);
-  const executions = await pool.query("SELECT status, elapsed_ms, stdout, stderr FROM store_command_executions WHERE store_id = $1 ORDER BY created_at", [storeId]);
+  const executions = await pool.query("SELECT enrollment_id, script_version_id, status, elapsed_ms, stdout, stderr FROM store_command_executions WHERE store_id = $1 ORDER BY created_at", [storeId]);
   assert.equal(executions.rows.length, 2);
   assert.deepEqual({ status: executions.rows[0].status, stdout: executions.rows[0].stdout, stderr: executions.rows[0].stderr }, { status: "succeeded", stdout: "ready\n", stderr: "" });
   assert.equal(typeof executions.rows[0].elapsed_ms, "number");
   assert.deepEqual({ status: executions.rows[1].status, stdout: executions.rows[1].stdout, stderr: executions.rows[1].stderr }, { status: "failed", stdout: "partial\n", stderr: "failed\n" });
   assert.equal(typeof executions.rows[1].elapsed_ms, "number");
+  assert.ok(executions.rows.every((execution) => execution.enrollment_id === enrollmentId));
+  assert.ok(executions.rows.every((execution) => execution.script_version_id === scriptVersionId));
 });
 
 test("tracks enrollment history and issues cleanup for a running tunnel", async () => {

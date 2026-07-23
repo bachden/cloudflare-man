@@ -1,5 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { AlertTriangle, Check, Globe2 } from "lucide-react";
+import { lazy, Suspense } from "react";
 import { Navigate, Route, Routes, useNavigate } from "react-router-dom";
 import { toast } from "sonner";
 import { api } from "./api";
@@ -12,6 +13,8 @@ import { OnboardingPage } from "./pages/OnboardingPage";
 import { SettingsPage } from "./pages/SettingsPage";
 import { StoresPage } from "./pages/StoresPage";
 import type { AppSettings, User } from "./types";
+
+const ScriptsPage = lazy(() => import("./pages/ScriptsPage").then((module) => ({ default: module.ScriptsPage })));
 
 function PublicBaseUrlBanner() {
   const queryClient = useQueryClient();
@@ -46,5 +49,5 @@ export default function App() {
   if (isLoading) return <div className="app-loading"><div className="brand-spinner" /><span>cloudflare-man</span></div>;
   if (isError || !data) return <LoginPage onLogin={(user) => queryClient.setQueryData(["auth", "me"], { user })} />;
   const updatePasswordState = () => queryClient.setQueryData<{ user: User }>(["auth", "me"], (current) => current ? { user: { ...current.user, mustChangePassword: false } } : current);
-  return <AppShell username={data.user.username}><PublicBaseUrlBanner />{data.user.mustChangePassword && <button className="password-banner" onClick={() => navigate("/settings")}><AlertTriangle size={16} /><span>The default password is still active.</span><strong>Change password</strong></button>}<Routes><Route path="/" element={<DashboardPage />} /><Route path="/accounts" element={<AccountsPage />} /><Route path="/stores" element={<StoresPage />} /><Route path="/onboarding" element={<OnboardingPage />} /><Route path="/audit" element={<AuditPage />} /><Route path="/settings" element={<SettingsPage user={data.user} onLogout={() => queryClient.removeQueries({ queryKey: ["auth", "me"] })} onPasswordChanged={updatePasswordState} />} /><Route path="*" element={<Navigate to="/" replace />} /></Routes></AppShell>;
+  return <AppShell username={data.user.username}><PublicBaseUrlBanner />{data.user.mustChangePassword && <button className="password-banner" onClick={() => navigate("/settings")}><AlertTriangle size={16} /><span>The default password is still active.</span><strong>Change password</strong></button>}<Suspense fallback={<div className="app-loading"><div className="brand-spinner" /><span>Loading script editor...</span></div>}><Routes><Route path="/" element={<DashboardPage />} /><Route path="/accounts" element={<AccountsPage />} /><Route path="/stores" element={<StoresPage />} /><Route path="/onboarding" element={<OnboardingPage />} /><Route path="/scripts" element={<ScriptsPage />} /><Route path="/audit" element={<AuditPage />} /><Route path="/settings" element={<SettingsPage user={data.user} onLogout={() => queryClient.removeQueries({ queryKey: ["auth", "me"] })} onPasswordChanged={updatePasswordState} />} /><Route path="*" element={<Navigate to="/" replace />} /></Routes></Suspense></AppShell>;
 }

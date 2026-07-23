@@ -25,6 +25,7 @@ The onboarding flow is:
 - One-time PowerShell and POSIX enrollment URLs.
 - Existing-install detection with explicit cleanup and override confirmation.
 - Authenticated PowerShell or shell execution through a designated store connectivity route.
+- Versioned Windows and Unix script library with an embedded syntax-highlighting editor.
 - Server-side enrollment logs and audit logs.
 - Enrollment host inventory (OS name/version/build, architecture, and machine name) captured per attempt.
 - Windows and Unix installer tracking; once one platform claims a link, the other is marked `staled - ignored`.
@@ -205,9 +206,9 @@ Ingress routes are evaluated in order. The root path is kept last so more specif
 
 The enrollment installer registers the command agent as a Windows scheduled task, Linux systemd service, or macOS launch daemon. The agent listens only on `127.0.0.1:47831`; Cloudflare Tunnel publishes it through the connectivity route marked **Command agent**.
 
-Open a store's details to run a PowerShell script on Windows or a shell script on Unix-like systems. Requests are authenticated with a per-store random token. The token is encrypted in PostgreSQL, written only into the protected local agent script, and never returned to the browser. Executions are limited to 64 KiB and a five-minute timeout, and completion metadata is written to the audit log.
+Create and version PowerShell, Bash, or POSIX sh scripts in **Script library**. Open a store's details, select a saved script version compatible with the active enrollment platform, and run it through the command agent. Requests are authenticated with a per-store random token. The token is encrypted in PostgreSQL, written only into the protected local agent script, and never returned to the browser. Executions are limited to a five-minute timeout, and completion metadata is written to the audit log.
 
-The command agent runs as `SYSTEM` or root because store administration scripts may need to manage services and machine configuration. Every execution is persisted with `running`, `succeeded`, `failed`, or `timed_out` status, elapsed time, exit code, stdout, stderr, and error details. Treat access to the cloudflare-man administrator account as privileged infrastructure access.
+The command agent runs as `SYSTEM` or root because store administration scripts may need to manage services and machine configuration. Every execution is linked to the active enrollment and exact script version, then persisted with `running`, `succeeded`, `failed`, or `timed_out` status, elapsed time, exit code, stdout, stderr, and error details. Treat access to the cloudflare-man administrator account as privileged infrastructure access.
 
 ## Browser RDP
 

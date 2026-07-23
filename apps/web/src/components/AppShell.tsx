@@ -1,5 +1,6 @@
 import {
   Activity,
+  Code2,
   CloudCog,
   Menu,
   ScrollText,
@@ -14,6 +15,7 @@ const navigation = [
   { to: "/", label: "Overview", icon: Activity },
   { to: "/accounts", label: "Account pool", icon: CloudCog },
   { to: "/stores", label: "Stores", icon: StoreIcon },
+  { to: "/scripts", label: "Script library", icon: Code2 },
   { to: "/audit", label: "Audit log", icon: ScrollText },
   { to: "/settings", label: "Settings", icon: Settings }
 ];

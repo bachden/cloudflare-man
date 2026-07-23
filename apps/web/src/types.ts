@@ -119,6 +119,12 @@ export type StoreEnrollment = {
 
 export type StoreCommandExecution = {
   id: string;
+  enrollmentId: string | null;
+  scriptVersionId: string | null;
+  scriptName: string | null;
+  scriptVersion: number | null;
+  platform: "windows" | "unix" | null;
+  language: "powershell" | "bash" | "sh" | null;
   script: string;
   timeoutMs: number;
   status: "running" | "succeeded" | "failed" | "timed_out";
@@ -130,6 +136,28 @@ export type StoreCommandExecution = {
   stderr: string;
   error: string | null;
   requestedBy: string | null;
+};
+
+export type ManagedScriptSummary = {
+  id: string;
+  name: string;
+  platform: "windows" | "unix";
+  language: "powershell" | "bash" | "sh";
+  description: string;
+  latestVersion: number | null;
+  latestVersionId: string | null;
+  updatedAt: string;
+  createdAt: string;
+};
+
+export type ManagedScript = ManagedScriptSummary & {
+  versions: Array<{
+    id: string;
+    version: number;
+    content: string;
+    createdAt: string;
+    createdBy: string | null;
+  }>;
 };
 
 export type EnrollmentResult = {

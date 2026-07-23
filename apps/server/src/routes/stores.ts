@@ -94,7 +94,7 @@ const enrollmentSchema = z.object({
 });
 
 const executeScriptSchema = z.object({
-  script: z.string().min(1).max(65_536).refine((value) => value.trim().length > 0, "A script is required"),
+  scriptVersionId: z.string().uuid(),
   timeoutMs: z.number().int().min(1_000).max(300_000).default(60_000)
 });
 
@@ -191,6 +191,12 @@ const commandAgentJson = `(
 const commandExecutionsJson = `COALESCE((
   SELECT jsonb_agg(jsonb_build_object(
     'id', ce.id,
+    'enrollmentId', ce.enrollment_id,
+    'scriptVersionId', ce.script_version_id,
+    'scriptName', ce.name,
+    'scriptVersion', ce.version,
+    'platform', ce.platform,
+    'language', ce.language,
     'script', ce.script,
     'timeoutMs', ce.timeout_ms,
     'status', ce.status,
@@ -204,9 +210,11 @@ const commandExecutionsJson = `COALESCE((
     'requestedBy', ce.username
   ) ORDER BY ce.created_at DESC)
   FROM LATERAL (
-    SELECT ce.*, u.username
+    SELECT ce.*, u.username, sv.version, ms.name, ms.platform, ms.language
       FROM store_command_executions ce
       LEFT JOIN users u ON u.id = ce.requested_by
+      LEFT JOIN managed_script_versions sv ON sv.id = ce.script_version_id
+      LEFT JOIN managed_scripts ms ON ms.id = sv.script_id
      WHERE ce.store_id = s.id
      ORDER BY ce.created_at DESC
      LIMIT 50
@@ -320,20 +328,45 @@ export async function storeRoutes(app: FastifyInstance): Promise<void> {
   app.post("/api/stores/:id/commands/execute", { preHandler: requireAuth }, async (request, reply) => {
     const { id } = z.object({ id: z.string().uuid() }).parse(request.params);
     const body = executeScriptSchema.parse(request.body);
+    const enrollmentResult = await pool.query(
+      `SELECT id, platform
+         FROM enrollments
+        WHERE store_id = $1
+          AND status IN ('ready', 'installed')
+          AND unenrolled_at IS NULL
+        ORDER BY COALESCE(installed_at, claimed_at, created_at) DESC
+        LIMIT 1`,
+      [id]
+    );
+    const enrollment = enrollmentResult.rows[0];
+    if (!enrollment) return reply.code(409).send({ error: "This store has no active enrollment" });
+    const scriptVersionResult = await pool.query(
+      `SELECT v.id, v.content, v.version, s.id AS script_id, s.name, s.platform, s.language
+         FROM managed_script_versions v
+         JOIN managed_scripts s ON s.id = v.script_id
+        WHERE v.id = $1`,
+      [body.scriptVersionId]
+    );
+    const scriptVersion = scriptVersionResult.rows[0];
+    if (!scriptVersion) return reply.code(404).send({ error: "Script version not found" });
+    const enrollmentPlatform = enrollment.platform === "windows" ? "windows" : "unix";
+    if (scriptVersion.platform !== enrollmentPlatform) {
+      return reply.code(409).send({ error: `This script is for ${scriptVersion.platform}, but the active enrollment is ${enrollmentPlatform}` });
+    }
     const agent = await getCommandAgentConfig(id);
     if (!agent) return reply.code(409).send({ error: "No command agent route is configured for this store" });
-    const executionId = await createCommandExecution(id, request.authUser!.id, body.script, body.timeoutMs);
+    const executionId = await createCommandExecution(id, enrollment.id, scriptVersion.id, request.authUser!.id, scriptVersion.content, body.timeoutMs);
     try {
-      const result = await executeStoreScript(id, body.script, body.timeoutMs, executionId);
+      const result = await executeStoreScript(id, scriptVersion.content, body.timeoutMs, executionId);
       if (!result) return reply.code(409).send({ error: "No command agent route is configured for this store" });
       await writeAudit({
         actorUserId: request.authUser!.id,
         action: "store.command_executed",
         entityType: "store",
         entityId: id,
-        details: { endpoint: agent.endpoint, executionId, timeoutMs: body.timeoutMs, success: result.success, exitCode: result.exitCode }
+        details: { endpoint: agent.endpoint, executionId, enrollmentId: enrollment.id, scriptVersionId: scriptVersion.id, timeoutMs: body.timeoutMs, success: result.success, exitCode: result.exitCode }
       });
-      return { executionId, endpoint: agent.endpoint, ...result };
+      return { executionId, endpoint: agent.endpoint, enrollmentId: enrollment.id, scriptVersionId: scriptVersion.id, scriptName: scriptVersion.name, version: scriptVersion.version, ...result };
     } catch (error) {
       const message = error instanceof Error ? error.message : "Command agent execution failed";
       await writeAudit({
@@ -341,7 +374,7 @@ export async function storeRoutes(app: FastifyInstance): Promise<void> {
         action: "store.command_executed",
         entityType: "store",
         entityId: id,
-        details: { endpoint: agent.endpoint, executionId, timeoutMs: body.timeoutMs, success: false, error: message }
+        details: { endpoint: agent.endpoint, executionId, enrollmentId: enrollment.id, scriptVersionId: scriptVersion.id, timeoutMs: body.timeoutMs, success: false, error: message }
       });
       return reply.code(502).send({ error: message, executionId });
     }
