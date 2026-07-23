@@ -298,6 +298,7 @@ const enrollmentsJson = `COALESCE((
     'id', e.id,
     'status', e.status,
     'platform', CASE WHEN e.platform = 'windows' THEN 'windows' WHEN e.platform IS NOT NULL THEN 'unix' ELSE null END,
+    'environment', e.platform,
     'createdAt', e.created_at,
     'expiresAt', e.expires_at,
     'claimedAt', e.claimed_at,

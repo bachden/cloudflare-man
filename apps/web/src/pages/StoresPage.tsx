@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { AlertTriangle, CheckCircle2, ChevronLeft, ChevronRight, Copy, ExternalLink, MonitorUp, MoreHorizontal, Plus, RefreshCw, ScrollText, Search, Settings2, ShieldAlert, TerminalSquare, Trash2 } from "lucide-react";
+import { AlertTriangle, CheckCircle2, ChevronLeft, ChevronRight, Copy, ExternalLink, Monitor, MonitorUp, MoreHorizontal, Plus, RefreshCw, ScrollText, Search, Settings2, ShieldAlert, TerminalSquare, Trash2 } from "lucide-react";
 import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { toast } from "sonner";
@@ -224,16 +224,32 @@ function StoreDeleteDialog({
 
 function EnrollmentHistory({ enrollments, onViewLog }: { enrollments: StoreEnrollment[]; onViewLog: (enrollment: StoreEnrollment) => void }) {
   return <section className="enrollment-history"><header><h3>Enrollment history</h3><span>{enrollments.length} attempt{enrollments.length === 1 ? "" : "s"}</span></header>{enrollments.length ? <div className="enrollment-history-list">{enrollments.map((enrollment) => {
-    const installScripts = enrollment.scripts.filter((script) => script.kind === "install");
-    const cleanupScripts = enrollment.scripts.filter((script) => script.kind === "unenroll");
-    const host = enrollment.hostInfo;
-    const hostLabel = [host.machineName, host.osName, host.osVersion && `v${host.osVersion}`, host.osBuild && `build ${host.osBuild}`, host.architecture].filter(Boolean).join(" · ");
+    const runStatus = enrollmentRunStatus(enrollment);
+    const environment = enrollmentEnvironment(enrollment);
     return <div className="enrollment-history-row" key={enrollment.id}>
-      <div className="enrollment-history-date"><strong>{new Date(enrollment.createdAt).toLocaleString()}</strong><code>{enrollment.id}</code>{enrollment.platform && <span>Ran on {enrollment.platform === "windows" ? "Windows" : "Unix"}</span>}{hostLabel && <span className="enrollment-host-info">{hostLabel}</span>}</div>
-      <div className="enrollment-script-statuses"><div><StatusBadge status={enrollment.status} />{enrollment.unenrollStatus !== "not_required" && <StatusBadge status={`unenroll_${enrollment.unenrollStatus}`} />}</div><div className="enrollment-script-row"><span>Install</span>{installScripts.map((script) => <span key={`${script.kind}-${script.platform}`}><small>{script.platform}</small><StatusBadge status={script.status} /></span>)}</div>{cleanupScripts.length > 0 && <div className="enrollment-script-row"><span>Unenroll</span>{cleanupScripts.map((script) => <span key={`${script.kind}-${script.platform}`}><small>{script.platform}</small><StatusBadge status={script.status} /></span>)}</div>}</div>
-      <div className="enrollment-history-meta"><span>{enrollment.logCount} log{enrollment.logCount === 1 ? "" : "s"}</span><button className="icon-button" title="View log" aria-label="View enrollment log" onClick={() => onViewLog(enrollment)}><ScrollText size={15} /></button></div>
+      <div className="enrollment-history-field"><span className="enrollment-history-label">Run status</span><StatusBadge status={runStatus} /></div>
+      <div className="enrollment-history-field"><span className="enrollment-history-label">Environment</span><span className="enrollment-environment"><Monitor size={15} />{environment}</span></div>
+      <button className="button button-secondary enrollment-log-button" type="button" onClick={() => onViewLog(enrollment)}><ScrollText size={15} />View log</button>
     </div>;
   })}</div> : <div className="quiet-empty">No enrollment links have been issued for this store.</div>}</section>;
+}
+
+function enrollmentRunStatus(enrollment: StoreEnrollment): "never_run" | "running" | "success" | "failed" {
+  const installScripts = enrollment.scripts.filter((script) => script.kind === "install");
+  if (installScripts.some((script) => script.status === "failed") || enrollment.status === "failed") return "failed";
+  if (installScripts.some((script) => script.status === "running") || ["claimed", "provisioning", "ready"].includes(enrollment.status)) return "running";
+  if (installScripts.some((script) => script.status === "completed") || enrollment.status === "installed") return "success";
+  return "never_run";
+}
+
+function enrollmentEnvironment(enrollment: StoreEnrollment): string {
+  switch (enrollment.environment ?? enrollment.platform) {
+    case "windows": return "Windows";
+    case "linux": return "Linux";
+    case "darwin": return "macOS";
+    case "unix": return "Unix";
+    default: return "Not detected";
+  }
 }
 
 type CommandExecutionResult = {

@@ -202,6 +202,7 @@ tbody tr:hover td { background: #fbfcfb; }
 .field-help-tooltip { position: absolute; z-index: 20; top: calc(100% + 6px); left: -8px; width: min(280px, calc(100vw - 48px)); padding: 9px 10px; color: white; background: #202c25; border: 1px solid #3a4b41; border-radius: 5px; box-shadow: 0 8px 22px rgba(20, 30, 24, .18); font-size: 10px; font-weight: 500; line-height: 1.5; pointer-events: none; opacity: 0; visibility: hidden; transform: translateY(-2px); transition: opacity .12s ease, transform .12s ease, visibility .12s ease; }
 .field-help:hover .field-help-tooltip, .field-help:focus-within .field-help-tooltip, .field-help-open .field-help-tooltip { opacity: 1; visibility: visible; transform: translateY(0); }
 .field input, .field select { width: 100%; height: 38px; padding: 0 11px; background: white; color: var(--ink); border: 1px solid var(--line-strong); border-radius: 5px; outline: none; font-size: 12px; font-weight: 450; }
+.field input:disabled, .field select:disabled { color: #829087; background: #eef2ef; border-color: #d2dad4; cursor: not-allowed; opacity: 1; -webkit-text-fill-color: #829087; }
 .field input:focus, .field select:focus { border-color: var(--green); box-shadow: 0 0 0 3px rgba(8, 127, 91, .1); }
 .field input::placeholder { color: #a0aaa3; }
 .searchable-select { position: relative; }
@@ -281,13 +282,12 @@ tbody tr:hover td { background: #fbfcfb; }
 .enrollment-history > header h3 { font-size: 11px; }
 .enrollment-history > header span { color: var(--muted); font-size: 9px; }
 .enrollment-history-list { display: flex; flex-direction: column; border: 1px solid var(--line); border-radius: 5px; overflow: hidden; }
-.enrollment-history-row { min-height: 58px; padding: 9px 11px; display: grid; grid-template-columns: minmax(190px, 1fr) minmax(160px, .8fr) auto; align-items: center; gap: 12px; border-bottom: 1px solid var(--line); }
+.enrollment-history-row { min-height: 62px; padding: 10px 12px; display: grid; grid-template-columns: minmax(170px, 1fr) minmax(170px, 1fr) auto; align-items: center; gap: 18px; border-bottom: 1px solid var(--line); }
 .enrollment-history-row:last-child { border-bottom: 0; }
-.enrollment-history-date { min-width: 0; display: flex; flex-direction: column; gap: 3px; }
-.enrollment-history-date strong { font-size: 10px; }
-.enrollment-history-date code { color: var(--muted); font-size: 8px; overflow: hidden; text-overflow: ellipsis; }
-.enrollment-history-row > div:nth-child(2) { display: flex; flex-wrap: wrap; align-items: center; gap: 5px; }
-.enrollment-history-meta { display: flex; align-items: center; justify-content: flex-end; gap: 8px; color: var(--muted); font-size: 9px; white-space: nowrap; }
+.enrollment-history-field { min-width: 0; display: flex; align-items: center; gap: 9px; }
+.enrollment-history-label { color: var(--muted); font-size: 9px; font-weight: 750; text-transform: uppercase; letter-spacing: .06em; }
+.enrollment-environment { display: inline-flex; align-items: center; gap: 6px; color: #445047; font-size: 11px; font-weight: 650; }
+.enrollment-log-button { justify-self: end; min-width: 98px; }
 .enrollment-log-list { display: flex; flex-direction: column; gap: 8px; }
 .enrollment-log { padding: 11px 12px; border: 1px solid var(--line); border-left: 3px solid var(--line-strong); border-radius: 4px; background: #fbfcfb; }
 .enrollment-log-error { border-left-color: #c75a4e; }
@@ -559,7 +559,7 @@ tbody tr:hover td { background: #fbfcfb; }
   .command-script-picker { grid-template-columns: 1fr 1fr; }
   .command-script-picker .text-link { grid-column: 1 / -1; margin: 0; }
   .enrollment-history-row { grid-template-columns: 1fr; gap: 8px; }
-  .enrollment-history-meta { justify-content: flex-start; }
+  .enrollment-log-button { justify-self: start; }
   .connectivity-scope { grid-template-columns: 1fr; }
   .connectivity-scope > div { border-right: 0; border-bottom: 1px solid var(--line); }
   .connectivity-scope > div:last-child { border-bottom: 0; }

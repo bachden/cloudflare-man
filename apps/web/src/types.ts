@@ -107,6 +107,7 @@ export type StoreEnrollment = {
   id: string;
   status: string;
   platform: "windows" | "unix" | null;
+  environment: "windows" | "linux" | "darwin" | "unix" | null;
   createdAt: string;
   expiresAt: string;
   claimedAt: string | null;

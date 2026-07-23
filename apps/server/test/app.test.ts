@@ -463,6 +463,9 @@ test("installer report activates a mock store", async () => {
     architecture: "amd64",
     machineName: "STORE-WIN-01"
   });
+  const enrollmentDetail = await app.inject({ method: "GET", url: `/api/stores/${storeId}`, headers: { cookie: sessionCookie } });
+  assert.equal(enrollmentDetail.statusCode, 200, enrollmentDetail.body);
+  assert.equal(enrollmentDetail.json().store.enrollments[0].environment, "windows");
   const installedScripts = await pool.query("SELECT platform, status FROM enrollment_scripts WHERE enrollment_id = $1 AND script_kind = 'install' ORDER BY platform", [enrollmentId]);
   assert.deepEqual(installedScripts.rows, [
     { platform: "unix", status: "staled_ignored" },
