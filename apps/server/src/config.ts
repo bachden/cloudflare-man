@@ -13,8 +13,7 @@ const schema = z.object({
   NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
   SERVER_HOST: z.string().default("127.0.0.1"),
   SERVER_PORT: z.coerce.number().int().positive().default(3000),
-  WEB_ORIGIN: z.string().url().default("http://127.0.0.1:5173"),
-  PUBLIC_BASE_URL: z.string().url().default("http://127.0.0.1:5173"),
+  PUBLIC_BASE_URL: z.string().url().optional(),
   DATABASE_URL: z.string().min(1),
   DATABASE_SCHEMA: z.string().regex(/^[a-z_][a-z0-9_]*$/).default("public"),
   ENCRYPTION_KEY: z.string().regex(/^[a-fA-F0-9]{64}$/),
@@ -23,4 +22,9 @@ const schema = z.object({
   ALLOW_MOCK_ACCOUNTS: booleanFromString.default(false)
 });
 
-export const config = schema.parse(process.env);
+const parsed = schema.parse(process.env);
+
+export const config = {
+  ...parsed,
+  PUBLIC_BASE_URL: parsed.PUBLIC_BASE_URL ?? `http://${parsed.SERVER_HOST}:${parsed.SERVER_PORT}`
+};

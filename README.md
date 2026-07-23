@@ -103,12 +103,16 @@ Set at least these values:
 NODE_ENV=development
 SERVER_HOST=127.0.0.1
 SERVER_PORT=3000
-WEB_ORIGIN=http://127.0.0.1:5173
-PUBLIC_BASE_URL=https://cloudflare-man.example.com
+WEB_HOST=127.0.0.1
+WEB_PORT=5173
 DATABASE_URL=postgresql://USER:PASSWORD@localhost:5432/cloudflare_man
 DATABASE_SCHEMA=public
 ENCRYPTION_KEY=64_HEX_CHARACTERS
 ```
+
+`WEB_HOST`/`WEB_PORT` configure the Vite dev server (`apps/web`) only; they are unused in production, where the API serves the built frontend from `SERVER_HOST`/`SERVER_PORT`.
+
+`PUBLIC_BASE_URL` is optional and defaults to `http://SERVER_HOST:SERVER_PORT`. Set it explicitly when the store-reachable URL differs, such as in production. It can also be changed later at runtime from the admin UI, which persists the value to PostgreSQL and takes precedence over `.env`.
 
 Prepare and seed PostgreSQL:
 
