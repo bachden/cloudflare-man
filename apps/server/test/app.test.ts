@@ -486,6 +486,9 @@ test("executes a script through the configured store command agent", async () =>
   assert.equal(detail.statusCode, 200, detail.body);
   assert.equal(detail.json().store.commandAgent.endpoint, "https://0001-ops.stores-a.example/agent/exec");
   assert.equal(detail.json().store.commandAgent.status, "ready");
+  const list = await app.inject({ method: "GET", url: "/api/stores?page=1&pageSize=25", headers: { cookie: sessionCookie } });
+  assert.equal(list.statusCode, 200, list.body);
+  assert.equal(list.json().stores.find((store: { id: string }) => store.id === storeId).commandAgent.endpoint, "https://0001-ops.stores-a.example/agent/exec");
 
   const originalFetch = globalThis.fetch;
   let executionCall = 0;
@@ -552,6 +555,30 @@ test("executes a script through the configured store command agent", async () =>
   assert.equal(typeof executions.rows[1].elapsed_ms, "number");
   assert.ok(executions.rows.every((execution) => execution.enrollment_id === enrollmentId));
   assert.ok(executions.rows.every((execution) => execution.script_version_id === scriptVersionId));
+});
+
+test("rejects a second command agent route for the same store", async () => {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const publication = await client.query(
+      `INSERT INTO store_publications(store_id, suffix, hostname, status)
+       VALUES ($1, 'duplicate-agent-test', 'duplicate-agent-test.stores-a.example', 'pending')
+       RETURNING id`,
+      [storeId]
+    );
+    await assert.rejects(
+      () => client.query(
+        `INSERT INTO store_routes(publication_id, path, service_url, route_kind, sort_order)
+         VALUES ($1, '/agent', 'http://127.0.0.1:47831', 'command_agent', 0)`,
+        [publication.rows[0].id]
+      ),
+      /Only one command agent route is allowed per store/
+    );
+  } finally {
+    await client.query("ROLLBACK");
+    client.release();
+  }
 });
 
 test("tracks enrollment history and issues cleanup for a running tunnel", async () => {

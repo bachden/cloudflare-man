@@ -425,7 +425,8 @@ export async function storeRoutes(app: FastifyInstance): Promise<void> {
              s.rdp_url AS "rdpUrl", s.rdp_last_error AS "rdpLastError",
              s.last_connected_at AS "lastConnectedAt", s.last_verified_at AS "lastVerifiedAt", s.last_error AS "lastError",
              s.created_at AS "createdAt", a.id AS "accountId", a.name AS "accountName", z.id AS "zoneId", z.name AS "zoneName",
-             ${publicationsJson} AS publications
+             ${publicationsJson} AS publications,
+             ${commandAgentJson} AS "commandAgent"
         FROM stores s
         JOIN cloudflare_accounts a ON a.id = s.account_id
         JOIN zones z ON z.id = s.zone_id

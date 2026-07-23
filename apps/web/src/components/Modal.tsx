@@ -6,14 +6,14 @@ type ModalProps = {
   title: string;
   children: ReactNode;
   onClose: () => void;
-  width?: "default" | "wide";
+  width?: "default" | "wide" | "extra-wide";
 };
 
 export function Modal({ open, title, children, onClose, width = "default" }: ModalProps) {
   if (!open) return null;
   return (
     <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
-      <section className={`modal ${width === "wide" ? "modal-wide" : ""}`} role="dialog" aria-modal="true" aria-labelledby="modal-title">
+      <section className={`modal ${width === "wide" ? "modal-wide" : width === "extra-wide" ? "modal-extra-wide" : ""}`} role="dialog" aria-modal="true" aria-labelledby="modal-title">
         <header className="modal-header">
           <h2 id="modal-title">{title}</h2>
           <button className="icon-button" type="button" onClick={onClose} aria-label="Close dialog" title="Close">
@@ -25,4 +25,3 @@ export function Modal({ open, title, children, onClose, width = "default" }: Mod
     </div>
   );
 }
-
