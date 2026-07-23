@@ -105,6 +105,9 @@ export type StoreDeletePreflight = {
 
 export type StoreEnrollment = {
   id: string;
+  computerName: string | null;
+  isCurrent: boolean;
+  deletedAt: string | null;
   status: string;
   platform: "windows" | "unix" | null;
   environment: "windows" | "linux" | "darwin" | "unix" | null;
@@ -114,6 +117,7 @@ export type StoreEnrollment = {
   installedAt: string | null;
   lastError: string | null;
   unenrollStatus: "not_required" | "pending" | "unenrolled" | "failed";
+  unenrollReason: "script" | "override" | null;
   unenrollRequestedAt: string | null;
   unenrolledAt: string | null;
   logCount: number;
@@ -193,4 +197,14 @@ export type EnrollmentResult = {
       powershell: string;
     };
   }>;
+};
+
+export type UnenrollmentResult = {
+  enrollmentId: string;
+  createdAt: string;
+  expiresAt: string;
+  urls: {
+    shell: string;
+    powershell: string;
+  };
 };

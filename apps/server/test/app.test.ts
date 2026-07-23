@@ -472,6 +472,14 @@ test("installer report activates a mock store", async () => {
     { platform: "windows", status: "completed" }
   ]);
 
+  const currentDelete = await app.inject({
+    method: "DELETE",
+    url: `/api/stores/${storeId}/enrollments/${enrollmentId}`,
+    headers: { cookie: sessionCookie }
+  });
+  assert.equal(currentDelete.statusCode, 409, currentDelete.body);
+  assert.match(currentDelete.json().error, /current connected/i);
+
   const retry = await app.inject({
     method: "POST",
     url: `/api/stores/${storeId}/rdp/retry`,
@@ -632,6 +640,8 @@ test("tracks enrollment history and issues cleanup for a running tunnel", async 
   const oldEnrollment = await pool.query("SELECT unenrolled_at, unenroll_last_error FROM enrollments WHERE id = $1", [enrollmentId]);
   assert.ok(oldEnrollment.rows[0].unenrolled_at);
   assert.equal(oldEnrollment.rows[0].unenroll_last_error, null);
+  const oldEnrollmentStatus = await pool.query("SELECT status FROM enrollments WHERE id = $1", [enrollmentId]);
+  assert.equal(oldEnrollmentStatus.rows[0].status, "unenrolled");
   const cleanupScripts = await pool.query("SELECT platform, status FROM enrollment_scripts WHERE enrollment_id = $1 AND script_kind = 'unenroll' ORDER BY platform", [enrollmentId]);
   assert.deepEqual(cleanupScripts.rows, [
     { platform: "unix", status: "completed" },
@@ -645,6 +655,22 @@ test("tracks enrollment history and issues cleanup for a running tunnel", async 
   });
   assert.equal(logs.statusCode, 200, logs.body);
   assert.equal(logs.json().logs.length, 3);
+
+  const softDeleted = await app.inject({
+    method: "DELETE",
+    url: `/api/stores/${storeId}/enrollments/${enrollmentId}`,
+    headers: { cookie: sessionCookie }
+  });
+  assert.equal(softDeleted.statusCode, 200, softDeleted.body);
+  assert.equal(softDeleted.json().alreadyDeleted, false);
+  const deletedDetail = await app.inject({ method: "GET", url: `/api/stores/${storeId}`, headers: { cookie: sessionCookie } });
+  assert.equal(deletedDetail.statusCode, 200, deletedDetail.body);
+  const deletedEnrollment = deletedDetail.json().store.enrollments.find((item: { id: string }) => item.id === enrollmentId);
+  assert.ok(deletedEnrollment.deletedAt);
+  assert.equal(deletedEnrollment.computerName, "STORE-WIN-01");
+
+  const retainedExecution = deletedDetail.json().store.commandExecutions.find((item: { enrollmentId: string | null }) => item.enrollmentId === enrollmentId);
+  assert.ok(retainedExecution, "Execution history must retain the soft-deleted enrollment reference");
 });
 
 test("preflights and force-deletes a store with explicit name confirmation", async () => {

@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { AlertTriangle, CheckCircle2, ChevronLeft, ChevronRight, Copy, ExternalLink, FilePlus2, Monitor, MonitorUp, MoreHorizontal, Plus, RefreshCw, Save, ScrollText, Search, Settings2, ShieldAlert, TerminalSquare, Trash2 } from "lucide-react";
+import { AlertTriangle, Apple, CheckCircle2, ChevronLeft, ChevronRight, FilePlus2, Monitor, MonitorUp, Plus, RefreshCw, Save, ScrollText, Search, Server, Settings2, ShieldAlert, TerminalSquare, Trash2 } from "lucide-react";
 import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { toast } from "sonner";
@@ -10,8 +10,9 @@ import { FieldHelp } from "../components/FieldHelp";
 import { Modal } from "../components/Modal";
 import { PageHeader } from "../components/PageHeader";
 import { ScriptEditor } from "../components/ScriptEditor";
+import { SideDrawer } from "../components/SideDrawer";
 import { StatusBadge } from "../components/StatusBadge";
-import type { AppSettings, EnrollmentResult, ManagedScript, ManagedScriptSummary, Store, StoreCommandExecution, StoreDeletePreflight, StoreEnrollment } from "../types";
+import type { AppSettings, EnrollmentResult, ManagedScript, ManagedScriptSummary, Store, StoreCommandExecution, StoreDeletePreflight, StoreEnrollment, UnenrollmentResult } from "../types";
 
 type StoreListResponse = {
   stores: Store[];
@@ -24,13 +25,15 @@ type StoreRefreshResponse = {
   failed: number;
 };
 
+type StoreDrawerTab = "overall" | "ingress" | "connect";
+
 export function StoresPage() {
   const queryClient = useQueryClient();
   const [search, setSearch] = useState("");
   const [status, setStatus] = useState("");
   const [page, setPage] = useState(1);
   const [selected, setSelected] = useState<Store | null>(null);
-  const [commandStore, setCommandStore] = useState<Store | null>(null);
+  const [selectedTab, setSelectedTab] = useState<StoreDrawerTab>("overall");
   const [connectivityStore, setConnectivityStore] = useState<Store | null>(null);
   const pageSize = 25;
   const params = new URLSearchParams({ page: String(page), pageSize: String(pageSize) });
@@ -56,6 +59,10 @@ export function StoresPage() {
   const pagination = data?.pagination;
   const firstResult = pagination && pagination.total > 0 ? (pagination.page - 1) * pagination.pageSize + 1 : 0;
   const lastResult = pagination ? Math.min(pagination.page * pagination.pageSize, pagination.total) : 0;
+  const openStore = (store: Store, tab: StoreDrawerTab = "overall") => {
+    setSelected(store);
+    setSelectedTab(tab);
+  };
   return (
     <div className="page">
       <PageHeader title="Stores" eyebrow="Tunnel inventory" actions={<><button className="button button-secondary" onClick={() => refresh.mutate()} disabled={refresh.isPending || !data?.stores.length}><RefreshCw size={15} className={refresh.isPending ? "spin-icon" : undefined} />{refresh.isPending ? "Refreshing..." : "Refresh"}</button><Link className="button button-primary" to="/onboarding"><Plus size={16} />Onboard store</Link></>} />
@@ -65,24 +72,24 @@ export function StoresPage() {
         <span className="result-count">{pagination?.total ?? 0} stores</span>
       </div>
       <section className="panel table-panel store-table-panel">
-        <div className="table-scroll"><table><thead><tr><th>Store</th><th>Hostname</th><th>Assignment</th><th>Onboarding</th><th>Tunnel</th><th>RDP</th><th>Commands</th><th /></tr></thead><tbody>
-          {isLoading ? <tr><td colSpan={8}><div className="quiet-empty">Loading stores...</div></td></tr> : data?.stores.length === 0 ? <tr><td colSpan={8}><div className="quiet-empty">No stores match this view</div></td></tr> : data?.stores.map((store) => (
-            <tr key={store.id}><td><div className="primary-cell"><strong>{store.displayName}</strong><span>{store.tenantCode} · {store.storeCode}</span></div></td><td><div className="hostname-cell"><span className="mono">{store.hostname}</span>{store.publications.length > 1 && <span className="endpoint-count">+{store.publications.length - 1}</span>}<button className="copy-icon" title="Copy hostname" onClick={() => { void navigator.clipboard.writeText(store.hostname); toast.success("Hostname copied"); }}><Copy size={14} /></button></div></td><td><div className="primary-cell"><strong>{store.accountName}</strong><span>{store.zoneName}</span></div></td><td><StatusBadge status={store.onboardingStatus} /></td><td><StatusBadge status={store.tunnelStatus} /></td><td>{store.rdpStatus === "ready" && store.rdpUrl ? <a className="button button-secondary table-action" href={store.rdpUrl} target="_blank" rel="noreferrer"><MonitorUp size={15} />Remote desktop</a> : <StatusBadge status={store.rdpStatus} />}</td><td>{store.commandAgent && <button className="icon-button command-agent-table-action" type="button" title="Open command console" aria-label={`Open command console for ${store.displayName}`} onClick={() => setCommandStore(store)}><TerminalSquare size={17} /></button>}</td><td><button className="icon-button" title="Store details" onClick={() => setSelected(store)}><MoreHorizontal size={18} /></button></td></tr>
+        <div className="table-scroll"><table><thead><tr><th>Store</th><th>Assignment</th><th>Onboarding</th><th>Tunnel</th><th>RDP</th><th>Commands</th></tr></thead><tbody>
+          {isLoading ? <tr><td colSpan={6}><div className="quiet-empty">Loading stores...</div></td></tr> : data?.stores.length === 0 ? <tr><td colSpan={6}><div className="quiet-empty">No stores match this view</div></td></tr> : data?.stores.map((store) => (
+            <tr key={store.id} className="store-row" onClick={() => openStore(store)} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); openStore(store); } }} tabIndex={0}><td><div className="primary-cell"><strong>{store.displayName}</strong><span>{store.tenantCode} · {store.storeCode}</span></div></td><td><div className="primary-cell"><strong>{store.accountName}</strong><span>{store.zoneName}</span></div></td><td><StatusBadge status={store.onboardingStatus} /></td><td><StatusBadge status={store.tunnelStatus} /></td><td><StatusBadge status={store.rdpStatus} /></td><td>{store.commandAgent && <button className="icon-button command-agent-table-action" type="button" title="Open Connect tab" aria-label={`Open Connect tab for ${store.displayName}`} onClick={(event) => { event.stopPropagation(); openStore(store, "connect"); }}><TerminalSquare size={17} /></button>}</td></tr>
           ))}
         </tbody></table></div>
         {pagination && pagination.total > 0 && <div className="table-pagination"><span>{firstResult}-{lastResult} of {pagination.total}</span><div><button className="icon-button" title="Previous page" aria-label="Previous page" disabled={pagination.page <= 1} onClick={() => setPage((current) => Math.max(1, current - 1))}><ChevronLeft size={17} /></button><span>Page {pagination.page} of {pagination.totalPages}</span><button className="icon-button" title="Next page" aria-label="Next page" disabled={pagination.page >= pagination.totalPages} onClick={() => setPage((current) => current + 1)}><ChevronRight size={17} /></button></div></div>}
       </section>
-      <StoreModal store={selected} onClose={() => setSelected(null)} onEditConnectivity={(store) => { setSelected(null); setConnectivityStore(store); }} onOpenCommand={(store) => { setSelected(null); setCommandStore(store); }} />
-      <CommandAgentModal store={commandStore} onClose={() => setCommandStore(null)} />
+      <StoreDrawer store={selected} tab={selectedTab} onTabChange={setSelectedTab} onClose={() => setSelected(null)} onEditConnectivity={(store) => { setSelected(null); setConnectivityStore(store); }} />
       <EditConnectivityModal store={connectivityStore} onClose={() => setConnectivityStore(null)} />
     </div>
   );
 }
 
-function StoreModal({ store, onClose, onEditConnectivity, onOpenCommand }: { store: Store | null; onClose: () => void; onEditConnectivity: (store: Store) => void; onOpenCommand: (store: Store) => void }) {
+function StoreDrawer({ store, tab, onTabChange, onClose, onEditConnectivity }: { store: Store | null; tab: StoreDrawerTab; onTabChange: (tab: StoreDrawerTab) => void; onClose: () => void; onEditConnectivity: (store: Store) => void }) {
   const queryClient = useQueryClient();
   const [enrollment, setEnrollment] = useState<EnrollmentResult | null>(null);
   const [logEnrollment, setLogEnrollment] = useState<StoreEnrollment | null>(null);
+  const [unenrollment, setUnenrollment] = useState<UnenrollmentResult | null>(null);
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [deletePreflight, setDeletePreflight] = useState<StoreDeletePreflight | null>(null);
   const [deleteName, setDeleteName] = useState("");
@@ -100,18 +107,38 @@ function StoreModal({ store, onClose, onEditConnectivity, onOpenCommand }: { sto
   });
   const mutation = useMutation({
     mutationFn: () => api.post<EnrollmentResult>(`/api/stores/${store!.id}/enrollments`, { expiresInHours: 24 }),
-    onSuccess: async (result) => { setEnrollment(result); toast.success("Enrollment URL issued"); await queryClient.invalidateQueries({ queryKey: ["stores"] }); await queryClient.invalidateQueries({ queryKey: ["store-detail", store?.id] }); },
+    onSuccess: async (result) => { setEnrollment(result); setUnenrollment(null); toast.success("Enrollment URL issued"); await queryClient.invalidateQueries({ queryKey: ["stores"] }); await queryClient.invalidateQueries({ queryKey: ["store-detail", store?.id] }); },
     onError: (error) => toast.error(error instanceof Error ? error.message : "Unable to issue enrollment")
   });
   const verify = useMutation({
-    mutationFn: () => api.post<{ success: boolean; check: { statusCode: number | null; latencyMs: number; error?: string }; checks: unknown[] }>(`/api/stores/${store!.id}/verify`),
-    onSuccess: async (result) => { await queryClient.invalidateQueries({ queryKey: ["stores"] }); if (result.success) toast.success(`${result.checks.length} endpoint${result.checks.length === 1 ? "" : "s"} verified`); else toast.error(result.check.error ?? "One or more endpoints are unreachable"); },
+    mutationFn: (routeId: string) => api.post<{ success: boolean; check: { statusCode: number | null; latencyMs: number; error?: string }; checks: unknown[] }>(`/api/stores/${store!.id}/verify`, { routeId }),
+    onSuccess: async (result) => { await Promise.all([queryClient.invalidateQueries({ queryKey: ["stores"] }), queryClient.invalidateQueries({ queryKey: ["store-detail", store?.id] })]); if (result.success) toast.success("Endpoint verified"); else toast.error(result.check.error ?? "Endpoint is unreachable"); },
     onError: (error) => toast.error(error instanceof Error ? error.message : "Verification failed")
   });
   const revoke = useMutation({
     mutationFn: () => api.post(`/api/stores/${store!.id}/enrollments/revoke`),
     onSuccess: async () => { setEnrollment(null); await queryClient.invalidateQueries({ queryKey: ["stores"] }); toast.success("Enrollment revoked"); },
     onError: (error) => toast.error(error instanceof Error ? error.message : "Unable to revoke enrollment")
+  });
+  const deleteEnrollment = useMutation({
+    mutationFn: (enrollmentId: string) => api.delete(`/api/stores/${store!.id}/enrollments/${enrollmentId}`),
+    onSuccess: async () => {
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["store-detail", store?.id] }),
+        queryClient.invalidateQueries({ queryKey: ["stores"] })
+      ]);
+      toast.success("Enrollment deleted from active history");
+    },
+    onError: (error) => toast.error(error instanceof Error ? error.message : "Unable to delete enrollment")
+  });
+  const issueUnenrollment = useMutation({
+    mutationFn: (enrollmentId: string) => api.post<UnenrollmentResult>(`/api/stores/${store!.id}/enrollments/${enrollmentId}/unenroll`, { expiresInHours: 24 }),
+    onSuccess: async (result) => {
+      setUnenrollment(result);
+      await queryClient.invalidateQueries({ queryKey: ["store-detail", store?.id] });
+      toast.success("Unenrollment command issued");
+    },
+    onError: (error) => toast.error(error instanceof Error ? error.message : "Unable to issue unenrollment command")
   });
   const retryRdp = useMutation({
     mutationFn: () => api.post(`/api/stores/${store!.id}/rdp/retry`),
@@ -149,43 +176,46 @@ function StoreModal({ store, onClose, onEditConnectivity, onOpenCommand }: { sto
     setDeleteOpen(true);
     deletePreflightMutation.mutate();
   };
-  const close = () => { setEnrollment(null); setLogEnrollment(null); setDeleteOpen(false); setDeletePreflight(null); setDeleteName(""); onClose(); };
+  const close = () => { setEnrollment(null); setUnenrollment(null); setLogEnrollment(null); setDeleteOpen(false); setDeletePreflight(null); setDeleteName(""); onClose(); };
   const canRevoke = ["url_issued", "claimed", "provisioning", "failed"].includes(currentStore?.onboardingStatus ?? "");
   return (
     <>
-    <Modal open={Boolean(store)} title={currentStore?.displayName ?? "Store details"} onClose={close} width="wide">
-      {currentStore && <div className="detail-layout">
-        <dl className="detail-list">
-          <div><dt>Store code</dt><dd>{currentStore.tenantCode} / {currentStore.storeCode}</dd></div>
-          <div><dt>Hostname</dt><dd className="mono">{currentStore.hostname}</dd></div>
-          <div><dt>Origin</dt><dd className="mono">{currentStore.originUrl}</dd></div>
-          <div><dt>Account</dt><dd>{currentStore.accountName}</dd></div>
-          <div><dt>Zone</dt><dd>{currentStore.zoneName}</dd></div>
-          <div><dt>Tunnel ID</dt><dd className="mono">{currentStore.tunnelId ?? "Not provisioned"}</dd></div>
-          <div><dt>RDP target</dt><dd className="mono">{currentStore.rdpTargetIp ? `${currentStore.rdpTargetIp}:3389` : "Awaiting Windows installer"}</dd></div>
-          <div><dt>RDP gateway</dt><dd className="mono">{currentStore.rdpUrl ? new URL(currentStore.rdpUrl).hostname : "Not provisioned"}</dd></div>
-        </dl>
-        <div className="detail-status">
-          <div><span>Onboarding</span><StatusBadge status={currentStore.onboardingStatus} /></div>
-          <div><span>Tunnel</span><StatusBadge status={currentStore.tunnelStatus} /></div>
-          <div><span>RDP</span><StatusBadge status={currentStore.rdpStatus} /></div>
-        </div>
-        <section className="publication-summary"><header><h3>Published endpoints</h3><span>{currentStore.publications.length} hostname{currentStore.publications.length === 1 ? "" : "s"}</span></header>{currentStore.publications.map((publication) => <div className="publication-summary-item" key={publication.id}><div><code>{publication.hostname}</code><StatusBadge status={publication.status} />{currentStore.tunnelStatus === "healthy" && <a className="copy-icon" href={`https://${publication.hostname}`} target="_blank" rel="noreferrer" title="Open endpoint"><ExternalLink size={14} /></a>}</div>{publication.routes.map((route) => <div className="publication-route" key={route.id}><code>{route.path}</code><span>→</span><code>{route.kind === "command_agent" ? "Cloudflare Man command agent" : route.serviceUrl}</code></div>)}</div>)}</section>
-        {currentStore.rdpLastError && <div className="inline-alert">{currentStore.rdpLastError}</div>}
-        <EnrollmentHistory enrollments={currentStore.enrollments ?? []} onViewLog={setLogEnrollment} />
-        {enrollment ? <EnrollmentCommands result={enrollment} /> : <div className="detail-actions">
-          <button className="button button-secondary" onClick={() => onEditConnectivity(currentStore)}><Settings2 size={15} />Edit connectivity</button>
-          {currentStore.commandAgent && <button className="button button-secondary" onClick={() => onOpenCommand(currentStore)}><TerminalSquare size={15} />Open command console</button>}
-          <button className="button button-primary" onClick={() => mutation.mutate()} disabled={mutation.isPending}><TerminalSquare size={16} />{mutation.isPending ? "Issuing..." : "Issue install URL"}</button>
-          {currentStore.rdpStatus === "ready" && currentStore.rdpUrl && <a className="button button-primary" href={currentStore.rdpUrl} target="_blank" rel="noreferrer"><MonitorUp size={16} />Remote desktop</a>}
-          {currentStore.rdpTargetIp && currentStore.rdpStatus !== "ready" && <button className="button button-secondary" onClick={() => retryRdp.mutate()} disabled={retryRdp.isPending}><RefreshCw size={15} />{retryRdp.isPending ? "Retrying..." : "Retry RDP"}</button>}
-          <button className="button button-secondary" onClick={() => verify.mutate()} disabled={verify.isPending}><CheckCircle2 size={15} />{verify.isPending ? "Checking..." : "Verify endpoint"}</button>
-          {canRevoke && <button className="button button-danger" onClick={() => { if (window.confirm("Revoke this enrollment URL?")) revoke.mutate(); }} disabled={revoke.isPending}><ShieldAlert size={15} />Revoke</button>}
-          {currentStore.tunnelStatus === "healthy" && <a className="button button-secondary" href={`https://${currentStore.hostname}`} target="_blank" rel="noreferrer"><ExternalLink size={15} />Open endpoint</a>}
-          <button className="button button-danger" onClick={openDelete} disabled={deletePreflightMutation.isPending || deleteStore.isPending}><Trash2 size={15} />Delete store</button>
+    <SideDrawer open={Boolean(store)} title={<div className="store-drawer-heading"><strong>{currentStore?.displayName ?? "Store details"}</strong>{currentStore && <div className="store-drawer-statuses"><div><span>Onboarding</span><StatusBadge status={currentStore.onboardingStatus} /></div><div><span>Tunnel</span><StatusBadge status={currentStore.tunnelStatus} /></div><div><span>RDP</span><StatusBadge status={currentStore.rdpStatus} /></div></div>}</div>} onClose={close}>
+      {currentStore && <div className="store-drawer-content">
+        <nav className="store-drawer-tabs" aria-label="Store detail sections">
+          <button className={tab === "overall" ? "active" : ""} type="button" onClick={() => onTabChange("overall")}>Overall</button>
+          <button className={tab === "ingress" ? "active" : ""} type="button" onClick={() => onTabChange("ingress")}>Ingress routes</button>
+          <button className={tab === "connect" ? "active" : ""} type="button" onClick={() => onTabChange("connect")}>Connect</button>
+        </nav>
+        {tab === "overall" && <div className="store-drawer-tab">
+          <section className="store-drawer-section">
+            <header className="store-section-heading"><div><h3>Store overview</h3><span>Store assignment and infrastructure</span></div></header>
+            <dl className="detail-list">
+              <div><dt>Store code</dt><dd>{currentStore.tenantCode} / {currentStore.storeCode}</dd></div>
+              <div><dt>Account</dt><dd>{currentStore.accountName}</dd></div>
+              <div><dt>Zone</dt><dd>{currentStore.zoneName}</dd></div>
+              <div><dt>Tunnel ID</dt><dd className="mono">{currentStore.tunnelId ?? "Not provisioned"}</dd></div>
+              <div><dt>RDP target</dt><dd className="mono">{currentStore.rdpTargetIp ? `${currentStore.rdpTargetIp}:3389` : "Awaiting Windows installer"}</dd></div>
+              <div><dt>RDP gateway</dt><dd className="mono">{currentStore.rdpUrl ? new URL(currentStore.rdpUrl).hostname : "Not provisioned"}</dd></div>
+            </dl>
+          </section>
+          <EnrollmentHistory enrollments={currentStore.enrollments ?? []} onViewLog={setLogEnrollment} onDelete={(enrollment) => { if (window.confirm(`Soft-delete the enrollment for ${enrollmentComputerName(enrollment)}? Execution history will be retained.`)) deleteEnrollment.mutate(enrollment.id); }} onUnenroll={(enrollment) => issueUnenrollment.mutate(enrollment.id)} deleting={deleteEnrollment.isPending} unenrolling={issueUnenrollment.isPending} />
+          {unenrollment && <UnenrollmentCommands result={unenrollment} />}
+          {enrollment ? <EnrollmentCommands result={enrollment} /> : <div className="detail-actions">
+            <button className="button button-primary" onClick={() => mutation.mutate()} disabled={mutation.isPending}><TerminalSquare size={16} />{mutation.isPending ? "Issuing..." : "New enrollment"}</button>
+            {canRevoke && <button className="button button-danger" onClick={() => { if (window.confirm("Revoke this enrollment URL?")) revoke.mutate(); }} disabled={revoke.isPending}><ShieldAlert size={15} />Revoke</button>}
+            <button className="button button-danger" onClick={openDelete} disabled={deletePreflightMutation.isPending || deleteStore.isPending}><Trash2 size={15} />Delete store</button>
+          </div>}
+        </div>}
+        {tab === "ingress" && <div className="store-drawer-tab">
+          <section className="store-drawer-section publication-summary"><header className="store-section-heading"><div><h3>Published endpoints</h3><span>{currentStore.publications.length} hostname{currentStore.publications.length === 1 ? "" : "s"}</span></div><button className="button button-secondary" type="button" onClick={() => onEditConnectivity(currentStore)}><Settings2 size={15} />Edit connectivity</button></header>{currentStore.publications.map((publication) => <div className="publication-summary-item" key={publication.id}><div className="publication-summary-head"><code>{publication.hostname}</code><StatusBadge status={publication.status} /></div>{publication.routes.map((route) => <div className="publication-route" key={route.id}><code>{route.path}</code><span>→</span><code>{route.kind === "command_agent" ? "Cloudflare Man command agent" : route.serviceUrl}</code><button className="button button-secondary publication-verify-button" type="button" onClick={() => verify.mutate(route.id)} disabled={verify.isPending}><CheckCircle2 size={15} />{verify.isPending && verify.variables === route.id ? "Checking..." : "Verify endpoint"}</button></div>)}</div>)}</section>
+        </div>}
+        {tab === "connect" && <div className="store-drawer-tab store-connect-tab">
+          <section className="store-drawer-section rdp-section"><header className="store-section-heading"><div><h3>Remote desktop</h3><span>{currentStore.rdpUrl ? new URL(currentStore.rdpUrl).hostname : "Browser RDP gateway"}</span></div><StatusBadge status={currentStore.rdpStatus} /></header><dl className="detail-list"><div><dt>Target</dt><dd className="mono">{currentStore.rdpTargetIp ? `${currentStore.rdpTargetIp}:3389` : "Awaiting Windows installer"}</dd></div><div><dt>Gateway</dt><dd className="mono">{currentStore.rdpUrl ?? "Not provisioned"}</dd></div></dl>{currentStore.rdpLastError && <div className="inline-alert">{currentStore.rdpLastError}</div>}<div className="detail-actions">{currentStore.rdpStatus === "ready" && currentStore.rdpUrl && <a className="button button-primary" href={currentStore.rdpUrl} target="_blank" rel="noreferrer"><MonitorUp size={16} />Remote desktop</a>}{currentStore.rdpTargetIp && currentStore.rdpStatus !== "ready" && <button className="button button-secondary" onClick={() => retryRdp.mutate()} disabled={retryRdp.isPending}><RefreshCw size={15} />{retryRdp.isPending ? "Retrying..." : "Retry RDP"}</button>}</div></section>
+          {currentStore.commandAgent ? <CommandExecutionPanel store={currentStore} /> : <div className="inline-alert">This store does not have a command agent endpoint.</div>}
         </div>}
       </div>}
-    </Modal>
+    </SideDrawer>
     <StoreDeleteDialog open={deleteOpen} preflight={deletePreflight} loading={deletePreflightMutation.isPending} confirmationName={deleteName} onConfirmationNameChange={setDeleteName} onClose={() => { setDeleteOpen(false); setDeletePreflight(null); setDeleteName(""); }} onConfirm={() => deleteStore.mutate()} deleting={deleteStore.isPending} />
     <Modal open={Boolean(logEnrollment)} title={`Enrollment log · ${logEnrollment ? new Date(logEnrollment.createdAt).toLocaleString() : ""}`} onClose={() => setLogEnrollment(null)} width="wide">
       {logsLoading ? <div className="quiet-empty">Loading logs...</div> : logData?.logs.length ? <div className="enrollment-log-list">{logData.logs.map((log) => <article key={log.id} className={`enrollment-log enrollment-log-${log.level}`}><header><StatusBadge status={log.level} /><strong>{log.step ?? "installer"}</strong><time>{new Date(log.createdAt).toLocaleString()}</time></header><p>{log.message}</p></article>)}</div> : <div className="quiet-empty">No logs have been reported for this enrollment.</div>}
@@ -225,16 +255,30 @@ function StoreDeleteDialog({
   </Modal>;
 }
 
-function EnrollmentHistory({ enrollments, onViewLog }: { enrollments: StoreEnrollment[]; onViewLog: (enrollment: StoreEnrollment) => void }) {
+function EnrollmentHistory({ enrollments, onViewLog, onDelete, onUnenroll, deleting, unenrolling }: { enrollments: StoreEnrollment[]; onViewLog: (enrollment: StoreEnrollment) => void; onDelete: (enrollment: StoreEnrollment) => void; onUnenroll: (enrollment: StoreEnrollment) => void; deleting: boolean; unenrolling: boolean }) {
   return <section className="enrollment-history"><header><h3>Enrollment history</h3><span>{enrollments.length} attempt{enrollments.length === 1 ? "" : "s"}</span></header>{enrollments.length ? <div className="enrollment-history-list">{enrollments.map((enrollment) => {
-    const runStatus = enrollmentRunStatus(enrollment);
     const environment = enrollmentEnvironment(enrollment);
+    const displayStatus = enrollmentDisplayStatus(enrollment);
+    const displayTime = enrollmentDisplayTime(enrollment, displayStatus);
     return <div className="enrollment-history-row" key={enrollment.id}>
-      <div className="enrollment-history-field"><span className="enrollment-history-label">Run status</span><StatusBadge status={runStatus} /></div>
-      <div className="enrollment-history-field"><span className="enrollment-history-label">Environment</span><span className="enrollment-environment"><Monitor size={15} />{environment}</span></div>
-      <button className="button button-secondary enrollment-log-button" type="button" onClick={() => onViewLog(enrollment)}><ScrollText size={15} />View log</button>
+      <div className="enrollment-history-field enrollment-computer-field"><div className="enrollment-computer-summary" title={environment} aria-label={`${environment} · ${enrollmentComputerName(enrollment)}`}><span className="enrollment-platform-icon">{enrollmentPlatformIcon(enrollment)}</span><strong>{enrollmentComputerName(enrollment)}</strong></div></div>
+      <div className="enrollment-history-field enrollment-status-cell"><StatusBadge status={displayStatus} />{enrollment.isCurrent && <button className="text-link enrollment-unenroll-link" type="button" onClick={() => onUnenroll(enrollment)} disabled={unenrolling}>{unenrolling ? "Issuing..." : "Unenroll"}</button>}</div>
+      <time className="enrollment-event-time" dateTime={displayTime ?? undefined}>{displayTime ? new Date(displayTime).toLocaleString() : "-"}</time>
+      <div className="enrollment-history-actions"><button className="button button-secondary enrollment-log-button" type="button" onClick={() => onViewLog(enrollment)}><ScrollText size={15} />View log</button>{!enrollment.isCurrent && !enrollment.deletedAt ? <button className="icon-button enrollment-delete-button" type="button" title="Delete enrollment" aria-label={`Delete enrollment for ${enrollmentComputerName(enrollment)}`} onClick={() => onDelete(enrollment)} disabled={deleting}><Trash2 size={15} /></button> : <span className="enrollment-delete-placeholder" aria-hidden="true" />}</div>
     </div>;
   })}</div> : <div className="quiet-empty">No enrollment links have been issued for this store.</div>}</section>;
+}
+
+function enrollmentComputerName(enrollment: StoreEnrollment): string {
+  return enrollment.computerName ?? enrollment.hostInfo.machineName ?? "N/A";
+}
+
+function enrollmentPlatformIcon(enrollment: StoreEnrollment) {
+  switch (enrollment.environment ?? enrollment.platform) {
+    case "darwin": return <Apple size={19} />;
+    case "linux": return <Server size={19} />;
+    default: return <Monitor size={19} />;
+  }
 }
 
 function enrollmentRunStatus(enrollment: StoreEnrollment): "never_run" | "running" | "success" | "failed" {
@@ -243,6 +287,28 @@ function enrollmentRunStatus(enrollment: StoreEnrollment): "never_run" | "runnin
   if (installScripts.some((script) => script.status === "running") || ["claimed", "provisioning", "ready"].includes(enrollment.status)) return "running";
   if (installScripts.some((script) => script.status === "completed") || enrollment.status === "installed") return "success";
   return "never_run";
+}
+
+function enrollmentDisplayStatus(enrollment: StoreEnrollment): string {
+  if (enrollment.deletedAt) return "deleted";
+  if (enrollment.isCurrent) return "connected";
+  if (enrollment.unenrollStatus === "unenrolled") return "unenrolled";
+  if (enrollment.unenrollStatus === "failed") return "unenroll_failed";
+  if (enrollment.unenrollStatus === "pending") return "unenroll_pending";
+  if (enrollmentRunStatus(enrollment) === "never_run" && (enrollment.status === "expired" || new Date(enrollment.expiresAt).getTime() <= Date.now())) return "staled";
+  return enrollmentRunStatus(enrollment);
+}
+
+function enrollmentDisplayTime(enrollment: StoreEnrollment, status: string): string | null {
+  if (status === "deleted") return enrollment.deletedAt;
+  if (status === "connected") return enrollment.installedAt ?? enrollment.claimedAt ?? enrollment.createdAt;
+  if (status === "unenrolled") return enrollment.unenrolledAt;
+  if (status === "unenroll_pending" || status === "unenroll_failed") return enrollment.unenrollRequestedAt;
+  if (status === "never_run" || status === "staled") return enrollment.createdAt;
+  if (status === "running") return enrollment.claimedAt ?? enrollment.createdAt;
+  if (status === "success") return enrollment.installedAt ?? enrollment.createdAt;
+  const finishedScript = enrollment.scripts.find((script) => script.status === "failed" && script.finishedAt);
+  return finishedScript?.finishedAt ?? enrollment.claimedAt ?? enrollment.createdAt;
 }
 
 function enrollmentEnvironment(enrollment: StoreEnrollment): string {
@@ -274,18 +340,6 @@ const quickScriptDefaults = {
   unix: "printf 'Store: %s\\n' \"$(hostname)\"\n"
 };
 
-function CommandAgentModal({ store, onClose }: { store: Store | null; onClose: () => void }) {
-  const { data, isLoading } = useQuery({
-    queryKey: ["command-agent-store-detail", store?.id],
-    queryFn: () => api.get<{ store: Store }>(`/api/stores/${store!.id}`),
-    enabled: Boolean(store),
-    refetchInterval: (query) => query.state.data?.store.commandExecutions?.some((execution) => execution.status === "running") ? 1500 : false
-  });
-  return <Modal open={Boolean(store)} title={`Command console · ${store?.displayName ?? "Store"}`} onClose={onClose} width="extra-wide">
-    {isLoading && !data ? <div className="quiet-empty">Loading command agent...</div> : data?.store.commandAgent ? <CommandExecutionPanel store={data.store} /> : <div className="inline-alert">This store does not have a command agent endpoint.</div>}
-  </Modal>;
-}
-
 function CommandExecutionPanel({ store }: { store: Store }) {
   const queryClient = useQueryClient();
   const [selectedScriptId, setSelectedScriptId] = useState("");
@@ -297,7 +351,7 @@ function CommandExecutionPanel({ store }: { store: Store }) {
   const [quickLanguage, setQuickLanguage] = useState<"powershell" | "bash" | "sh">("powershell");
   const [quickDescription, setQuickDescription] = useState("");
   const [quickContent, setQuickContent] = useState(quickScriptDefaults.windows);
-  const activeEnrollment = [...(store.enrollments ?? [])].filter((enrollment) => ["ready", "installed"].includes(enrollment.status) && enrollment.unenrolledAt === null).sort((left, right) => new Date(right.installedAt ?? right.createdAt).getTime() - new Date(left.installedAt ?? left.createdAt).getTime())[0];
+  const activeEnrollment = [...(store.enrollments ?? [])].filter((enrollment) => enrollment.isCurrent && ["ready", "installed"].includes(enrollment.status) && enrollment.unenrolledAt === null && enrollment.deletedAt === null).sort((left, right) => new Date(right.installedAt ?? right.createdAt).getTime() - new Date(left.installedAt ?? left.createdAt).getTime())[0];
   const hostPlatform = activeEnrollment?.platform ?? null;
   const { data: scriptData } = useQuery({
     queryKey: ["scripts", "command-agent", hostPlatform],
@@ -353,16 +407,16 @@ function CommandExecutionPanel({ store }: { store: Store }) {
     onSuccess: async (response) => {
       setResult(response);
       await Promise.all([
-        queryClient.invalidateQueries({ queryKey: ["command-agent-store-detail", store.id] }),
-        queryClient.invalidateQueries({ queryKey: ["store-detail", store.id] })
+        queryClient.invalidateQueries({ queryKey: ["store-detail", store.id] }),
+        queryClient.invalidateQueries({ queryKey: ["stores"] })
       ]);
       if (response.success) toast.success("Script completed successfully");
       else toast.error(`Script exited with code ${response.exitCode ?? "timeout"}`);
     },
     onError: async (error) => {
       await Promise.all([
-        queryClient.invalidateQueries({ queryKey: ["command-agent-store-detail", store.id] }),
-        queryClient.invalidateQueries({ queryKey: ["store-detail", store.id] })
+        queryClient.invalidateQueries({ queryKey: ["store-detail", store.id] }),
+        queryClient.invalidateQueries({ queryKey: ["stores"] })
       ]);
       toast.error(error instanceof Error ? error.message : "Unable to execute script");
     }
@@ -376,7 +430,7 @@ function CommandExecutionPanel({ store }: { store: Store }) {
     {!hostPlatform ? <div className="inline-alert">An active enrollment is required before running a saved script.</div> : <div className="command-script-picker"><label className="field"><span className="field-label">Saved script <FieldHelp text="Only scripts compatible with the platform reported by this store's active enrollment are listed." /></span><div className="command-script-select-line"><select value={selectedScriptId} onChange={(event) => { setSelectedScriptId(event.target.value); setSelectedVersionId(""); }}>{scriptOptions.length === 0 && <option value="">No compatible scripts</option>}{scriptOptions.map((script) => <option value={script.id} key={script.id}>{script.name} · {script.platform}</option>)}</select><Link className="text-link" to="/scripts">Manage scripts</Link><button className="button button-secondary quick-create-button" type="button" onClick={openQuickCreate}><FilePlus2 size={14} />Quick create new</button></div></label><label className="field"><span className="field-label">Version <FieldHelp text="Select the exact immutable script version to execute. The execution history retains this version reference." /></span><select value={selectedVersionId} onChange={(event) => setSelectedVersionId(event.target.value)}>{!selectedScript?.versions.length && <option value="">No version available</option>}{selectedScript?.versions.map((version) => <option value={version.id} key={version.id}>Version {version.version}</option>)}</select></label><label className="field"><span className="field-label">Timeout (seconds) <FieldHelp text="The maximum time the command agent may let this script run before terminating it. Allowed range: 1 to 300 seconds." /></span><input type="number" min={1} max={300} value={timeoutSeconds} onChange={(event) => setTimeoutSeconds(Math.min(300, Math.max(1, Number(event.target.value) || 1)))} /></label><button className="button button-primary command-execute-button" type="button" disabled={!selectedVersionId || execute.isPending || !hostPlatform} onClick={() => execute.mutate()}><TerminalSquare size={15} />{execute.isPending ? "Executing..." : "Execute script"}</button></div>}
     {quickCreateOpen && <div className="command-quick-create"><header><div><strong>Quick create new script</strong><span>{hostPlatform === "windows" ? "PowerShell" : "Unix shell"} script for the active enrollment</span></div><button className="button button-secondary" type="button" onClick={() => setQuickCreateOpen(false)}>Cancel</button></header><div className="script-metadata-grid command-quick-create-fields"><label className="field"><span className="field-label">Name <FieldHelp text="The reusable script name shown in the script picker. Names must be unique within the platform." /></span><input value={quickName} onChange={(event) => setQuickName(event.target.value)} placeholder="Store health check" /></label><label className="field"><span className="field-label">Language</span><select value={quickLanguage} onChange={(event) => setQuickLanguage(event.target.value as typeof quickLanguage)}>{hostPlatform === "windows" ? <option value="powershell">PowerShell</option> : <><option value="bash">Bash</option><option value="sh">POSIX sh</option></>}</select></label><label className="field"><span className="field-label">Description</span><input value={quickDescription} onChange={(event) => setQuickDescription(event.target.value)} placeholder="Optional description" /></label></div><ScriptEditor value={quickContent} language={quickLanguage} height="240px" onChange={setQuickContent} /><div className="form-actions"><span className="script-editor-hint">Creates version 1 and selects it for this run</span><button className="button button-primary" type="button" disabled={!quickName.trim() || !quickContent.trim() || quickCreate.isPending} onClick={() => quickCreate.mutate()}><Save size={15} />{quickCreate.isPending ? "Saving..." : "Save script"}</button></div></div>}
     {result && <div className="command-result"><header><StatusBadge status={result.success ? "completed" : "failed"} /><span>Exit {result.exitCode ?? "timeout"} · {result.durationMs} ms</span></header>{result.stdout && <div><strong>stdout</strong><pre>{result.stdout}</pre></div>}{result.stderr && <div><strong>stderr</strong><pre>{result.stderr}</pre></div>}{!result.stdout && !result.stderr && <div className="quiet-empty">The script produced no output.</div>}</div>}
-    <div className="command-execution-history"><header><h4>Execution history</h4><span>{executions.length} run{executions.length === 1 ? "" : "s"}</span></header>{executions.length ? executions.map((execution: StoreCommandExecution) => { const enrollment = execution.enrollmentId ? enrollmentById.get(execution.enrollmentId) : undefined; const environment = enrollment ? enrollmentEnvironment(enrollment) : "Enrollment unavailable"; const machine = enrollment?.hostInfo.machineName; return <details className="command-execution" key={execution.id}><summary><span><StatusBadge status={execution.status} /><code>{execution.scriptName ?? "Saved script"} {execution.scriptVersion ? `v${execution.scriptVersion}` : ""} · {environment}{machine ? ` · ${machine}` : ""}</code></span><span>{execution.elapsedMs !== null ? `${execution.elapsedMs} ms` : execution.status === "running" ? "running" : "-"}</span></summary><div className="command-execution-body"><code>{execution.enrollmentId ? `Enrollment ${execution.enrollmentId}` : "Enrollment unavailable"}</code><code>{new Date(execution.startedAt).toLocaleString()}</code><code>{execution.script}</code>{execution.error && <div className="inline-alert">{execution.error}</div>}{execution.stdout && <div><strong>stdout</strong><pre>{execution.stdout}</pre></div>}{execution.stderr && <div><strong>stderr</strong><pre>{execution.stderr}</pre></div>}{!execution.stdout && !execution.stderr && !execution.error && <div className="quiet-empty">The script produced no output.</div>}</div></details>; }) : <div className="quiet-empty">No scripts have been executed for this store.</div>}</div>
+    <div className="command-execution-history"><header><h4>Execution history</h4><span>{executions.length} run{executions.length === 1 ? "" : "s"}</span></header>{executions.length ? executions.map((execution: StoreCommandExecution) => { const enrollment = execution.enrollmentId ? enrollmentById.get(execution.enrollmentId) : undefined; const environment = enrollment ? enrollmentEnvironment(enrollment) : "Enrollment unavailable"; const computerName = enrollment ? enrollmentComputerName(enrollment) : "Enrollment unavailable"; return <details className="command-execution" key={execution.id}><summary><span><StatusBadge status={execution.status} /><code>{execution.scriptName ?? "Saved script"} {execution.scriptVersion ? `v${execution.scriptVersion}` : ""} · {computerName} · {environment}</code></span><span>{execution.elapsedMs !== null ? `${execution.elapsedMs} ms` : execution.status === "running" ? "running" : "-"}</span></summary><div className="command-execution-body"><code>{computerName}</code><code>{new Date(execution.startedAt).toLocaleString()}</code><code>{execution.script}</code>{execution.error && <div className="inline-alert">{execution.error}</div>}{execution.stdout && <div><strong>stdout</strong><pre>{execution.stdout}</pre></div>}{execution.stderr && <div><strong>stderr</strong><pre>{execution.stderr}</pre></div>}{!execution.stdout && !execution.stderr && !execution.error && <div className="quiet-empty">The script produced no output.</div>}</div></details>; }) : <div className="quiet-empty">No scripts have been executed for this store.</div>}</div>
   </section>;
 }
 
@@ -446,4 +500,18 @@ export function EnrollmentCommands({ result }: { result: EnrollmentResult }) {
     {cleanupCommands.length > 0 && <div className="unenroll-command-panel"><div className="command-note"><ShieldAlert size={14} />A running tunnel instance was found. Run the cleanup command on the old store machine before installing this new link.</div>{cleanupCommands.map((cleanup) => { const cleanupCommand = commandFor(cleanup.urls); return <div className="command-section" key={cleanup.enrollmentId}><div className="command-head"><strong>Unenroll instance created {new Date(cleanup.createdAt).toLocaleString()}</strong><CopyButton value={cleanupCommand} label="Copy cleanup command" /></div><pre><code>{cleanupCommand}</code></pre>{platform === "windows" && <div className="command-note"><ShieldAlert size={14} />Run PowerShell as Administrator.</div>}<div className="expiry-line">Cleanup link expires {new Date(cleanup.expiresAt).toLocaleString()}</div></div>; })}</div>}
     <div className="command-section"><div className="command-head"><div className="segmented compact"><button type="button" className={platform === "windows" ? "active" : ""} onClick={() => setPlatform("windows")}>PowerShell</button><button type="button" className={platform === "unix" ? "active" : ""} onClick={() => setPlatform("unix")}>Bash</button></div><CopyButton value={command} label="Copy command" /></div><pre><code>{command}</code></pre>{platform === "windows" && <div className="command-note"><ShieldAlert size={14} />Run PowerShell as Administrator.</div>}<div className="expiry-line">Expires {new Date(result.expiresAt).toLocaleString()}</div></div>
   </div>;
+}
+
+function UnenrollmentCommands({ result }: { result: UnenrollmentResult }) {
+  const [platform, setPlatform] = useState<"windows" | "unix">("windows");
+  const { data } = useQuery({ queryKey: ["settings"], queryFn: () => api.get<{ settings: AppSettings }>("/api/settings") });
+  const withCurrentBaseUrl = (value: string) => {
+    if (!data?.settings.publicBaseUrl) return value;
+    const url = new URL(value);
+    return `${data.settings.publicBaseUrl}${url.pathname}${url.search}`;
+  };
+  const powershellUrl = withCurrentBaseUrl(result.urls.powershell);
+  const shellUrl = withCurrentBaseUrl(result.urls.shell);
+  const command = platform === "windows" ? `irm '${powershellUrl}' | iex` : `curl -fsSL '${shellUrl}' | sudo bash`;
+  return <div className="unenroll-command-panel"><div className="command-note"><ShieldAlert size={14} />Run this cleanup command on the connected store machine. It expires {new Date(result.expiresAt).toLocaleString()}.</div><div className="command-head"><div className="segmented compact"><button type="button" className={platform === "windows" ? "active" : ""} onClick={() => setPlatform("windows")}>PowerShell</button><button type="button" className={platform === "unix" ? "active" : ""} onClick={() => setPlatform("unix")}>Bash</button></div><CopyButton value={command} label="Copy unenroll command" /></div><pre><code>{command}</code></pre>{platform === "windows" && <div className="command-note"><ShieldAlert size={14} />Run PowerShell as Administrator.</div>}</div>;
 }

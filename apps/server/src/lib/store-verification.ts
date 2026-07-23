@@ -4,7 +4,9 @@ import { checkStoreEndpoint, type EndpointCheck } from "./monitor.js";
 
 export type StoreEndpointVerification = {
   publicationId: string | null;
+  routeId?: string | null;
   hostname: string;
+  path?: string;
   check: EndpointCheck;
 };
 
@@ -16,6 +18,8 @@ export type StoreVerificationResult = {
 
 type VerificationOptions = {
   actorUserId?: string;
+  publicationId?: string;
+  routeId?: string;
   attempts?: number;
   retryDelayMs?: number;
 };
@@ -27,15 +31,20 @@ export async function verifyStoreEndpoints(
   const store = await pool.query("SELECT id, hostname FROM stores WHERE id = $1", [storeId]);
   if (!store.rowCount) return null;
 
-  const publications = await pool.query(
-    "SELECT id, hostname FROM store_publications WHERE store_id = $1 ORDER BY created_at",
-    [storeId]
-  );
-  const targets = publications.rowCount ? publications.rows : [{ id: null, hostname: store.rows[0].hostname }];
+  const publications = options.routeId
+    ? await pool.query("SELECT p.id, p.hostname, r.id AS route_id, r.path FROM store_publications p JOIN store_routes r ON r.publication_id = p.id WHERE p.store_id = $1 AND r.id = $2", [storeId, options.routeId])
+    : options.publicationId
+      ? await pool.query("SELECT id, hostname, null::uuid AS route_id, '/' AS path FROM store_publications WHERE store_id = $1 AND id = $2", [storeId, options.publicationId])
+      : await pool.query("SELECT id, hostname, null::uuid AS route_id, '/' AS path FROM store_publications WHERE store_id = $1 ORDER BY created_at", [storeId]);
+  if ((options.routeId || options.publicationId) && !publications.rowCount) return null;
+  const targets = publications.rowCount ? publications.rows : [{ id: null, route_id: null, hostname: store.rows[0].hostname, path: "/" }];
   const checks = await Promise.all(targets.map(async (target) => ({
     publicationId: target.id as string | null,
+    routeId: target.route_id as string | null,
     hostname: target.hostname as string,
+    path: target.path as string,
     check: await checkStoreEndpoint(target.hostname, {
+      path: target.path as string,
       attempts: options.attempts,
       retryDelayMs: options.retryDelayMs
     })
@@ -47,11 +56,16 @@ export async function verifyStoreEndpoints(
   )));
   const success = checks.every((item) => item.check.reachable);
   if (success) {
+    const remainingFailed = options.publicationId || options.routeId
+      ? await pool.query("SELECT 1 FROM store_publications WHERE store_id = $1 AND status <> 'active' LIMIT 1", [storeId])
+      : { rowCount: 0 };
     await pool.query(
-      `UPDATE stores SET last_verified_at = now(), last_error = null,
-              tunnel_status = 'healthy',
-              onboarding_status = CASE WHEN onboarding_status IN ('connector_online', 'verified') THEN 'verified' ELSE onboarding_status END,
-              updated_at = now() WHERE id = $1`,
+      (options.publicationId || options.routeId) && remainingFailed.rowCount
+        ? "UPDATE stores SET last_verified_at = now(), last_error = null, updated_at = now() WHERE id = $1"
+        : `UPDATE stores SET last_verified_at = now(), last_error = null,
+                tunnel_status = 'healthy',
+                onboarding_status = CASE WHEN onboarding_status IN ('connector_online', 'verified') THEN 'verified' ELSE onboarding_status END,
+                updated_at = now() WHERE id = $1`,
       [storeId]
     );
   } else {

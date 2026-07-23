@@ -7,6 +7,7 @@ export type EndpointCheck = {
 };
 
 type CheckOptions = {
+  path?: string | undefined;
   attempts?: number | undefined;
   retryDelayMs?: number | undefined;
   timeoutMs?: number | undefined;
@@ -22,30 +23,37 @@ export async function checkStoreEndpoint(hostname: string, options: CheckOptions
   const retryDelayMs = Math.max(0, options.retryDelayMs ?? 1_000);
   const timeoutMs = Math.max(1, options.timeoutMs ?? 10_000);
   let lastError = "Endpoint check failed";
+  let lastStatus: number | null = null;
 
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
     try {
-      const response = await fetch(`https://${hostname}/`, {
+      const path = options.path?.startsWith("/") ? options.path : `/${options.path ?? ""}`;
+      const response = await fetch(`https://${hostname}${path}`, {
         method: "GET",
         redirect: "manual",
         headers: { Accept: "*/*", "User-Agent": "cloudflare-man-monitor/0.1" },
         signal: AbortSignal.timeout(timeoutMs)
       });
-      return {
-        reachable: true,
-        statusCode: response.status,
-        latencyMs: Date.now() - startedAt,
-        attempts: attempt
-      };
+      lastStatus = response.status;
+      if (response.status < 500) {
+        return {
+          reachable: true,
+          statusCode: response.status,
+          latencyMs: Date.now() - startedAt,
+          attempts: attempt
+        };
+      }
+      lastError = `Endpoint returned HTTP ${response.status}`;
     } catch (error) {
       lastError = error instanceof Error ? error.message : "Endpoint check failed";
+      lastStatus = null;
       if (attempt < attempts && retryDelayMs > 0) await wait(retryDelayMs);
     }
   }
 
   return {
     reachable: false,
-    statusCode: null,
+    statusCode: lastStatus,
     latencyMs: Date.now() - startedAt,
     attempts,
     error: lastError

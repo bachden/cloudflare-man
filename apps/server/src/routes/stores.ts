@@ -175,12 +175,14 @@ async function loadStoreDeleteContext(executor: StoreDeleteExecutor, storeId: st
             (SELECT count(*)::int FROM enrollments e
               WHERE e.store_id = s.id
                 AND e.status IN ('claimed', 'provisioning', 'ready', 'installed')
-                AND e.unenrolled_at IS NULL) AS "activeEnrollmentCount",
+                AND e.unenrolled_at IS NULL
+                AND e.deleted_at IS NULL) AS "activeEnrollmentCount",
             (SELECT string_agg(COALESCE(e.platform, 'unknown'), ', ' ORDER BY e.created_at)
                FROM enrollments e
               WHERE e.store_id = s.id
                 AND e.status IN ('claimed', 'provisioning', 'ready', 'installed')
-                AND e.unenrolled_at IS NULL) AS "activeEnrollmentPlatforms",
+                AND e.unenrolled_at IS NULL
+                AND e.deleted_at IS NULL) AS "activeEnrollmentPlatforms",
             (SELECT count(*)::int FROM store_command_executions ce
               WHERE ce.store_id = s.id AND ce.status = 'running') AS "runningCommandCount",
             ca.status AS "commandAgentStatus", ca.last_seen_at AS "commandAgentLastSeenAt"
@@ -295,7 +297,22 @@ const publicationsJson = `COALESCE((
 
 const enrollmentsJson = `COALESCE((
   SELECT jsonb_agg(jsonb_build_object(
-    'id', e.id,
+            'id', e.id,
+    'computerName', NULLIF(e.host_info->>'machineName', ''),
+    'isCurrent', e.deleted_at IS NULL
+      AND e.unenrolled_at IS NULL
+      AND e.status IN ('ready', 'installed')
+      AND e.id = (
+        SELECT current_enrollment.id
+          FROM enrollments current_enrollment
+         WHERE current_enrollment.store_id = s.id
+           AND current_enrollment.deleted_at IS NULL
+           AND current_enrollment.unenrolled_at IS NULL
+           AND current_enrollment.status IN ('ready', 'installed')
+         ORDER BY COALESCE(current_enrollment.installed_at, current_enrollment.claimed_at, current_enrollment.created_at) DESC
+         LIMIT 1
+      ),
+    'deletedAt', e.deleted_at,
     'status', e.status,
     'platform', CASE WHEN e.platform = 'windows' THEN 'windows' WHEN e.platform IS NOT NULL THEN 'unix' ELSE null END,
     'environment', e.platform,
@@ -311,6 +328,7 @@ const enrollmentsJson = `COALESCE((
       WHEN e.unenroll_token_hash IS NOT NULL THEN 'pending'
       ELSE 'not_required'
     END,
+    'unenrollReason', e.unenroll_reason,
     'unenrollRequestedAt', e.unenroll_requested_at,
     'unenrolledAt', e.unenrolled_at,
     'logCount', (SELECT count(*)::int FROM enrollment_logs l WHERE l.enrollment_id = e.id),
@@ -468,6 +486,123 @@ export async function storeRoutes(app: FastifyInstance): Promise<void> {
     return { store: result.rows[0] };
   });
 
+  app.delete("/api/stores/:storeId/enrollments/:enrollmentId", { preHandler: requireAuth }, async (request, reply) => {
+    const { storeId, enrollmentId } = z.object({
+      storeId: z.string().uuid(),
+      enrollmentId: z.string().uuid()
+    }).parse(request.params);
+    const deleted = await withTransaction(async (client) => {
+      const result = await client.query(
+        `SELECT e.id, e.deleted_at,
+                e.deleted_at IS NULL
+                AND e.unenrolled_at IS NULL
+                AND e.status IN ('ready', 'installed')
+                AND e.id = (
+                  SELECT current_enrollment.id
+                    FROM enrollments current_enrollment
+                   WHERE current_enrollment.store_id = e.store_id
+                     AND current_enrollment.deleted_at IS NULL
+                     AND current_enrollment.unenrolled_at IS NULL
+                     AND current_enrollment.status IN ('ready', 'installed')
+                   ORDER BY COALESCE(current_enrollment.installed_at, current_enrollment.claimed_at, current_enrollment.created_at) DESC
+                   LIMIT 1
+                ) AS is_current
+           FROM enrollments e
+          WHERE e.store_id = $1 AND e.id = $2
+          FOR UPDATE`,
+        [storeId, enrollmentId]
+      );
+      const enrollment = result.rows[0];
+      if (!enrollment) return { kind: "missing" as const };
+      if (enrollment.is_current) return { kind: "current" as const };
+      if (enrollment.deleted_at) return { kind: "already_deleted" as const, deletedAt: enrollment.deleted_at as string };
+      const updated = await client.query(
+        `UPDATE enrollments
+            SET deleted_at = now(), deleted_by = $3, updated_at = now()
+          WHERE store_id = $1 AND id = $2
+          RETURNING deleted_at`,
+        [storeId, enrollmentId, request.authUser!.id]
+      );
+      await writeAudit({
+        actorUserId: request.authUser!.id,
+        action: "enrollment.deleted",
+        entityType: "enrollment",
+        entityId: enrollmentId,
+        details: { storeId, softDelete: true }
+      }, client);
+      return { kind: "deleted" as const, deletedAt: updated.rows[0].deleted_at as string };
+    });
+    if (deleted.kind === "missing") return reply.code(404).send({ error: "Enrollment not found" });
+    if (deleted.kind === "current") return reply.code(409).send({ error: "The current connected enrollment cannot be deleted" });
+    return { success: true, deletedAt: deleted.deletedAt, alreadyDeleted: deleted.kind === "already_deleted" };
+  });
+
+  app.post("/api/stores/:storeId/enrollments/:enrollmentId/unenroll", { preHandler: requireAuth }, async (request, reply) => {
+    const { storeId, enrollmentId } = z.object({
+      storeId: z.string().uuid(),
+      enrollmentId: z.string().uuid()
+    }).parse(request.params);
+    const body = enrollmentSchema.parse(request.body ?? {});
+    const rawToken = createOpaqueToken();
+    const expiresAt = new Date(Date.now() + body.expiresInHours * 60 * 60 * 1000);
+    const issued = await withTransaction(async (client) => {
+      const result = await client.query(
+        `SELECT e.id, e.created_at, e.status, e.unenrolled_at, e.deleted_at,
+                e.status IN ('ready', 'installed')
+                AND e.unenrolled_at IS NULL
+                AND e.deleted_at IS NULL
+                AND e.id = (
+                  SELECT current_enrollment.id
+                    FROM enrollments current_enrollment
+                   WHERE current_enrollment.store_id = e.store_id
+                     AND current_enrollment.deleted_at IS NULL
+                     AND current_enrollment.unenrolled_at IS NULL
+                     AND current_enrollment.status IN ('ready', 'installed')
+                   ORDER BY COALESCE(current_enrollment.installed_at, current_enrollment.claimed_at, current_enrollment.created_at) DESC
+                   LIMIT 1
+                ) AS is_current
+           FROM enrollments e
+          WHERE e.store_id = $1 AND e.id = $2
+          FOR UPDATE`,
+        [storeId, enrollmentId]
+      );
+      const enrollment = result.rows[0];
+      if (!enrollment) return { kind: "missing" as const };
+      if (!enrollment.is_current) return { kind: "not_current" as const };
+      await client.query(
+        `UPDATE enrollments
+            SET unenroll_token_hash = $1, unenroll_token_expires_at = $2,
+                unenroll_requested_at = now(), unenrolled_at = null,
+                unenroll_reason = null, unenroll_last_error = null, updated_at = now()
+          WHERE id = $3`,
+        [hashToken(rawToken), expiresAt, enrollmentId]
+      );
+      await client.query(
+        `INSERT INTO enrollment_scripts(enrollment_id, script_kind, platform, status)
+         VALUES ($1, 'unenroll', 'windows', 'available'), ($1, 'unenroll', 'unix', 'available')
+         ON CONFLICT (enrollment_id, script_kind, platform) DO UPDATE SET
+           status = 'available', started_at = null, finished_at = null, last_error = null, updated_at = now()`,
+        [enrollmentId]
+      );
+      await writeAudit({
+        actorUserId: request.authUser!.id,
+        action: "enrollment.unenroll_issued",
+        entityType: "enrollment",
+        entityId: enrollmentId,
+        details: { storeId, expiresAt }
+      }, client);
+      return { kind: "issued" as const, createdAt: enrollment.created_at as string };
+    });
+    if (issued.kind === "missing") return reply.code(404).send({ error: "Enrollment not found" });
+    if (issued.kind === "not_current") return reply.code(409).send({ error: "Only the current connected enrollment can be unenrolled" });
+    return {
+      enrollmentId,
+      createdAt: issued.createdAt,
+      expiresAt,
+      urls: await unenrollmentUrls(rawToken)
+    };
+  });
+
   app.get("/api/stores/:id/delete-preflight", { preHandler: requireAuth }, async (request, reply) => {
     const { id } = z.object({ id: z.string().uuid() }).parse(request.params);
     const context = await loadStoreDeleteContext(pool, id);
@@ -554,6 +689,7 @@ export async function storeRoutes(app: FastifyInstance): Promise<void> {
         WHERE store_id = $1
           AND status IN ('ready', 'installed')
           AND unenrolled_at IS NULL
+          AND deleted_at IS NULL
         ORDER BY COALESCE(installed_at, claimed_at, created_at) DESC
         LIMIT 1`,
       [id]
@@ -754,6 +890,7 @@ export async function storeRoutes(app: FastifyInstance): Promise<void> {
             WHERE store_id = $1
               AND status IN ('claimed', 'provisioning', 'ready', 'installed')
               AND unenrolled_at IS NULL
+              AND deleted_at IS NULL
             ORDER BY created_at DESC`,
           [id]
         );
@@ -850,8 +987,13 @@ export async function storeRoutes(app: FastifyInstance): Promise<void> {
 
   app.post("/api/stores/:id/verify", { preHandler: requireAuth }, async (request, reply) => {
     const { id } = z.object({ id: z.string().uuid() }).parse(request.params);
-    const result = await verifyStoreEndpoints(id, { actorUserId: request.authUser!.id });
-    if (!result) return reply.code(404).send({ error: "Store not found" });
+    const body = z.object({ publicationId: z.string().uuid().optional(), routeId: z.string().uuid().optional() }).parse(request.body ?? {});
+    const result = await verifyStoreEndpoints(id, {
+      actorUserId: request.authUser!.id,
+      ...(body.publicationId ? { publicationId: body.publicationId } : {}),
+      ...(body.routeId ? { routeId: body.routeId } : {})
+    });
+    if (!result) return reply.code(404).send({ error: body.routeId ? "Ingress route not found" : body.publicationId ? "Published endpoint not found" : "Store not found" });
     return result;
   });
 

@@ -20,6 +20,23 @@ test("retries a store endpoint while Cloudflare provisioning settles", async () 
   }
 });
 
+test("verifies a route path and treats server errors as unreachable", async () => {
+  const originalFetch = globalThis.fetch;
+  const requested: string[] = [];
+  globalThis.fetch = async (input) => {
+    requested.push(String(input));
+    return new Response("upstream failed", { status: 500 });
+  };
+  try {
+    const result = await checkStoreEndpoint("store.example.com", { path: "/api/health", attempts: 1, retryDelayMs: 0 });
+    assert.equal(requested[0], "https://store.example.com/api/health");
+    assert.equal(result.reachable, false);
+    assert.equal(result.statusCode, 500);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("waits for a browser RDP hostname to become an Access endpoint", async () => {
   const originalFetch = globalThis.fetch;
   let calls = 0;

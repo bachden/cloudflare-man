@@ -60,9 +60,10 @@ const unenrollReportSchema = z.object({
 async function findEnrollment(token: string) {
   const result = await pool.query(
     `SELECT e.id, e.store_id, e.status, e.expires_at, e.install_id, e.claimed_at, e.claimed_by, e.platform,
+            e.deleted_at,
             e.host_info, s.hostname
        FROM enrollments e JOIN stores s ON s.id = e.store_id
-      WHERE e.token_hash = $1`,
+      WHERE e.token_hash = $1 AND e.deleted_at IS NULL`,
     [hashToken(token)]
   );
   return result.rows[0];
@@ -70,9 +71,9 @@ async function findEnrollment(token: string) {
 
 async function findUnenrollment(token: string) {
   const result = await pool.query(
-    `SELECT e.id, e.store_id, e.status, e.unenroll_token_expires_at, e.unenrolled_at, s.hostname
+    `SELECT e.id, e.store_id, e.status, e.unenroll_token_expires_at, e.unenrolled_at, e.deleted_at, s.hostname
        FROM enrollments e JOIN stores s ON s.id = e.store_id
-      WHERE e.unenroll_token_hash = $1`,
+      WHERE e.unenroll_token_hash = $1 AND e.deleted_at IS NULL`,
     [hashToken(token)]
   );
   return result.rows[0];
@@ -966,6 +967,7 @@ export async function enrollmentRoutes(app: FastifyInstance): Promise<void> {
               updated_at = now()
         WHERE token_hash = $4
           AND status IN ('url_issued', 'failed', 'provisioning', 'ready')
+          AND deleted_at IS NULL
           AND expires_at > now()
           AND (claimed_at IS NULL OR install_id = $3 OR $5 = true)
       RETURNING id, store_id`,
@@ -995,6 +997,32 @@ export async function enrollmentRoutes(app: FastifyInstance): Promise<void> {
     }
 
     const scriptPlatform = normalizeScriptPlatform(body.platform)!;
+    if (body.overrideExisting) {
+      await pool.query(
+        `UPDATE enrollments
+            SET status = 'unenrolled', unenrolled_at = COALESCE(unenrolled_at, now()),
+                unenroll_reason = 'override', unenroll_token_hash = null,
+                unenroll_token_expires_at = null, unenroll_requested_at = null,
+                unenroll_last_error = null, updated_at = now()
+          WHERE store_id = $1
+            AND id <> $2
+            AND status IN ('claimed', 'provisioning', 'ready', 'installed')
+            AND unenrolled_at IS NULL
+            AND deleted_at IS NULL`,
+        [enrollment.store_id, enrollment.id]
+      );
+      await pool.query(
+        `UPDATE enrollment_scripts
+            SET status = 'staled_ignored', finished_at = COALESCE(finished_at, now()),
+                last_error = 'Skipped because a new enrollment overrode this instance', updated_at = now()
+          WHERE script_kind = 'unenroll'
+            AND enrollment_id IN (
+              SELECT id FROM enrollments
+               WHERE store_id = $2 AND id <> $1 AND unenroll_reason = 'override'
+            )`,
+        [enrollment.id, enrollment.store_id]
+      );
+    }
     await pool.query(
       `UPDATE enrollment_scripts
           SET status = CASE WHEN platform = $1 THEN 'running' ELSE 'staled_ignored' END,
@@ -1128,7 +1156,7 @@ export async function enrollmentRoutes(app: FastifyInstance): Promise<void> {
     await withTransaction(async (client) => {
       await client.query(
         `UPDATE enrollments
-            SET unenrolled_at = COALESCE(unenrolled_at, now()), unenroll_last_error = null, updated_at = now()
+            SET status = 'unenrolled', unenrolled_at = COALESCE(unenrolled_at, now()), unenroll_reason = 'script', unenroll_last_error = null, updated_at = now()
           WHERE id = $1`,
         [enrollment.id]
       );
@@ -1145,8 +1173,9 @@ export async function enrollmentRoutes(app: FastifyInstance): Promise<void> {
               SELECT 1 FROM enrollments active
                WHERE active.store_id = $1
                  AND active.id <> $2
-                 AND active.status IN ('claimed', 'provisioning', 'ready', 'installed')
-                 AND active.unenrolled_at IS NULL
+               AND active.status IN ('claimed', 'provisioning', 'ready', 'installed')
+               AND active.unenrolled_at IS NULL
+               AND active.deleted_at IS NULL
             )`,
         [enrollment.store_id, enrollment.id]
       );
