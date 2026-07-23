@@ -1,9 +1,12 @@
 import type { FastifyInstance } from "fastify";
+import type { PoolClient } from "pg";
 import { z } from "zod";
 import { writeAudit } from "../lib/audit.js";
 import { getPublicBaseUrl } from "../lib/app-settings.js";
 import { requireAuth } from "../lib/auth.js";
+import { CloudflareClient } from "../lib/cloudflare.js";
 import { pool, withTransaction } from "../lib/database.js";
+import { decryptSecret } from "../lib/security.js";
 import { reconfigureStore } from "../lib/provisioning.js";
 import { provisionBrowserRdp } from "../lib/rdp.js";
 import { verifyStoreEndpoints } from "../lib/store-verification.js";
@@ -14,12 +17,16 @@ import { createCommandExecution, executeStoreScript, getCommandAgentConfig, ensu
 const serviceUrlSchema = z.string().url().refine((value) => value.startsWith("http://") || value.startsWith("https://"), {
   message: "Service URL must use HTTP or HTTPS"
 });
+const optionalServiceUrlSchema = z.preprocess(
+  (value) => typeof value === "string" && value.trim() === "" ? undefined : value,
+  serviceUrlSchema.optional()
+);
 
 const routeKindSchema = z.enum(["service", "command_agent"]);
 const routeSchema = z.object({
   kind: routeKindSchema.default("service"),
   path: z.string().trim().min(1).max(200).regex(/^\//, "Path must start with /").transform(normalizePath),
-  serviceUrl: serviceUrlSchema.optional()
+  serviceUrl: optionalServiceUrlSchema
 }).superRefine((route, context) => {
   if (route.kind === "service" && !route.serviceUrl) {
     context.addIssue({ code: "custom", path: ["serviceUrl"], message: "A service URL is required" });
@@ -98,6 +105,50 @@ const executeScriptSchema = z.object({
   timeoutMs: z.number().int().min(1_000).max(300_000).default(60_000)
 });
 
+const deleteStoreSchema = z.object({
+  confirmName: z.string().trim().max(160).optional(),
+  force: z.boolean().default(false)
+});
+
+type StoreDeleteExecutor = Pick<PoolClient, "query">;
+type StoreDeleteContext = {
+  id: string;
+  displayName: string;
+  storeCode: string;
+  tunnelId: string | null;
+  tunnelStatus: string;
+  rdpRouteId: string | null;
+  rdpTargetId: string | null;
+  rdpVnetId: string | null;
+  providerMode: "live" | "mock";
+  accountRowId: string;
+  cfAccountId: string | null;
+  apiTokenEncrypted: string | null;
+  cfZoneId: string | null;
+  activeEnrollmentCount: number;
+  activeEnrollmentPlatforms: string | null;
+  runningCommandCount: number;
+  commandAgentStatus: string | null;
+  commandAgentLastSeenAt: string | null;
+  publications: Array<{ hostname: string; dnsRecordId: string | null }>;
+};
+
+type StoreDeleteCheck = {
+  id: "tunnel" | "enrollments" | "commands" | "cloudflare";
+  label: string;
+  ok: boolean;
+  detail: string;
+  resolution: string;
+};
+
+type StoreDeletePreflight = {
+  storeId: string;
+  displayName: string;
+  canDelete: boolean;
+  checks: StoreDeleteCheck[];
+  checkedAt: string;
+};
+
 async function enrollmentUrls(token: string) {
   const publicBaseUrl = await getPublicBaseUrl();
   return {
@@ -112,6 +163,114 @@ async function unenrollmentUrls(token: string) {
     shell: `${publicBaseUrl}/e/${token}/unenroll.sh`,
     powershell: `${publicBaseUrl}/e/${token}/unenroll.ps1`
   };
+}
+
+async function loadStoreDeleteContext(executor: StoreDeleteExecutor, storeId: string): Promise<StoreDeleteContext | null> {
+  const storeResult = await executor.query(
+    `SELECT s.id, s.display_name AS "displayName", s.store_code AS "storeCode",
+            s.tunnel_id AS "tunnelId", s.tunnel_status AS "tunnelStatus",
+            s.rdp_route_id AS "rdpRouteId", s.rdp_target_id AS "rdpTargetId", s.rdp_vnet_id AS "rdpVnetId",
+            a.id AS "accountRowId", a.provider_mode AS "providerMode", a.cf_account_id AS "cfAccountId",
+            a.api_token_encrypted AS "apiTokenEncrypted", z.cf_zone_id AS "cfZoneId",
+            (SELECT count(*)::int FROM enrollments e
+              WHERE e.store_id = s.id
+                AND e.status IN ('claimed', 'provisioning', 'ready', 'installed')
+                AND e.unenrolled_at IS NULL) AS "activeEnrollmentCount",
+            (SELECT string_agg(COALESCE(e.platform, 'unknown'), ', ' ORDER BY e.created_at)
+               FROM enrollments e
+              WHERE e.store_id = s.id
+                AND e.status IN ('claimed', 'provisioning', 'ready', 'installed')
+                AND e.unenrolled_at IS NULL) AS "activeEnrollmentPlatforms",
+            (SELECT count(*)::int FROM store_command_executions ce
+              WHERE ce.store_id = s.id AND ce.status = 'running') AS "runningCommandCount",
+            ca.status AS "commandAgentStatus", ca.last_seen_at AS "commandAgentLastSeenAt"
+       FROM stores s
+       JOIN cloudflare_accounts a ON a.id = s.account_id
+       JOIN zones z ON z.id = s.zone_id
+       LEFT JOIN store_command_agents ca ON ca.store_id = s.id
+      WHERE s.id = $1`,
+    [storeId]
+  );
+  if (!storeResult.rowCount) return null;
+  const publicationResult = await executor.query(
+    `SELECT hostname, dns_record_id AS "dnsRecordId"
+       FROM store_publications
+      WHERE store_id = $1
+      ORDER BY created_at`,
+    [storeId]
+  );
+  return { ...storeResult.rows[0], publications: publicationResult.rows } as StoreDeleteContext;
+}
+
+function buildStoreDeletePreflight(context: StoreDeleteContext): StoreDeletePreflight {
+  const activeTunnel = Boolean(context.tunnelId && ["healthy", "degraded", "connector_online"].includes(context.tunnelStatus));
+  const tunnelCheck: StoreDeleteCheck = {
+    id: "tunnel",
+    label: "Tunnel is disconnected",
+    ok: !activeTunnel,
+    detail: context.tunnelId ? `Tunnel ${context.tunnelId} is ${context.tunnelStatus}.` : "No Cloudflare Tunnel has been provisioned.",
+    resolution: activeTunnel
+      ? "Run the generated unenrollment command on the store, stop cloudflared if needed, then refresh this check. Force delete will terminate Cloudflare tunnel connections."
+      : "No action required."
+  };
+  const enrollmentCheck: StoreDeleteCheck = {
+    id: "enrollments",
+    label: "All installed enrollments are unenrolled",
+    ok: context.activeEnrollmentCount === 0,
+    detail: context.activeEnrollmentCount
+      ? `${context.activeEnrollmentCount} active enrollment${context.activeEnrollmentCount === 1 ? "" : "s"}${context.activeEnrollmentPlatforms ? ` (${context.activeEnrollmentPlatforms})` : ""}.`
+      : "No active installed enrollment remains.",
+    resolution: context.activeEnrollmentCount
+      ? "Open Enrollment history, run the matching Windows or Unix unenrollment command, and wait for the status to become unenrolled."
+      : "No action required."
+  };
+  const commandsCheck: StoreDeleteCheck = {
+    id: "commands",
+    label: "No command execution is running",
+    ok: context.runningCommandCount === 0,
+    detail: context.runningCommandCount
+      ? `${context.runningCommandCount} command execution${context.runningCommandCount === 1 ? " is" : "s are"} still running.`
+      : "No command execution is currently running.",
+    resolution: context.runningCommandCount
+      ? "Wait for the command to finish or fail. Force delete removes the local execution history and may interrupt the remote request."
+      : "No action required."
+  };
+  const cloudflareReady = context.providerMode === "mock" || Boolean(context.cfAccountId && context.cfZoneId && context.apiTokenEncrypted);
+  const cloudflareCheck: StoreDeleteCheck = {
+    id: "cloudflare",
+    label: "Cloudflare cleanup credentials are available",
+    ok: cloudflareReady,
+    detail: cloudflareReady ? `Store-owned DNS and tunnel resources can be cleaned from the ${context.providerMode} account.` : "The live account or zone is missing its API credentials.",
+    resolution: cloudflareReady
+      ? "No action required."
+      : "Open Account pool and restore the account token and zone ID before deleting, otherwise Cloudflare resources could be orphaned."
+  };
+  const checks = [tunnelCheck, enrollmentCheck, commandsCheck, cloudflareCheck];
+  return {
+    storeId: context.id,
+    displayName: context.displayName,
+    canDelete: checks.every((check) => check.ok),
+    checks,
+    checkedAt: new Date().toISOString()
+  };
+}
+
+async function cleanupStoreResources(context: StoreDeleteContext): Promise<void> {
+  const client = new CloudflareClient(
+    context.cfAccountId ?? context.accountRowId,
+    context.apiTokenEncrypted ? decryptSecret(context.apiTokenEncrypted) : "mock",
+    context.providerMode
+  );
+  for (const publication of context.publications) {
+    if (publication.dnsRecordId && context.cfZoneId) await client.deleteDnsRecord(context.cfZoneId, publication.dnsRecordId);
+  }
+  if (context.rdpRouteId) await client.deleteTunnelRoute(context.rdpRouteId);
+  if (context.rdpTargetId) await client.deleteInfrastructureTarget(context.rdpTargetId);
+  if (context.rdpVnetId) await client.deleteVirtualNetwork(context.rdpVnetId);
+  if (context.tunnelId) {
+    await client.deleteTunnelConnections(context.tunnelId);
+    await client.deleteTunnel(context.tunnelId);
+  }
 }
 
 const publicationsJson = `COALESCE((
@@ -305,6 +464,65 @@ export async function storeRoutes(app: FastifyInstance): Promise<void> {
     `, [id]);
     if (!result.rowCount) return reply.code(404).send({ error: "Store not found" });
     return { store: result.rows[0] };
+  });
+
+  app.get("/api/stores/:id/delete-preflight", { preHandler: requireAuth }, async (request, reply) => {
+    const { id } = z.object({ id: z.string().uuid() }).parse(request.params);
+    const context = await loadStoreDeleteContext(pool, id);
+    if (!context) return reply.code(404).send({ error: "Store not found" });
+    return buildStoreDeletePreflight(context);
+  });
+
+  app.delete("/api/stores/:id", { preHandler: requireAuth }, async (request, reply) => {
+    const { id } = z.object({ id: z.string().uuid() }).parse(request.params);
+    const body = deleteStoreSchema.parse(request.body ?? {});
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      const lockedStore = await client.query("SELECT id FROM stores WHERE id = $1 FOR UPDATE", [id]);
+      if (!lockedStore.rowCount) {
+        await client.query("ROLLBACK");
+        return reply.code(404).send({ error: "Store not found" });
+      }
+      const context = await loadStoreDeleteContext(client, id);
+      if (!context) {
+        await client.query("ROLLBACK");
+        return reply.code(404).send({ error: "Store not found" });
+      }
+      const preflight = buildStoreDeletePreflight(context);
+      const cloudflareCheck = preflight.checks.find((check) => check.id === "cloudflare");
+      if (!cloudflareCheck?.ok) {
+        await client.query("ROLLBACK");
+        return reply.code(409).send({ error: "Cloudflare cleanup is not ready", preflight });
+      }
+      if (!preflight.canDelete && (!body.force || body.confirmName !== context.displayName)) {
+        await client.query("ROLLBACK");
+        return reply.code(409).send({ error: "Store safety checks require an explicit name confirmation", preflight, requiresNameConfirmation: true });
+      }
+      await cleanupStoreResources(context);
+      await writeAudit({
+        actorUserId: request.authUser!.id,
+        action: "store.deleted",
+        entityType: "store",
+        entityId: id,
+        details: {
+          displayName: context.displayName,
+          storeCode: context.storeCode,
+          forced: !preflight.canDelete,
+          tunnelId: context.tunnelId,
+          publicationCount: context.publications.length
+        }
+      }, client);
+      await client.query("DELETE FROM stores WHERE id = $1", [id]);
+      await client.query("COMMIT");
+      return reply.code(204).send();
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      const message = error instanceof Error ? error.message : "Store deletion failed";
+      return reply.code(502).send({ error: `Store resources could not be fully deleted: ${message}` });
+    } finally {
+      client.release();
+    }
   });
 
   app.get("/api/stores/:storeId/enrollments/:enrollmentId/logs", { preHandler: requireAuth }, async (request, reply) => {

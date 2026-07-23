@@ -202,6 +202,12 @@ Connectivity is editable after onboarding. Saving the connectivity editor update
 
 Ingress routes are evaluated in order. The root path is kept last so more specific paths are evaluated first.
 
+## Store deletion
+
+Use **Delete store** from the store details modal. Cloudflare Man runs a server-side preflight that checks the tunnel connection, installed enrollments, running command executions, and the credentials needed to clean store-owned Cloudflare resources. Every check includes its current state and a resolution step.
+
+When a safety check is not ready, the operator must enter the exact store display name before **Force delete store** is enabled. Force deletion terminates remaining tunnel connections, removes store publication DNS records and RDP network resources, deletes the tunnel, and then removes the PostgreSQL store record. Cleanup is idempotent for resources already missing from Cloudflare.
+
 ## Store command agent
 
 The enrollment installer registers the command agent as a Windows scheduled task, Linux systemd service, or macOS launch daemon. The agent listens only on `127.0.0.1:47831`; Cloudflare Tunnel publishes it through the connectivity route marked **Command agent**.

@@ -125,7 +125,9 @@ export class CloudflareClient {
         continue;
       }
       const message = payload.errors?.map((error) => error.message).join("; ") || `Cloudflare API returned ${response.status}`;
-      throw new Error(message);
+      const requestError = new Error(message) as Error & { status?: number };
+      requestError.status = response.status;
+      throw requestError;
     }
     throw new Error("Cloudflare request failed after retries");
   }
@@ -206,8 +208,27 @@ export class CloudflareClient {
   }
 
   async deleteDnsRecord(zoneId: string, recordId: string): Promise<void> {
-    if (this.mode === "mock") return;
-    await this.request(`/zones/${zoneId}/dns_records/${recordId}`, { method: "DELETE" });
+    await this.deleteResource(`/zones/${zoneId}/dns_records/${recordId}`);
+  }
+
+  async deleteTunnelConnections(tunnelId: string): Promise<void> {
+    await this.deleteResource(`/accounts/${this.accountId}/cfd_tunnel/${tunnelId}/connections`);
+  }
+
+  async deleteTunnel(tunnelId: string): Promise<void> {
+    await this.deleteResource(`/accounts/${this.accountId}/cfd_tunnel/${tunnelId}`);
+  }
+
+  async deleteTunnelRoute(routeId: string): Promise<void> {
+    await this.deleteResource(`/accounts/${this.accountId}/teamnet/routes/${routeId}`);
+  }
+
+  async deleteInfrastructureTarget(targetId: string): Promise<void> {
+    await this.deleteResource(`/accounts/${this.accountId}/infrastructure/targets/${targetId}`);
+  }
+
+  async deleteVirtualNetwork(networkId: string): Promise<void> {
+    await this.deleteResource(`/accounts/${this.accountId}/teamnet/virtual_networks/${networkId}`);
   }
 
   async ensureBrowserRdpDnsRecord(zoneId: string, hostname: string): Promise<{ id: string }> {
@@ -245,6 +266,16 @@ export class CloudflareClient {
       method: "POST",
       body: JSON.stringify(body)
     });
+  }
+
+  private async deleteResource(path: string): Promise<void> {
+    if (this.mode === "mock") return;
+    try {
+      await this.requestPage<unknown>(path, { method: "DELETE" });
+    } catch (error) {
+      if ((error as Error & { status?: number }).status === 404) return;
+      throw error;
+    }
   }
 
   async ensureVirtualNetwork(name: string): Promise<CloudflareVirtualNetwork> {

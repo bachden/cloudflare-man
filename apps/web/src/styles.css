@@ -228,6 +228,18 @@ tbody tr:hover td { background: #fbfcfb; }
 .delete-confirmation { display: flex; flex-direction: column; gap: 15px; }
 .delete-confirmation > p { color: #536058; font-size: 11px; line-height: 1.6; }
 .delete-confirmation .inline-alert { margin: 0; }
+.delete-check-list { display: flex; flex-direction: column; gap: 8px; }
+.delete-check-row { display: grid; grid-template-columns: 25px minmax(0, 1fr); gap: 9px; padding: 11px 12px; border: 1px solid var(--line); border-radius: 5px; background: #fbfcfb; }
+.delete-check-row.delete-check-ok { border-color: #cfe5d8; background: #f5fbf7; }
+.delete-check-row.delete-check-blocked { border-color: #edcbc5; background: #fff8f6; }
+.delete-check-icon { display: grid; place-items: start center; padding-top: 1px; color: var(--green); }
+.delete-check-blocked .delete-check-icon { color: var(--red); }
+.delete-check-row strong { color: var(--ink); font-size: 11px; }
+.delete-check-row p { margin: 4px 0 5px; color: #536058; font-size: 10px; line-height: 1.45; }
+.delete-check-row small { display: block; color: var(--muted); font-size: 9px; line-height: 1.45; }
+.delete-force-panel { display: flex; flex-direction: column; gap: 13px; }
+.delete-force-panel .inline-alert { display: flex; align-items: flex-start; gap: 7px; }
+.delete-force-panel .inline-alert svg { flex: 0 0 auto; margin-top: 1px; }
 .segmented { width: fit-content; height: 36px; padding: 3px; display: flex; background: #edf1ee; border-radius: 5px; }
 .segmented button { min-width: 100px; height: 30px; padding: 0 10px; display: flex; align-items: center; justify-content: center; gap: 6px; color: #69756d; background: transparent; border-radius: 4px; cursor: pointer; font-size: 10px; font-weight: 700; }
 .segmented button.active { color: #1f382d; background: white; box-shadow: 0 1px 3px rgba(20, 30, 24, .12); }

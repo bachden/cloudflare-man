@@ -68,7 +68,11 @@ export function validatePublications(publications: DraftPublication[]): string |
 export function connectivityPayload(publications: DraftPublication[]) {
   return publications.map((publication) => ({
     suffix: publication.suffix.trim().toLowerCase(),
-    routes: publication.routes.map((route) => ({ kind: route.kind, path: route.path.trim(), serviceUrl: route.serviceUrl.trim() }))
+    routes: publication.routes.map((route) => ({
+      kind: route.kind,
+      path: route.path.trim(),
+      ...(route.kind === "service" ? { serviceUrl: route.serviceUrl.trim() } : {})
+    }))
   }));
 }
 

@@ -87,6 +87,22 @@ export type Store = {
   } | null;
 };
 
+export type StoreDeleteCheck = {
+  id: "tunnel" | "enrollments" | "commands" | "cloudflare";
+  label: string;
+  ok: boolean;
+  detail: string;
+  resolution: string;
+};
+
+export type StoreDeletePreflight = {
+  storeId: string;
+  displayName: string;
+  canDelete: boolean;
+  checks: StoreDeleteCheck[];
+  checkedAt: string;
+};
+
 export type StoreEnrollment = {
   id: string;
   status: string;

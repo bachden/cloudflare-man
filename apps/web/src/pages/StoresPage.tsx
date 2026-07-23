@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { CheckCircle2, ChevronLeft, ChevronRight, Copy, ExternalLink, MonitorUp, MoreHorizontal, Plus, RefreshCw, ScrollText, Search, Settings2, ShieldAlert, TerminalSquare } from "lucide-react";
+import { AlertTriangle, CheckCircle2, ChevronLeft, ChevronRight, Copy, ExternalLink, MonitorUp, MoreHorizontal, Plus, RefreshCw, ScrollText, Search, Settings2, ShieldAlert, TerminalSquare, Trash2 } from "lucide-react";
 import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { toast } from "sonner";
@@ -10,7 +10,7 @@ import { FieldHelp } from "../components/FieldHelp";
 import { Modal } from "../components/Modal";
 import { PageHeader } from "../components/PageHeader";
 import { StatusBadge } from "../components/StatusBadge";
-import type { AppSettings, EnrollmentResult, ManagedScript, ManagedScriptSummary, Store, StoreCommandExecution, StoreEnrollment } from "../types";
+import type { AppSettings, EnrollmentResult, ManagedScript, ManagedScriptSummary, Store, StoreCommandExecution, StoreDeletePreflight, StoreEnrollment } from "../types";
 
 type StoreListResponse = {
   stores: Store[];
@@ -80,6 +80,9 @@ function StoreModal({ store, onClose, onEditConnectivity }: { store: Store | nul
   const queryClient = useQueryClient();
   const [enrollment, setEnrollment] = useState<EnrollmentResult | null>(null);
   const [logEnrollment, setLogEnrollment] = useState<StoreEnrollment | null>(null);
+  const [deleteOpen, setDeleteOpen] = useState(false);
+  const [deletePreflight, setDeletePreflight] = useState<StoreDeletePreflight | null>(null);
+  const [deleteName, setDeleteName] = useState("");
   const { data: detailData } = useQuery({
     queryKey: ["store-detail", store?.id],
     queryFn: () => api.get<{ store: Store }>(`/api/stores/${store!.id}`),
@@ -112,7 +115,38 @@ function StoreModal({ store, onClose, onEditConnectivity }: { store: Store | nul
     onSuccess: async () => { await queryClient.invalidateQueries({ queryKey: ["stores"] }); toast.success("Browser RDP provisioned"); },
     onError: (error) => toast.error(error instanceof Error ? error.message : "RDP provisioning failed")
   });
-  const close = () => { setEnrollment(null); setLogEnrollment(null); onClose(); };
+  const deletePreflightMutation = useMutation({
+    mutationFn: () => api.get<StoreDeletePreflight>(`/api/stores/${store!.id}/delete-preflight`),
+    onSuccess: (result) => setDeletePreflight(result),
+    onError: (error) => { setDeleteOpen(false); toast.error(error instanceof Error ? error.message : "Unable to check store deletion readiness"); }
+  });
+  const deleteStore = useMutation({
+    mutationFn: () => api.delete(`/api/stores/${store!.id}`, {
+      force: Boolean(deletePreflight && !deletePreflight.canDelete),
+      ...(deletePreflight && !deletePreflight.canDelete ? { confirmName: deleteName } : {})
+    }),
+    onSuccess: async () => {
+      setDeleteOpen(false);
+      setDeletePreflight(null);
+      onClose();
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["stores"] }),
+        queryClient.invalidateQueries({ queryKey: ["dashboard"] })
+      ]);
+      toast.success("Store deleted");
+    },
+    onError: (error) => {
+      toast.error(error instanceof Error ? error.message : "Unable to delete store");
+      deletePreflightMutation.mutate();
+    }
+  });
+  const openDelete = () => {
+    setDeleteName("");
+    setDeletePreflight(null);
+    setDeleteOpen(true);
+    deletePreflightMutation.mutate();
+  };
+  const close = () => { setEnrollment(null); setLogEnrollment(null); setDeleteOpen(false); setDeletePreflight(null); setDeleteName(""); onClose(); };
   const canRevoke = ["url_issued", "claimed", "provisioning", "failed"].includes(currentStore?.onboardingStatus ?? "");
   return (
     <>
@@ -145,14 +179,47 @@ function StoreModal({ store, onClose, onEditConnectivity }: { store: Store | nul
           <button className="button button-secondary" onClick={() => verify.mutate()} disabled={verify.isPending}><CheckCircle2 size={15} />{verify.isPending ? "Checking..." : "Verify endpoint"}</button>
           {canRevoke && <button className="button button-danger" onClick={() => { if (window.confirm("Revoke this enrollment URL?")) revoke.mutate(); }} disabled={revoke.isPending}><ShieldAlert size={15} />Revoke</button>}
           {currentStore.tunnelStatus === "healthy" && <a className="button button-secondary" href={`https://${currentStore.hostname}`} target="_blank" rel="noreferrer"><ExternalLink size={15} />Open endpoint</a>}
+          <button className="button button-danger" onClick={openDelete} disabled={deletePreflightMutation.isPending || deleteStore.isPending}><Trash2 size={15} />Delete store</button>
         </div>}
       </div>}
     </Modal>
+    <StoreDeleteDialog open={deleteOpen} preflight={deletePreflight} loading={deletePreflightMutation.isPending} confirmationName={deleteName} onConfirmationNameChange={setDeleteName} onClose={() => { setDeleteOpen(false); setDeletePreflight(null); setDeleteName(""); }} onConfirm={() => deleteStore.mutate()} deleting={deleteStore.isPending} />
     <Modal open={Boolean(logEnrollment)} title={`Enrollment log · ${logEnrollment ? new Date(logEnrollment.createdAt).toLocaleString() : ""}`} onClose={() => setLogEnrollment(null)} width="wide">
       {logsLoading ? <div className="quiet-empty">Loading logs...</div> : logData?.logs.length ? <div className="enrollment-log-list">{logData.logs.map((log) => <article key={log.id} className={`enrollment-log enrollment-log-${log.level}`}><header><StatusBadge status={log.level} /><strong>{log.step ?? "installer"}</strong><time>{new Date(log.createdAt).toLocaleString()}</time></header><p>{log.message}</p></article>)}</div> : <div className="quiet-empty">No logs have been reported for this enrollment.</div>}
     </Modal>
     </>
   );
+}
+
+function StoreDeleteDialog({
+  open,
+  preflight,
+  loading,
+  confirmationName,
+  onConfirmationNameChange,
+  onClose,
+  onConfirm,
+  deleting
+}: {
+  open: boolean;
+  preflight: StoreDeletePreflight | null;
+  loading: boolean;
+  confirmationName: string;
+  onConfirmationNameChange: (value: string) => void;
+  onClose: () => void;
+  onConfirm: () => void;
+  deleting: boolean;
+}) {
+  const requiresName = Boolean(preflight && !preflight.canDelete);
+  const nameMatches = !requiresName || confirmationName === preflight?.displayName;
+  return <Modal open={open} title={`Delete store · ${preflight?.displayName ?? "Store"}`} onClose={onClose} width="wide">
+    {loading || !preflight ? <div className="quiet-empty">Checking deletion readiness...</div> : <div className="delete-confirmation">
+      <p>This permanently removes the store from Cloudflare Man and attempts to delete its store-owned Cloudflare DNS, tunnel, and RDP network resources.</p>
+      <div className="delete-check-list">{preflight.checks.map((check) => <article className={`delete-check-row ${check.ok ? "delete-check-ok" : "delete-check-blocked"}`} key={check.id}><span className="delete-check-icon">{check.ok ? <CheckCircle2 size={17} /> : <AlertTriangle size={17} />}</span><div><strong>{check.label}</strong><p>{check.detail}</p><small><b>How to resolve:</b> {check.resolution}</small></div></article>)}</div>
+      {requiresName && <div className="delete-force-panel"><div className="inline-alert"><AlertTriangle size={15} />One or more safety checks are not ready. Force delete will terminate remaining tunnel connections and may interrupt running commands.</div><label className="field"><span className="field-label">Type the store name to confirm <FieldHelp text="Enter the exact display name shown in the store details title. This extra confirmation is required when a tunnel, enrollment, or command is still active." /></span><input value={confirmationName} onChange={(event) => onConfirmationNameChange(event.target.value)} placeholder={preflight.displayName} autoComplete="off" /></label></div>}
+      <div className="form-actions"><button className="button button-secondary" type="button" onClick={onClose}>Cancel</button><button className="button button-danger" type="button" disabled={!nameMatches || deleting} onClick={onConfirm}><Trash2 size={15} />{deleting ? "Deleting..." : requiresName ? "Force delete store" : "Delete store"}</button></div>
+    </div>}
+  </Modal>;
 }
 
 function EnrollmentHistory({ enrollments, onViewLog }: { enrollments: StoreEnrollment[]; onViewLog: (enrollment: StoreEnrollment) => void }) {

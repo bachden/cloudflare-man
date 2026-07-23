@@ -410,7 +410,7 @@ test("updates all ingress routes on an existing tunnel", async () => {
         },
         {
           suffix: "ops",
-          routes: [{ kind: "command_agent", path: "/agent" }]
+          routes: [{ kind: "command_agent", path: "/agent", serviceUrl: "" }]
         }
       ]
     }
@@ -615,4 +615,44 @@ test("tracks enrollment history and issues cleanup for a running tunnel", async 
   });
   assert.equal(logs.statusCode, 200, logs.body);
   assert.equal(logs.json().logs.length, 3);
+});
+
+test("preflights and force-deletes a store with explicit name confirmation", async () => {
+  await pool.query("UPDATE stores SET tunnel_status = 'healthy' WHERE id = $1", [storeId]);
+  const preflight = await app.inject({
+    method: "GET",
+    url: `/api/stores/${storeId}/delete-preflight`,
+    headers: { cookie: sessionCookie }
+  });
+  assert.equal(preflight.statusCode, 200, preflight.body);
+  assert.equal(preflight.json().canDelete, false);
+  assert.deepEqual(preflight.json().checks.map((check: { id: string; ok: boolean }) => ({ id: check.id, ok: check.ok })), [
+    { id: "tunnel", ok: false },
+    { id: "enrollments", ok: true },
+    { id: "commands", ok: true },
+    { id: "cloudflare", ok: true }
+  ]);
+  assert.match(preflight.json().checks[0].resolution, /unenrollment|cloudflared/i);
+
+  const blocked = await app.inject({
+    method: "DELETE",
+    url: `/api/stores/${storeId}`,
+    headers: { cookie: sessionCookie },
+    payload: { force: false }
+  });
+  assert.equal(blocked.statusCode, 409, blocked.body);
+  assert.equal(blocked.json().requiresNameConfirmation, true);
+
+  const deleted = await app.inject({
+    method: "DELETE",
+    url: `/api/stores/${storeId}`,
+    headers: { cookie: sessionCookie },
+    payload: { force: true, confirmName: "Highlands Test Store" }
+  });
+  assert.equal(deleted.statusCode, 204, deleted.body);
+  const store = await pool.query("SELECT 1 FROM stores WHERE id = $1", [storeId]);
+  assert.equal(store.rowCount, 0);
+  const audit = await pool.query("SELECT details FROM audit_logs WHERE action = 'store.deleted' AND entity_id = $1", [storeId]);
+  assert.equal(audit.rowCount, 1);
+  assert.equal(audit.rows[0].details.forced, true);
 });
