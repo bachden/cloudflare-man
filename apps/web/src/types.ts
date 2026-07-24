@@ -229,15 +229,6 @@ export type EnrollmentResult = {
     shell: string;
     powershell: string;
   };
-  unenrollCommands?: Array<{
-    enrollmentId: string;
-    createdAt: string;
-    expiresAt: string;
-    urls: {
-      shell: string;
-      powershell: string;
-    };
-  }>;
 };
 
 export type UnenrollmentResult = {
@@ -255,5 +246,14 @@ export type UnenrollmentResult = {
     executionId: string | null;
     platform: "windows" | "unix" | null;
     error: string | null;
+  };
+};
+
+export type DiagnoseResult = {
+  platform: "windows" | "unix";
+  expiresAt: string;
+  urls: {
+    shell: string;
+    powershell: string;
   };
 };

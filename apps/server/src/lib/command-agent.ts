@@ -129,6 +129,20 @@ async function finishCommandExecution(
   );
 }
 
+// Node's fetch (undici) throws a generic "fetch failed" TypeError for any
+// lower-level network failure (DNS, TLS, connection reset) and puts the
+// actual reason on `.cause` instead of the message, so surface that detail -
+// otherwise every network failure looks identical and undiagnosable.
+function describeCommandAgentError(error: unknown): string {
+  if (!(error instanceof Error)) return "Command agent request failed";
+  const cause = (error as { cause?: unknown }).cause;
+  if (cause instanceof Error) {
+    const code = (cause as { code?: string }).code;
+    return `${error.message}: ${code ? `${code} ` : ""}${cause.message}`.trim();
+  }
+  return error.message;
+}
+
 export async function executeStoreScript(
   storeId: string,
   script: string,
@@ -176,7 +190,7 @@ export async function executeStoreScript(
     );
     return result;
   } catch (error) {
-    const message = error instanceof Error ? error.message : "Command agent request failed";
+    const message = describeCommandAgentError(error);
     if (executionId) {
       await finishCommandExecution(
         executionId,

@@ -63,7 +63,6 @@ export async function verifyStoreEndpoints(
       (options.publicationId || options.routeId) && remainingFailed.rowCount
         ? "UPDATE stores SET last_verified_at = now(), last_error = null, updated_at = now() WHERE id = $1"
         : `UPDATE stores SET last_verified_at = now(), last_error = null,
-                tunnel_status = 'healthy',
                 onboarding_status = CASE WHEN onboarding_status IN ('connector_online', 'verified') THEN 'verified' ELSE onboarding_status END,
                 updated_at = now() WHERE id = $1`,
       [storeId]
@@ -71,7 +70,7 @@ export async function verifyStoreEndpoints(
   } else {
     const failed = checks.filter((item) => !item.check.reachable);
     await pool.query(
-      "UPDATE stores SET last_error = $1, tunnel_status = 'down', updated_at = now() WHERE id = $2",
+      "UPDATE stores SET last_error = $1, updated_at = now() WHERE id = $2",
       [`${failed.length} published endpoint${failed.length === 1 ? " is" : "s are"} unreachable`, storeId]
     );
   }

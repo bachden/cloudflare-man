@@ -12,6 +12,7 @@ import { reconfigureStore } from "../lib/provisioning.js";
 import { isValidIpOrCidr, resolveWafAllowedIps } from "../lib/route-waf.js";
 import { provisionBrowserRdp } from "../lib/rdp.js";
 import { verifyStoreEndpoints } from "../lib/store-verification.js";
+import { synchronizeAccount } from "./accounts.js";
 import { createOpaqueToken, hashToken } from "../lib/security.js";
 import { selectZone, slugifyLabel } from "../lib/stores.js";
 import { createCommandExecution, executeStoreScript, getCommandAgentConfig, ensureCommandAgentToken, COMMAND_AGENT_SERVICE_URL } from "../lib/command-agent.js";
@@ -363,8 +364,11 @@ const publicationsJson = `COALESCE((
   FROM store_publications p WHERE p.store_id = s.id
 ), '[]'::jsonb)`;
 
+// A revoked/expired link that was never claimed is a dead end - if an older
+// enrollment is still active (or otherwise live), prefer it so a store
+// doesn't display "revoked" while it's actually still enrolled.
 const latestEnrollmentJoin = `LEFT JOIN LATERAL (
-  SELECT e.status, e.expires_at,
+  SELECT e.status, e.expires_at, e.unenrolled_at,
          EXISTS (
            SELECT 1
              FROM enrollments previous
@@ -377,14 +381,20 @@ const latestEnrollmentJoin = `LEFT JOIN LATERAL (
     FROM enrollments e
    WHERE e.store_id = s.id
      AND e.deleted_at IS NULL
-   ORDER BY e.created_at DESC, e.id DESC
+   ORDER BY (e.status = 'revoked' OR e.status = 'expired' OR (e.status = 'url_issued' AND e.expires_at <= now())) ASC,
+            e.created_at DESC, e.id DESC
    LIMIT 1
 ) latest_enrollment ON TRUE`;
 
+// Kept in sync with the drawer's "isCurrent" concept (StoreEnrollment.isCurrent,
+// apps/web/src/components/StoreDrawer.tsx): a ready/installed enrollment that
+// hasn't been unenrolled is displayed as "active" everywhere, not the raw
+// workflow status, so the store list and the enrollment history never disagree.
 const onboardingStatusExpression = `CASE
   WHEN latest_enrollment.status IS NULL THEN s.onboarding_status
   WHEN latest_enrollment.status = 'url_issued' AND latest_enrollment.expires_at <= now() THEN 'expired'
   WHEN latest_enrollment.status = 'url_issued' AND latest_enrollment.has_active_previous THEN 'waiting_for_new_enrollment'
+  WHEN latest_enrollment.status IN ('ready', 'installed') AND latest_enrollment.unenrolled_at IS NULL THEN 'active'
   ELSE latest_enrollment.status
 END`;
 
@@ -1335,41 +1345,24 @@ export async function storeRoutes(app: FastifyInstance): Promise<void> {
     const rawToken = createOpaqueToken();
     const expiresAt = new Date(Date.now() + body.expiresInHours * 60 * 60 * 1000);
     const issued = await withTransaction(async (client) => {
-      const store = await client.query("SELECT id, tunnel_status FROM stores WHERE id = $1 FOR UPDATE", [id]);
+      const store = await client.query("SELECT id FROM stores WHERE id = $1 FOR UPDATE", [id]);
       if (!store.rowCount) throw new Error("Store not found");
       await ensureCommandAgentToken(client, id);
-      const previous: Array<{ enrollmentId: string; createdAt: string; expiresAt: Date; rawToken: string }> = [];
-      if (["healthy", "degraded", "connector_online"].includes(store.rows[0].tunnel_status)) {
-        const active = await client.query(
-          `SELECT id, created_at
-             FROM enrollments
-            WHERE store_id = $1
-              AND status IN ('claimed', 'provisioning', 'ready', 'installed')
-              AND unenrolled_at IS NULL
-              AND deleted_at IS NULL
-            ORDER BY created_at DESC`,
-          [id]
-        );
-        for (const row of active.rows) {
-          const cleanupToken = createOpaqueToken();
-          await client.query(
-            `UPDATE enrollments
-                SET unenroll_token_hash = $1, unenroll_token_expires_at = $2,
-                    unenroll_requested_at = now(), unenrolled_at = null,
-                    unenroll_last_error = null, updated_at = now()
-              WHERE id = $3`,
-            [hashToken(cleanupToken), expiresAt, row.id]
-          );
-          await client.query(
-            `INSERT INTO enrollment_scripts(enrollment_id, script_kind, platform, status)
-             VALUES ($1, 'unenroll', 'windows', 'available'), ($1, 'unenroll', 'unix', 'available')
-             ON CONFLICT (enrollment_id, script_kind, platform) DO UPDATE SET
-               status = 'available', started_at = null, finished_at = null, last_error = null, updated_at = now()`,
-            [row.id]
-          );
-          previous.push({ enrollmentId: row.id, createdAt: row.created_at, expiresAt, rawToken: cleanupToken });
-        }
-      }
+      // Claiming this new link auto-unenrolls any other active enrollment for
+      // this store server-side (see reconcilePriorEnrollments in enrollment.ts),
+      // so we only need to flag the transitional state here, not pre-issue
+      // cleanup scripts for the operator to run manually.
+      const active = await client.query(
+        `SELECT 1
+           FROM enrollments
+          WHERE store_id = $1
+            AND status IN ('claimed', 'provisioning', 'ready', 'installed')
+            AND unenrolled_at IS NULL
+            AND deleted_at IS NULL
+          LIMIT 1`,
+        [id]
+      );
+      const hasActivePrevious = (active.rowCount ?? 0) > 0;
       await client.query(
         "UPDATE enrollments SET status = 'revoked', updated_at = now() WHERE store_id = $1 AND status IN ('url_issued', 'claimed', 'failed')",
         [id]
@@ -1386,31 +1379,21 @@ export async function storeRoutes(app: FastifyInstance): Promise<void> {
       );
       await client.query(
         "UPDATE stores SET onboarding_status = $1, last_error = null, updated_at = now() WHERE id = $2",
-        [previous.length ? "waiting_for_new_enrollment" : "url_issued", id]
+        [hasActivePrevious ? "waiting_for_new_enrollment" : "url_issued", id]
       );
       await writeAudit({
         actorUserId: request.authUser!.id,
         action: "enrollment.issued",
         entityType: "store",
         entityId: id,
-        details: {
-          enrollmentId: result.rows[0].id,
-          expiresAt,
-          unenrollEnrollmentIds: previous.map((item) => item.enrollmentId)
-        }
+        details: { enrollmentId: result.rows[0].id, expiresAt, hasActivePrevious }
       }, client);
-      return { id: result.rows[0].id as string, previous };
+      return { id: result.rows[0].id as string };
     });
     return reply.code(201).send({
       id: issued.id,
       expiresAt,
-      urls: await enrollmentUrls(rawToken),
-      unenrollCommands: await Promise.all(issued.previous.map(async (item) => ({
-        enrollmentId: item.enrollmentId,
-        createdAt: item.createdAt,
-        expiresAt: item.expiresAt,
-        urls: await unenrollmentUrls(item.rawToken)
-      })))
+      urls: await enrollmentUrls(rawToken)
     });
   });
 
@@ -1455,6 +1438,13 @@ export async function storeRoutes(app: FastifyInstance): Promise<void> {
 
   app.post("/api/stores/refresh", { preHandler: requireAuth }, async (request) => {
     const body = refreshStoresSchema.parse(request.body);
+    const accountIds = await pool.query(
+      "SELECT DISTINCT account_id FROM stores WHERE id = ANY($1::uuid[]) AND account_id IS NOT NULL",
+      [body.storeIds]
+    );
+    // Tunnel status (online/offline) only ever comes from Cloudflare's own tunnel
+    // list, never from the endpoint reachability checks below.
+    await Promise.all(accountIds.rows.map((row) => synchronizeAccount(row.account_id as string).catch(() => undefined)));
     const results: Array<{ storeId: string; success: boolean; error?: string }> = [];
     let nextIndex = 0;
     const worker = async () => {
@@ -1491,5 +1481,31 @@ export async function storeRoutes(app: FastifyInstance): Promise<void> {
     const result = await provisionBrowserRdp(id);
     if (!result.ready) return reply.code(502).send({ error: result.error ?? "RDP provisioning failed" });
     return result;
+  });
+
+  app.post("/api/stores/:id/diagnose", { preHandler: requireAuth }, async (request, reply) => {
+    const { id } = z.object({ id: z.string().uuid() }).parse(request.params);
+    const enrollment = await pool.query(
+      `SELECT id, platform FROM enrollments
+        WHERE store_id = $1 AND deleted_at IS NULL AND unenrolled_at IS NULL
+        ORDER BY COALESCE(installed_at, claimed_at, created_at) DESC LIMIT 1`,
+      [id]
+    );
+    if (!enrollment.rowCount) return reply.code(404).send({ error: "No enrollment found for this store" });
+    const rawToken = createOpaqueToken();
+    const expiresAt = new Date(Date.now() + 60 * 60 * 1000);
+    await pool.query(
+      "UPDATE enrollments SET diagnose_token_hash = $1, diagnose_token_expires_at = $2, updated_at = now() WHERE id = $3",
+      [hashToken(rawToken), expiresAt, enrollment.rows[0].id]
+    );
+    const baseUrl = await getPublicBaseUrl();
+    return {
+      platform: enrollment.rows[0].platform,
+      expiresAt: expiresAt.toISOString(),
+      urls: {
+        shell: `${baseUrl}/d/${rawToken}/diagnose.sh`,
+        powershell: `${baseUrl}/d/${rawToken}/diagnose.ps1`
+      }
+    };
   });
 }

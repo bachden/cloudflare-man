@@ -6,12 +6,13 @@ type SideDrawerProps = {
   title: ReactNode;
   children: ReactNode;
   onClose: () => void;
+  zIndex?: number | undefined;
 };
 
-export function SideDrawer({ open, title, children, onClose }: SideDrawerProps) {
+export function SideDrawer({ open, title, children, onClose, zIndex }: SideDrawerProps) {
   if (!open) return null;
   return (
-    <div className="drawer-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
+    <div className="drawer-backdrop" role="presentation" style={zIndex !== undefined ? { zIndex } : undefined} onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
       <aside className="side-drawer" role="dialog" aria-modal="true" aria-labelledby="drawer-title">
         <header className="side-drawer-header">
           <div className="side-drawer-title" id="drawer-title">{title}</div>

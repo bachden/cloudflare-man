@@ -4,12 +4,14 @@ import type { PoolClient } from "pg";
 import { z } from "zod";
 import { config } from "../config.js";
 import { getPublicBaseUrl } from "../lib/app-settings.js";
+import { writeAudit } from "../lib/audit.js";
 import { pool, withTransaction } from "../lib/database.js";
 import { deprovisionStore, provisionStore, withStoreCloudflareLock } from "../lib/provisioning.js";
 import { provisionBrowserRdp } from "../lib/rdp.js";
-import { hashToken } from "../lib/security.js";
-import { scheduleStoreVerification } from "../lib/store-verification.js";
+import { decryptSecret, hashToken } from "../lib/security.js";
+import { scheduleStoreVerification, verifyStoreEndpoints } from "../lib/store-verification.js";
 import { ensureCommandAgentToken } from "../lib/command-agent.js";
+import { synchronizeAccount } from "./accounts.js";
 
 const tokenParams = z.object({ token: z.string().min(30).max(200) });
 const claimSchema = z.object({
@@ -21,7 +23,8 @@ const claimSchema = z.object({
   osVersion: z.string().max(100).optional(),
   osBuild: z.string().max(100).optional(),
   installId: z.string().max(200).optional(),
-  overrideExisting: z.boolean().default(false)
+  overrideExisting: z.boolean().default(false),
+  previousHostname: z.string().max(253).optional()
 });
 const reportSchema = z.object({
   token: z.string().min(30).max(200),
@@ -80,6 +83,16 @@ async function findUnenrollment(token: string) {
   return result.rows[0];
 }
 
+async function findDiagnose(token: string) {
+  const result = await pool.query(
+    `SELECT e.id, e.store_id, e.diagnose_token_expires_at, e.deleted_at, s.hostname
+       FROM enrollments e JOIN stores s ON s.id = e.store_id
+      WHERE e.diagnose_token_hash = $1 AND e.deleted_at IS NULL`,
+    [hashToken(token)]
+  );
+  return result.rows[0];
+}
+
 async function findEnrollmentScript(enrollmentId: string, scriptKind: "install" | "unenroll", platform: "windows" | "unix") {
   const result = await pool.query(
     `SELECT status, started_at, finished_at, last_error
@@ -103,6 +116,47 @@ function noStore(reply: FastifyReply): void {
 
 async function commandAgentToken(storeId: string): Promise<string> {
   return ensureCommandAgentToken(pool, storeId);
+}
+
+async function reconcilePriorEnrollments(storeId: string, keepEnrollmentId: string, lockClient?: PoolClient): Promise<void> {
+  const previous = await pool.query(
+    `SELECT id
+       FROM enrollments
+      WHERE store_id = $1
+        AND id <> $2
+        AND status IN ('claimed', 'provisioning', 'ready', 'installed')
+        AND unenrolled_at IS NULL
+        AND deleted_at IS NULL`,
+    [storeId, keepEnrollmentId]
+  );
+  if (!previous.rowCount) return;
+  // Hold the store lock until the replacement tunnel is provisioned,
+  // preventing a late cleanup report from deleting the new tunnel.
+  await deprovisionStore(storeId, "override", lockClient);
+  await pool.query(
+    `UPDATE enrollments
+        SET status = 'unenrolled', unenrolled_at = COALESCE(unenrolled_at, now()),
+            unenroll_reason = 'override', unenroll_token_hash = null,
+            unenroll_token_expires_at = null, unenroll_requested_at = null,
+            unenroll_last_error = null, updated_at = now()
+      WHERE store_id = $1
+        AND id <> $2
+        AND status IN ('claimed', 'provisioning', 'ready', 'installed')
+        AND unenrolled_at IS NULL
+        AND deleted_at IS NULL`,
+    [storeId, keepEnrollmentId]
+  );
+  await pool.query(
+    `UPDATE enrollment_scripts
+        SET status = 'staled_ignored', finished_at = COALESCE(finished_at, now()),
+            last_error = 'Skipped because a new enrollment overrode this instance', updated_at = now()
+      WHERE script_kind = 'unenroll'
+        AND enrollment_id IN (
+          SELECT id FROM enrollments
+           WHERE store_id = $1 AND id <> $2 AND unenroll_reason = 'override'
+        )`,
+    [storeId, keepEnrollmentId]
+  );
 }
 
 export function unixAgentProgram(agentToken: string): string {
@@ -287,6 +341,7 @@ OS_VERSION="unknown"
 OS_BUILD="unknown"
 MACHINE_ARCH="unknown"
 MACHINE_NAME="unknown"
+PREVIOUS_HOSTNAME=""
 
 send_log() {
   level="$1"
@@ -430,7 +485,7 @@ if ! command -v cloudflared >/dev/null 2>&1; then
 fi
 
 log_message "info" "claim" "Claiming enrollment and provisioning the Cloudflare tunnel"
-CLAIM_BODY="$(printf '{\\"token\\":\\"%s\\",\\"platform\\":\\"%s\\",\\"architecture\\":\\"%s\\",\\"machineName\\":\\"%s\\",\\"osName\\":\\"%s\\",\\"osVersion\\":\\"%s\\",\\"osBuild\\":\\"%s\\",\\"installId\\":\\"%s\\",\\"overrideExisting\\":%s}' "$ENROLLMENT_TOKEN" "$OS_NAME" "$MACHINE_ARCH" "$MACHINE_NAME" "$OS_DISPLAY_NAME" "$OS_VERSION" "$OS_BUILD" "$INSTALL_ID" "$OVERRIDE_EXISTING")"
+CLAIM_BODY="$(printf '{\\"token\\":\\"%s\\",\\"platform\\":\\"%s\\",\\"architecture\\":\\"%s\\",\\"machineName\\":\\"%s\\",\\"osName\\":\\"%s\\",\\"osVersion\\":\\"%s\\",\\"osBuild\\":\\"%s\\",\\"installId\\":\\"%s\\",\\"overrideExisting\\":%s,\\"previousHostname\\":\\"%s\\"}' "$ENROLLMENT_TOKEN" "$OS_NAME" "$MACHINE_ARCH" "$MACHINE_NAME" "$OS_DISPLAY_NAME" "$OS_VERSION" "$OS_BUILD" "$INSTALL_ID" "$OVERRIDE_EXISTING" "$PREVIOUS_HOSTNAME")"
 CLAIM_RESPONSE_FILE="$(mktemp)"
 CLAIM_CURL_ERROR=0
 CLAIM_STATUS="$(curl --silent --show-error --retry 3 --retry-all-errors --output "$CLAIM_RESPONSE_FILE" --write-out '%{http_code}' -X POST "$CLAIM_URL" -H 'Content-Type: application/json' -H 'Accept: text/plain' --data "$CLAIM_BODY")" || CLAIM_CURL_ERROR=$?
@@ -630,6 +685,7 @@ $stateDirectory = Join-Path $env:ProgramData "cloudflare-man"
 $installIdFile = Join-Path $stateDirectory "install-id"
 $hostnameFile = Join-Path $stateDirectory "assigned-hostname"
 $overrideExisting = $false
+$previousHostname = ""
 $existingService = Get-Service -Name "cloudflared" -ErrorAction SilentlyContinue
 $existingEnrollment = (Test-Path $installIdFile) -or ($null -ne $existingService)
 if ($existingEnrollment) {
@@ -708,6 +764,7 @@ $claimBody = @{
   osBuild = $osBuild
   installId = $installId
   overrideExisting = $overrideExisting
+  previousHostname = $previousHostname
 } | ConvertTo-Json
 try {
   $claim = Invoke-RestMethod -Method Post -Uri $ClaimUrl -ContentType "application/json" -Body $claimBody
@@ -971,6 +1028,135 @@ try {
 `;
 }
 
+function diagnosticShellScript(hostname: string, publicBaseUrl: string, agentToken: string, storeId: string): string {
+  const reportUrl = `${publicBaseUrl}/api/public/stores/diagnose/report`;
+  return `#!/usr/bin/env bash
+set -uo pipefail
+
+ASSIGNED_HOSTNAME='${hostname}'
+STORE_ID='${storeId}'
+AGENT_TOKEN='${agentToken}'
+REPORT_URL='${reportUrl}'
+
+if [ "$(uname -s)" = "Linux" ]; then
+  STATE_DIR="/var/lib/cloudflare-man"
+else
+  STATE_DIR="/Library/Application Support/cloudflare-man"
+fi
+HOSTNAME_FILE="$STATE_DIR/assigned-hostname"
+
+echo "cloudflare-man diagnostics for $ASSIGNED_HOSTNAME"
+echo "----------------------------------------"
+
+CLOUDFLARED_RUNNING=false
+if pgrep -x cloudflared >/dev/null 2>&1; then CLOUDFLARED_RUNNING=true; fi
+if [ "$CLOUDFLARED_RUNNING" = true ]; then
+  echo "[PASS] cloudflared is running"
+else
+  echo "[FAIL] cloudflared is not running"
+fi
+
+HOSTNAME_MATCH=false
+LOCAL_HOSTNAME=""
+if [ -s "$HOSTNAME_FILE" ]; then
+  LOCAL_HOSTNAME="$(cat "$HOSTNAME_FILE")"
+  if [ "$LOCAL_HOSTNAME" = "$ASSIGNED_HOSTNAME" ]; then
+    HOSTNAME_MATCH=true
+    echo "[PASS] Local install is registered for $ASSIGNED_HOSTNAME"
+  else
+    echo "[FAIL] Local install is registered for $LOCAL_HOSTNAME, not $ASSIGNED_HOSTNAME"
+  fi
+else
+  echo "[FAIL] No local enrollment state found at $HOSTNAME_FILE"
+fi
+
+AGENT_HEALTHY=false
+if curl --silent --show-error --fail --max-time 3 -H "X-Cloudflare-Man-Agent-Token: $AGENT_TOKEN" http://127.0.0.1:47831/health >/dev/null 2>&1; then
+  AGENT_HEALTHY=true
+  echo "[PASS] Command agent is responding on 127.0.0.1:47831"
+else
+  echo "[FAIL] Command agent is not responding on 127.0.0.1:47831"
+fi
+
+echo "----------------------------------------"
+echo "Reporting results to cloudflare-man..."
+REPORT_BODY="$(printf '{"storeId":"%s","agentToken":"%s","cloudflaredRunning":%s,"hostnameMatch":%s,"localHostname":"%s","agentHealthy":%s}' "$STORE_ID" "$AGENT_TOKEN" "$CLOUDFLARED_RUNNING" "$HOSTNAME_MATCH" "$LOCAL_HOSTNAME" "$AGENT_HEALTHY")"
+RESPONSE="$(curl --silent --show-error --max-time 15 -X POST "$REPORT_URL" -H 'Content-Type: application/json' --data "$REPORT_BODY")"
+MESSAGE="$(printf '%s' "$RESPONSE" | grep -o '"message":"[^"]*"' | sed 's/"message":"//;s/"$//')"
+if [ -n "$MESSAGE" ]; then echo "$MESSAGE"; else echo "$RESPONSE"; fi
+`;
+}
+
+function diagnosticPowerShellScript(hostname: string, publicBaseUrl: string, agentToken: string, storeId: string): string {
+  const reportUrl = `${publicBaseUrl}/api/public/stores/diagnose/report`;
+  return `$ErrorActionPreference = "Continue"
+$AssignedHostname = "${hostname}"
+$StoreId = "${storeId}"
+$AgentToken = "${agentToken}"
+$ReportUrl = "${reportUrl}"
+$stateDirectory = Join-Path $env:ProgramData "cloudflare-man"
+$hostnameFile = Join-Path $stateDirectory "assigned-hostname"
+
+Write-Host "cloudflare-man diagnostics for $AssignedHostname"
+Write-Host "----------------------------------------"
+
+$cloudflaredService = Get-Service -Name "cloudflared" -ErrorAction SilentlyContinue
+$cloudflaredRunning = $false
+if ($cloudflaredService -and $cloudflaredService.Status -eq "Running") {
+  $cloudflaredRunning = $true
+  Write-Host "[PASS] cloudflared service is running"
+} elseif ($cloudflaredService) {
+  Write-Host "[FAIL] cloudflared service is installed but not running"
+} else {
+  Write-Host "[FAIL] cloudflared service is not installed"
+}
+
+$hostnameMatch = $false
+$localHostname = ""
+if (Test-Path $hostnameFile) {
+  $localHostname = (Get-Content $hostnameFile -Raw).Trim()
+  if ($localHostname -eq $AssignedHostname) {
+    $hostnameMatch = $true
+    Write-Host "[PASS] Local install is registered for $AssignedHostname"
+  } else {
+    Write-Host "[FAIL] Local install is registered for $localHostname, not $AssignedHostname"
+  }
+} else {
+  Write-Host "[FAIL] No local enrollment state found at $hostnameFile"
+}
+
+$agentHealthy = $false
+try {
+  $health = Invoke-RestMethod -Method Get -Uri "http://127.0.0.1:47831/health" -Headers @{ "X-Cloudflare-Man-Agent-Token" = $AgentToken } -TimeoutSec 3
+  if ($health.ready) {
+    $agentHealthy = $true
+    Write-Host "[PASS] Command agent is responding on 127.0.0.1:47831"
+  } else {
+    Write-Host "[FAIL] Command agent responded but is not ready"
+  }
+} catch {
+  Write-Host "[FAIL] Command agent is not responding on 127.0.0.1:47831"
+}
+
+Write-Host "----------------------------------------"
+Write-Host "Reporting results to cloudflare-man..."
+$reportBody = @{
+  storeId = $StoreId
+  agentToken = $AgentToken
+  cloudflaredRunning = $cloudflaredRunning
+  hostnameMatch = $hostnameMatch
+  localHostname = $localHostname
+  agentHealthy = $agentHealthy
+} | ConvertTo-Json
+try {
+  $report = Invoke-RestMethod -Method Post -Uri $ReportUrl -ContentType "application/json" -Body $reportBody
+  Write-Host $report.message
+} catch {
+  Write-Host "Unable to reach cloudflare-man to report diagnostics: $($_.Exception.Message)"
+}
+`;
+}
+
 export async function enrollmentRoutes(app: FastifyInstance): Promise<void> {
   app.get("/e/:token/install.sh", async (request, reply) => {
     const { token } = tokenParams.parse(request.params);
@@ -1026,6 +1212,26 @@ export async function enrollmentRoutes(app: FastifyInstance): Promise<void> {
     }
     noStore(reply);
     return reply.type("text/plain; charset=utf-8").send(powerShellUnenrollScript(token, enrollment.hostname, await getPublicBaseUrl()));
+  });
+
+  app.get("/d/:token/diagnose.sh", async (request, reply) => {
+    const { token } = tokenParams.parse(request.params);
+    const diagnose = await findDiagnose(token);
+    if (!diagnose || !diagnose.diagnose_token_expires_at || new Date(diagnose.diagnose_token_expires_at) <= new Date()) {
+      return reply.code(404).type("text/plain").send("Diagnostic link is invalid or expired.\n");
+    }
+    noStore(reply);
+    return reply.type("text/x-shellscript; charset=utf-8").send(diagnosticShellScript(diagnose.hostname, await getPublicBaseUrl(), await commandAgentToken(diagnose.store_id), diagnose.store_id));
+  });
+
+  app.get("/d/:token/diagnose.ps1", async (request, reply) => {
+    const { token } = tokenParams.parse(request.params);
+    const diagnose = await findDiagnose(token);
+    if (!diagnose || !diagnose.diagnose_token_expires_at || new Date(diagnose.diagnose_token_expires_at) <= new Date()) {
+      return reply.code(404).type("text/plain").send("Diagnostic link is invalid or expired.\n");
+    }
+    noStore(reply);
+    return reply.type("text/plain; charset=utf-8").send(diagnosticPowerShellScript(diagnose.hostname, await getPublicBaseUrl(), await commandAgentToken(diagnose.store_id), diagnose.store_id));
   });
 
   app.post("/api/public/enrollments/claim", {
@@ -1087,53 +1293,31 @@ export async function enrollmentRoutes(app: FastifyInstance): Promise<void> {
 
     try {
       const provision = async (lockClient?: PoolClient) => {
-        if (body.overrideExisting) {
-          const previousEnrollments = await pool.query(
-            `SELECT id
-               FROM enrollments
-              WHERE store_id = $1
-                AND id <> $2
-                AND status IN ('claimed', 'provisioning', 'ready', 'installed')
-                AND unenrolled_at IS NULL
-                AND deleted_at IS NULL
-              ORDER BY COALESCE(installed_at, claimed_at, created_at) DESC`,
-            [enrollment.store_id, enrollment.id]
+        await reconcilePriorEnrollments(enrollment.store_id, enrollment.id, lockClient);
+        if (body.previousHostname) {
+          const previousStore = await pool.query(
+            "SELECT id FROM stores WHERE hostname = $1 AND id <> $2",
+            [body.previousHostname, enrollment.store_id]
           );
-          if (previousEnrollments.rowCount) {
-            // Hold the store lock until the replacement tunnel is provisioned,
-            // preventing a late cleanup report from deleting the new tunnel.
-            await deprovisionStore(enrollment.store_id, "override", lockClient);
+          const previousStoreId = previousStore.rows[0]?.id as string | undefined;
+          if (previousStoreId) {
+            // Cleanup of an unrelated store must not block this store's own
+            // provisioning, so isolate failures instead of rethrowing.
+            try {
+              await reconcilePriorEnrollments(previousStoreId, enrollment.id);
+            } catch (error) {
+              const message = error instanceof Error ? error.message : "Unable to reconcile the previous store";
+              await pool.query(
+                `INSERT INTO enrollment_logs(enrollment_id, level, step, message, metadata)
+                 VALUES ($1, 'warn', 'claim', $2, $3::jsonb)`,
+                [enrollment.id, message.slice(0, 4000), JSON.stringify({ source: "server", previousStoreId })]
+              );
+            }
           }
-          await pool.query(
-            `UPDATE enrollments
-                SET status = 'unenrolled', unenrolled_at = COALESCE(unenrolled_at, now()),
-                    unenroll_reason = 'override', unenroll_token_hash = null,
-                    unenroll_token_expires_at = null, unenroll_requested_at = null,
-                    unenroll_last_error = null, updated_at = now()
-              WHERE store_id = $1
-                AND id <> $2
-                AND status IN ('claimed', 'provisioning', 'ready', 'installed')
-                AND unenrolled_at IS NULL
-                AND deleted_at IS NULL`,
-            [enrollment.store_id, enrollment.id]
-          );
-          await pool.query(
-            `UPDATE enrollment_scripts
-                SET status = 'staled_ignored', finished_at = COALESCE(finished_at, now()),
-                    last_error = 'Skipped because a new enrollment overrode this instance', updated_at = now()
-              WHERE script_kind = 'unenroll'
-                AND enrollment_id IN (
-                  SELECT id FROM enrollments
-                   WHERE store_id = $2 AND id <> $1 AND unenroll_reason = 'override'
-                )`,
-            [enrollment.id, enrollment.store_id]
-          );
         }
         return provisionStore(enrollment.store_id);
       };
-      const provisioned = body.overrideExisting
-        ? await withStoreCloudflareLock(enrollment.store_id, provision)
-        : await provision();
+      const provisioned = await withStoreCloudflareLock(enrollment.store_id, provision);
       const agentToken = await commandAgentToken(enrollment.store_id);
       await pool.query("UPDATE enrollments SET status = 'ready', last_error = null, updated_at = now() WHERE id = $1", [enrollment.id]);
       if (request.headers.accept?.includes("text/plain")) {
@@ -1322,6 +1506,7 @@ export async function enrollmentRoutes(app: FastifyInstance): Promise<void> {
     }
     const retryablePreflightFailure = !success && enrollment.status === "url_issued" && !enrollment.claimed_at;
     let scheduleVerification = false;
+    let accountId: string | undefined;
     await withTransaction(async (client) => {
       await client.query(
         `UPDATE enrollments SET status = $1, installed_at = CASE WHEN $2 THEN now() ELSE installed_at END,
@@ -1358,10 +1543,11 @@ export async function enrollmentRoutes(app: FastifyInstance): Promise<void> {
         );
       }
       const provider = await client.query(
-        `SELECT a.provider_mode FROM stores s JOIN cloudflare_accounts a ON a.id = s.account_id WHERE s.id = $1`,
+        `SELECT a.provider_mode, s.account_id FROM stores s JOIN cloudflare_accounts a ON a.id = s.account_id WHERE s.id = $1`,
         [enrollment.store_id]
       );
       const isMock = provider.rows[0]?.provider_mode === "mock";
+      accountId = provider.rows[0]?.account_id;
       scheduleVerification = success && !isMock;
       await client.query(
         `UPDATE stores SET onboarding_status = $1, tunnel_status = CASE WHEN $2 THEN 'healthy' ELSE tunnel_status END,
@@ -1397,7 +1583,133 @@ export async function enrollmentRoutes(app: FastifyInstance): Promise<void> {
         ? await provisionBrowserRdp(enrollment.store_id)
         : { ready: false, error: body.rdpError ?? "Windows Remote Desktop was not enabled" };
     }
-    if (scheduleVerification) scheduleStoreVerification(enrollment.store_id);
+    if (scheduleVerification) {
+      scheduleStoreVerification(enrollment.store_id);
+      if (accountId) void synchronizeAccount(accountId).catch(() => undefined);
+    }
     return { success: true, ...(rdp ? { rdp } : {}) };
+  });
+
+  const diagnoseReportSchema = z.object({
+    storeId: z.string().uuid(),
+    agentToken: z.string().min(1).max(500),
+    cloudflaredRunning: z.boolean(),
+    hostnameMatch: z.boolean(),
+    localHostname: z.string().max(253).default(""),
+    agentHealthy: z.boolean()
+  });
+
+  app.post("/api/public/stores/diagnose/report", {
+    config: { rateLimit: { max: 20, timeWindow: "1 minute" } }
+  }, async (request, reply) => {
+    const body = diagnoseReportSchema.parse(request.body);
+    const agent = await pool.query("SELECT token_encrypted FROM store_command_agents WHERE store_id = $1", [body.storeId]);
+    const storedToken = agent.rows[0]?.token_encrypted ? decryptSecret(agent.rows[0].token_encrypted as string) : null;
+    if (!storedToken || storedToken !== body.agentToken) {
+      return reply.code(401).send({ error: "Invalid diagnostic credentials" });
+    }
+    const store = await pool.query("SELECT account_id, hostname FROM stores WHERE id = $1", [body.storeId]);
+    if (!store.rowCount) return reply.code(404).send({ error: "Store not found" });
+
+    const currentEnrollment = await pool.query(
+      `SELECT id, status FROM enrollments
+        WHERE store_id = $1 AND deleted_at IS NULL AND unenrolled_at IS NULL
+        ORDER BY COALESCE(installed_at, claimed_at, created_at) DESC LIMIT 1`,
+      [body.storeId]
+    );
+
+    // Edge case: this machine has since been overridden by a *different* store's
+    // enrollment (the local state file now points at another store's hostname).
+    // Detect it precisely and mark this store's enrollment unenrolled instead of
+    // reporting a vague mismatch.
+    if (body.localHostname && body.localHostname !== store.rows[0].hostname) {
+      const supersededBy = await pool.query(
+        "SELECT id, display_name FROM stores WHERE hostname = $1 AND id <> $2",
+        [body.localHostname, body.storeId]
+      );
+      if (supersededBy.rowCount) {
+        if (currentEnrollment.rows[0] && currentEnrollment.rows[0].status !== "unenrolled") {
+          await pool.query(
+            `UPDATE enrollments
+                SET status = 'unenrolled', unenrolled_at = COALESCE(unenrolled_at, now()),
+                    unenroll_reason = 'override', unenroll_token_hash = null,
+                    unenroll_token_expires_at = null, unenroll_requested_at = null,
+                    unenroll_last_error = null, updated_at = now()
+              WHERE id = $1`,
+            [currentEnrollment.rows[0].id]
+          );
+          await deprovisionStore(body.storeId, "override").catch(() => undefined);
+          await writeAudit({
+            action: "store.enrollment_superseded_detected",
+            entityType: "store",
+            entityId: body.storeId,
+            details: { supersededByStoreId: supersededBy.rows[0].id, supersededByStoreName: supersededBy.rows[0].display_name, localHostname: body.localHostname }
+          });
+        }
+        return {
+          tunnelOnline: false,
+          hostnameMatch: false,
+          agentHealthy: body.agentHealthy,
+          endpointOk: false,
+          reconciled: false,
+          message: `This machine now belongs to store "${supersededBy.rows[0].display_name}" - this enrollment has been marked unenrolled.`
+        };
+      }
+    }
+
+    await synchronizeAccount(store.rows[0].account_id).catch(() => undefined);
+    const tunnelStatusResult = await pool.query("SELECT tunnel_status FROM stores WHERE id = $1", [body.storeId]);
+    const tunnelOnline = ["healthy", "degraded"].includes(tunnelStatusResult.rows[0]?.tunnel_status);
+
+    const endpointResult = await verifyStoreEndpoints(body.storeId).catch(() => null);
+    const endpointOk = endpointResult?.success ?? false;
+
+    const allHealthy = tunnelOnline && body.cloudflaredRunning && body.hostnameMatch && body.agentHealthy && endpointOk;
+    let reconciled = false;
+    if (allHealthy && currentEnrollment.rows[0] && currentEnrollment.rows[0].status !== "installed") {
+      await pool.query(
+        "UPDATE enrollments SET status = 'installed', installed_at = COALESCE(installed_at, now()), last_error = null, updated_at = now() WHERE id = $1",
+        [currentEnrollment.rows[0].id]
+      );
+      reconciled = true;
+      await writeAudit({
+        action: "store.enrollment_reconciled",
+        entityType: "store",
+        entityId: body.storeId,
+        details: { tunnelOnline, endpointOk, ...body, agentToken: undefined }
+      });
+    } else if (!allHealthy) {
+      const problems: string[] = [];
+      if (!body.cloudflaredRunning) problems.push("cloudflared is not running on the machine");
+      if (!body.hostnameMatch) problems.push("the local install is not registered for this store's hostname");
+      if (!body.agentHealthy) problems.push("the command agent is not responding locally");
+      if (!tunnelOnline) problems.push("Cloudflare reports the tunnel as offline");
+      if (!endpointOk) problems.push("the published endpoint is not reachable");
+      if (problems.length) {
+        await pool.query("UPDATE stores SET last_error = $1, updated_at = now() WHERE id = $2", [problems.join("; "), body.storeId]);
+        await writeAudit({
+          action: "store.diagnose_reported_issue",
+          entityType: "store",
+          entityId: body.storeId,
+          details: { tunnelOnline, endpointOk, ...body, agentToken: undefined }
+        });
+      }
+    }
+
+    const message = allHealthy
+      ? reconciled
+        ? "Everything checks out - the enrollment status has been updated to installed."
+        : "Everything checks out - the enrollment status is already up to date."
+      : !body.cloudflaredRunning
+        ? "Found a problem: cloudflared is not running on this machine."
+        : !body.hostnameMatch
+          ? "Found a problem: this machine's local install is registered for a different store."
+          : !body.agentHealthy
+            ? "Found a problem: the command agent is not responding locally."
+            : !tunnelOnline
+              ? "Found a problem: Cloudflare reports the tunnel as offline."
+              : "Found a problem: the published endpoint is not reachable.";
+
+    return { tunnelOnline, hostnameMatch: body.hostnameMatch, agentHealthy: body.agentHealthy, endpointOk, reconciled, message };
   });
 }

@@ -122,22 +122,42 @@ export async function scriptRoutes(app: FastifyInstance): Promise<void> {
 
   app.get("/api/scripts/:id", { preHandler: requireAuth }, async (request, reply) => {
     const { id } = z.object({ id: z.string().uuid() }).parse(request.params);
-    const result = await pool.query(
-      `SELECT s.id, s.name, s.platform, s.language, s.description,
-              s.created_at AS "createdAt", s.updated_at AS "updatedAt",
-              COALESCE(jsonb_agg(jsonb_build_object(
-                'id', v.id, 'version', v.version, 'content', v.content,
-                'createdAt', v.created_at, 'createdBy', u.username
-              ) ORDER BY v.version DESC) FILTER (WHERE v.id IS NOT NULL), '[]'::jsonb) AS versions
-         FROM managed_scripts s
-         LEFT JOIN managed_script_versions v ON v.script_id = s.id
-         LEFT JOIN users u ON u.id = v.created_by
-        WHERE s.id = $1
-        GROUP BY s.id`,
-      [id]
-    );
-    if (!result.rowCount) return reply.code(404).send({ error: "Script not found" });
-    return { script: result.rows[0] };
+    const [summaryResult, versionsResult] = await Promise.all([
+      pool.query(
+        `SELECT ${scriptSummary} AS script
+           FROM managed_scripts s
+           LEFT JOIN LATERAL (
+             SELECT v.id, v.version, count(*) OVER()::int AS "versionCount"
+               FROM managed_script_versions v
+              WHERE v.script_id = s.id
+              ORDER BY v.version DESC
+             LIMIT 1
+           ) latest ON true
+           LEFT JOIN LATERAL (
+             SELECT count(*)::int AS total,
+                    (count(*) FILTER (WHERE ce.status = 'succeeded'))::int AS succeeded,
+                    (count(*) FILTER (WHERE ce.status = 'failed'))::int AS failed,
+                    (count(*) FILTER (WHERE ce.status = 'timed_out'))::int AS "timedOut",
+                    (count(*) FILTER (WHERE ce.status = 'running'))::int AS running
+               FROM store_command_executions ce
+               LEFT JOIN managed_script_versions executed_version ON executed_version.id = ce.script_version_id
+               LEFT JOIN managed_script_versions saved_version ON saved_version.id = ce.saved_script_version_id
+              WHERE executed_version.script_id = s.id OR saved_version.script_id = s.id
+           ) execution_stats ON true
+          WHERE s.id = $1`,
+        [id]
+      ),
+      pool.query(
+        `SELECT v.id, v.version, v.content, v.created_at AS "createdAt", u.username AS "createdBy"
+           FROM managed_script_versions v
+           LEFT JOIN users u ON u.id = v.created_by
+          WHERE v.script_id = $1
+          ORDER BY v.version DESC`,
+        [id]
+      )
+    ]);
+    if (!summaryResult.rowCount) return reply.code(404).send({ error: "Script not found" });
+    return { script: { ...summaryResult.rows[0].script, versions: versionsResult.rows } };
   });
 
   app.get("/api/scripts/:id/executions", { preHandler: requireAuth }, async (request, reply) => {

@@ -6,8 +6,8 @@ import { ApiError, api } from "../api";
 import { ConnectivityEditor, connectivityPayload, createCommandAgentDraftPublication, validatePublications, type DraftPublication } from "../components/ConnectivityEditor";
 import { FieldHelp } from "../components/FieldHelp";
 import { PageHeader } from "../components/PageHeader";
+import { EnrollmentCommands } from "../components/StoreDrawer";
 import { SearchableSelect } from "../components/SearchableSelect";
-import { EnrollmentCommands } from "./StoresPage";
 import type { CloudflareAccount, EnrollmentResult, Store } from "../types";
 
 export function OnboardingPage() {

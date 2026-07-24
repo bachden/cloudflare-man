@@ -1,0 +1,16 @@
+import { createContext, useContext } from "react";
+
+export type StoreDrawerTab = "overall" | "ingress" | "connect";
+
+export type DrawerApi = {
+  openStoreDrawer: (storeId: string, tab?: StoreDrawerTab) => void;
+  openScriptDrawer: (scriptId: string, version?: number | null) => void;
+};
+
+export const DrawerContext = createContext<DrawerApi | null>(null);
+
+export function useDrawers(): DrawerApi {
+  const context = useContext(DrawerContext);
+  if (!context) throw new Error("useDrawers must be used within a DrawerProvider");
+  return context;
+}

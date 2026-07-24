@@ -89,7 +89,7 @@ async function accountList(filter: z.infer<typeof accountListQuerySchema>) {
   return result.rows;
 }
 
-type AccountSyncResult = {
+export type AccountSyncResult = {
   id: string;
   success: boolean;
   zones?: number;
@@ -97,7 +97,21 @@ type AccountSyncResult = {
   error?: string;
 };
 
-async function synchronizeAccount(id: string): Promise<AccountSyncResult> {
+// Multiple stores usually share one Cloudflare account. When a caller (e.g. the
+// stores list refreshing several rows at once) triggers a sync per store rather
+// than once per account, concurrent calls for the SAME account share one
+// in-flight request instead of hitting Cloudflare's API redundantly.
+const inFlightAccountSyncs = new Map<string, Promise<AccountSyncResult>>();
+
+export async function synchronizeAccount(id: string): Promise<AccountSyncResult> {
+  const existing = inFlightAccountSyncs.get(id);
+  if (existing) return existing;
+  const promise = synchronizeAccountOnce(id).finally(() => inFlightAccountSyncs.delete(id));
+  inFlightAccountSyncs.set(id, promise);
+  return promise;
+}
+
+async function synchronizeAccountOnce(id: string): Promise<AccountSyncResult> {
   const result = await pool.query(
     "SELECT provider_mode, cf_account_id, api_token_encrypted FROM cloudflare_accounts WHERE id = $1",
     [id]
@@ -124,10 +138,13 @@ async function synchronizeAccount(id: string): Promise<AccountSyncResult> {
         );
       }
       for (const tunnel of tunnels) {
+        const status = tunnel.status ?? "unknown";
         await db.query(
-          `UPDATE stores SET tunnel_status = $1, last_connected_at = $2, updated_at = now()
-           WHERE account_id = $3 AND tunnel_id = $4`,
-          [tunnel.status ?? "unknown", tunnel.conns_active_at ?? null, id, tunnel.id]
+          `UPDATE stores
+              SET tunnel_status = $1, last_connected_at = $2, updated_at = now(),
+                  rdp_status = CASE WHEN $1 <> 'healthy' AND rdp_status = 'ready' THEN 'failed' ELSE rdp_status END
+            WHERE account_id = $3 AND tunnel_id = $4`,
+          [status, tunnel.conns_active_at ?? null, id, tunnel.id]
         );
       }
       await db.query(

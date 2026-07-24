@@ -5,6 +5,7 @@ import { Navigate, Route, Routes, useNavigate } from "react-router-dom";
 import { toast } from "sonner";
 import { api } from "./api";
 import { AppShell } from "./components/AppShell";
+import { DrawerProvider } from "./components/DrawerProvider";
 import { AccountsPage } from "./pages/AccountsPage";
 import { AuditPage } from "./pages/AuditPage";
 import { DashboardPage } from "./pages/DashboardPage";
@@ -49,5 +50,5 @@ export default function App() {
   if (isLoading) return <div className="app-loading"><div className="brand-spinner" /><span>cloudflare-man</span></div>;
   if (isError || !data) return <LoginPage onLogin={(user) => queryClient.setQueryData(["auth", "me"], { user })} />;
   const updatePasswordState = () => queryClient.setQueryData<{ user: User }>(["auth", "me"], (current) => current ? { user: { ...current.user, mustChangePassword: false } } : current);
-  return <AppShell username={data.user.username}><PublicBaseUrlBanner />{data.user.mustChangePassword && <button className="password-banner" onClick={() => navigate("/settings")}><AlertTriangle size={16} /><span>The default password is still active.</span><strong>Change password</strong></button>}<Suspense fallback={<div className="app-loading"><div className="brand-spinner" /><span>Loading script editor...</span></div>}><Routes><Route path="/" element={<DashboardPage />} /><Route path="/accounts" element={<AccountsPage />} /><Route path="/stores" element={<StoresPage />} /><Route path="/onboarding" element={<OnboardingPage />} /><Route path="/scripts" element={<ScriptsPage />} /><Route path="/audit" element={<AuditPage />} /><Route path="/settings" element={<SettingsPage user={data.user} onLogout={() => queryClient.removeQueries({ queryKey: ["auth", "me"] })} onPasswordChanged={updatePasswordState} />} /><Route path="*" element={<Navigate to="/" replace />} /></Routes></Suspense></AppShell>;
+  return <AppShell username={data.user.username}><DrawerProvider><PublicBaseUrlBanner />{data.user.mustChangePassword && <button className="password-banner" onClick={() => navigate("/settings")}><AlertTriangle size={16} /><span>The default password is still active.</span><strong>Change password</strong></button>}<Suspense fallback={<div className="app-loading"><div className="brand-spinner" /><span>Loading script editor...</span></div>}><Routes><Route path="/" element={<DashboardPage />} /><Route path="/accounts" element={<AccountsPage />} /><Route path="/stores" element={<StoresPage />} /><Route path="/onboarding" element={<OnboardingPage />} /><Route path="/scripts" element={<ScriptsPage />} /><Route path="/audit" element={<AuditPage />} /><Route path="/settings" element={<SettingsPage user={data.user} onLogout={() => queryClient.removeQueries({ queryKey: ["auth", "me"] })} onPasswordChanged={updatePasswordState} />} /><Route path="*" element={<Navigate to="/" replace />} /></Routes></Suspense></DrawerProvider></AppShell>;
 }
