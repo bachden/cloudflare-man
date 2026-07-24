@@ -477,6 +477,8 @@ test("allocates a store and issues bootstrap URLs", async () => {
   assert.match(windowsScript.body, /X-Cloudflare-Man-Agent-Token/);
   assert.match(windowsScript.body, /sc\.exe failure cloudflared/);
   assert.match(windowsScript.body, /RestartCount 999/);
+  assert.match(windowsScript.body, /\$cleanupExitCode = \$LASTEXITCODE/);
+  assert.match(windowsScript.body, /\$ErrorActionPreference = "Continue"/);
   assert.match(windowsScript.body, /Get-CimInstance Win32_OperatingSystem/);
   assert.match(windowsScript.body, /platform = "windows"/);
 });
@@ -1138,6 +1140,8 @@ test("tracks enrollment history and issues cleanup for a running tunnel", async 
   const cleanupPowerShell = await app.inject({ method: "GET", url: `/e/${cleanupToken}/unenroll.ps1` });
   assert.equal(cleanupPowerShell.statusCode, 200, cleanupPowerShell.body);
   assert.match(cleanupPowerShell.body, /Run PowerShell as Administrator/);
+  assert.match(cleanupPowerShell.body, /\$uninstallExitCode = \$LASTEXITCODE/);
+  assert.match(cleanupPowerShell.body, /cloudflared writes INF messages to stderr/);
 
   const cleanupClaim = await app.inject({
     method: "POST",

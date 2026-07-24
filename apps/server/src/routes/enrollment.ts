@@ -613,11 +613,28 @@ if ($existingEnrollment) {
   }
   Send-InstallLog -Level "info" -Step "cleanup" -Message "User approved cleanup and override"
   if (Test-Path $binary) {
-    $cleanupOutput = & $binary service uninstall 2>&1
+    $previousErrorActionPreference = $ErrorActionPreference
+    try {
+      # cloudflared writes informational messages to stderr. PowerShell 5.1
+      # turns native stderr into ErrorRecord objects when the global policy is Stop.
+      $ErrorActionPreference = "Continue"
+      $cleanupOutput = @(& $binary service uninstall 2>&1)
+      $cleanupExitCode = $LASTEXITCODE
+    } finally {
+      $ErrorActionPreference = $previousErrorActionPreference
+    }
     foreach ($line in $cleanupOutput) { Send-InstallLog -Level "info" -Step "cleanup" -Message $line.ToString() }
+    if ($cleanupExitCode -ne 0) {
+      $remainingService = Get-Service -Name "cloudflared" -ErrorAction SilentlyContinue
+      if ($remainingService) {
+        Send-InstallLog -Level "warn" -Step "cleanup" -Message "cloudflared uninstall exited with code $cleanupExitCode; removing the remaining service"
+        Stop-Service -Name "cloudflared" -Force -ErrorAction SilentlyContinue
+        Start-Process -FilePath (Join-Path $env:SystemRoot "System32\\sc.exe") -ArgumentList "delete", "cloudflared" -Wait -NoNewWindow
+      }
+    }
   } elseif ($existingService) {
     Stop-Service -Name "cloudflared" -Force -ErrorAction SilentlyContinue
-    & sc.exe delete cloudflared | Out-Null
+    Start-Process -FilePath (Join-Path $env:SystemRoot "System32\\sc.exe") -ArgumentList "delete", "cloudflared" -Wait -NoNewWindow
   }
   Stop-ScheduledTask -TaskName "CloudflareManCommandAgent" -ErrorAction SilentlyContinue
   Unregister-ScheduledTask -TaskName "CloudflareManCommandAgent" -Confirm:$false -ErrorAction SilentlyContinue
@@ -862,7 +879,29 @@ try {
   Send-CleanupLog -Level "info" -Message "Unenrollment script claimed for windows"
   Send-CleanupLog -Level "info" -Message "Stopping and removing the cloudflared service for ${hostname}"
   $binary = Join-Path $env:ProgramFiles "cloudflared\\cloudflared.exe"
-  if (Test-Path $binary) { & $binary service uninstall 2>&1 | ForEach-Object { Send-CleanupLog -Level "info" -Message $_.ToString() } }
+  if (Test-Path $binary) {
+    $previousErrorActionPreference = $ErrorActionPreference
+    try {
+      # cloudflared writes INF messages to stderr even when uninstall succeeds.
+      # Capture native output without promoting it to a terminating PowerShell error.
+      $ErrorActionPreference = "Continue"
+      $uninstallOutput = @(& $binary service uninstall 2>&1)
+      $uninstallExitCode = $LASTEXITCODE
+    } finally {
+      $ErrorActionPreference = $previousErrorActionPreference
+    }
+    foreach ($line in $uninstallOutput) { Send-CleanupLog -Level "info" -Message $line.ToString() }
+    if ($uninstallExitCode -ne 0) {
+      $remainingService = Get-Service -Name "cloudflared" -ErrorAction SilentlyContinue
+      if ($remainingService) {
+        Send-CleanupLog -Level "warn" -Message "cloudflared uninstall exited with code $uninstallExitCode; removing the remaining service"
+        Stop-Service -Name "cloudflared" -Force -ErrorAction SilentlyContinue
+        Start-Process -FilePath (Join-Path $env:SystemRoot "System32\\sc.exe") -ArgumentList "delete", "cloudflared" -Wait -NoNewWindow
+      } else {
+        Send-CleanupLog -Level "warn" -Message "cloudflared uninstall exited with code $uninstallExitCode, but the service is already absent"
+      }
+    }
+  }
   Stop-ScheduledTask -TaskName "CloudflareManCommandAgent" -ErrorAction SilentlyContinue
   Unregister-ScheduledTask -TaskName "CloudflareManCommandAgent" -Confirm:$false -ErrorAction SilentlyContinue
   Get-CimInstance Win32_Process -Filter "Name = 'powershell.exe'" -ErrorAction SilentlyContinue |
@@ -871,7 +910,7 @@ try {
   $service = Get-Service -Name "cloudflared" -ErrorAction SilentlyContinue
   if ($service) {
     Stop-Service -Name "cloudflared" -Force -ErrorAction SilentlyContinue
-    & sc.exe delete cloudflared | Out-Null
+    Start-Process -FilePath (Join-Path $env:SystemRoot "System32\\sc.exe") -ArgumentList "delete", "cloudflared" -Wait -NoNewWindow
   }
   $stateDirectory = Join-Path $env:ProgramData "cloudflare-man"
   if (Test-Path $stateDirectory) { Remove-Item $stateDirectory -Recurse -Force }
