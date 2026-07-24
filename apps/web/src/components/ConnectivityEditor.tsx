@@ -32,6 +32,14 @@ export function createDraftPublication(serviceUrl = ""): DraftPublication {
   };
 }
 
+export function createCommandAgentDraftPublication(): DraftPublication {
+  return {
+    key: draftId("publication"),
+    suffix: "",
+    routes: [{ key: draftId("route"), path: "/exec", serviceUrl: "", kind: "command_agent" }]
+  };
+}
+
 export function validatePublications(publications: DraftPublication[]): string | null {
   if (publications.length === 0) return "Add at least one subdomain";
   const suffixes = new Set<string>();

@@ -263,10 +263,15 @@ function createMcpServer(app: FastifyInstance, token: string): McpServer {
     storeId: z.string().uuid(),
     enrollmentId: z.string().uuid()
   }, (args) => callApi(app, token, "DELETE", `/api/stores/${args.storeId}/enrollments/${args.enrollmentId}`));
-  registerApiTool(server, app, token, "cfman_issue_unenrollment", "Issue Windows and Unix unenrollment commands for the current connected enrollment.", {
+  registerApiTool(server, app, token, "cfman_issue_unenrollment", "Issue unenrollment for the current connected enrollment. Optionally schedule the cleanup through its command agent; the response retains manual fallback URLs plus enrollment and command execution IDs.", {
     storeId: z.string().uuid(),
-    enrollmentId: z.string().uuid()
-  }, (args) => callApi(app, token, "POST", `/api/stores/${args.storeId}/enrollments/${args.enrollmentId}/unenroll`));
+    enrollmentId: z.string().uuid(),
+    automatic: z.boolean().default(false),
+    expiresInHours: z.number().int().min(1).max(168).default(24)
+  }, (args) => {
+    const { storeId, enrollmentId, ...body } = args;
+    return callApi(app, token, "POST", `/api/stores/${storeId}/enrollments/${enrollmentId}/unenroll`, body);
+  });
   registerApiTool(server, app, token, "cfman_verify_store", "Verify a store, publication, or individual ingress route endpoint.", {
     storeId: z.string().uuid(),
     publicationId: z.string().uuid().optional(),

@@ -105,6 +105,10 @@ const enrollmentSchema = z.object({
   expiresInHours: z.number().int().min(1).max(168).default(24)
 });
 
+const unenrollmentRequestSchema = enrollmentSchema.extend({
+  automatic: z.boolean().default(false)
+});
+
 const executeScriptSchema = z.object({
   scriptVersionId: z.string().uuid().optional(),
   inlineScript: z.string().min(1).max(262_144).refine((value) => value.trim().length > 0, "Inline script content is required").optional(),
@@ -188,6 +192,22 @@ async function unenrollmentUrls(token: string) {
     shell: `${publicBaseUrl}/e/${token}/unenroll.sh`,
     powershell: `${publicBaseUrl}/e/${token}/unenroll.ps1`
   };
+}
+
+function automaticUnenrollmentScript(platform: "windows" | "unix", url: string): string {
+  if (platform === "windows") {
+    const escapedUrl = url.replaceAll("'", "''");
+    const delayedCleanup = `$ErrorActionPreference = "Stop"; Start-Sleep -Seconds 2; irm '${escapedUrl}' | iex`;
+    const encodedCommand = Buffer.from(delayedCleanup, "utf16le").toString("base64");
+    return `$ErrorActionPreference = "Stop"
+Start-Process -FilePath "powershell.exe" -ArgumentList "-NoProfile","-ExecutionPolicy","Bypass","-EncodedCommand","${encodedCommand}" -WindowStyle Hidden
+Write-Output "Automatic unenrollment scheduled. The command agent and cloudflared services will stop shortly."
+`;
+  }
+  const delayedCleanup = `sleep 2; curl -fsSL '${url.replaceAll("'", `'\"'\"'`)}' | /bin/sh`;
+  return `nohup /bin/sh -c '${delayedCleanup.replaceAll("'", `'\"'\"'`)}' >/tmp/cloudflare-man-unenroll.log 2>&1 &
+printf '%s\n' 'Automatic unenrollment scheduled. The command agent and cloudflared services will stop shortly.'
+`;
 }
 
 async function loadStoreDeleteContext(executor: StoreDeleteExecutor, storeId: string): Promise<StoreDeleteContext | null> {
@@ -725,12 +745,12 @@ export async function storeRoutes(app: FastifyInstance): Promise<void> {
       storeId: z.string().uuid(),
       enrollmentId: z.string().uuid()
     }).parse(request.params);
-    const body = enrollmentSchema.parse(request.body ?? {});
+    const body = unenrollmentRequestSchema.parse(request.body ?? {});
     const rawToken = createOpaqueToken();
     const expiresAt = new Date(Date.now() + body.expiresInHours * 60 * 60 * 1000);
     const issued = await withTransaction(async (client) => {
       const result = await client.query(
-        `SELECT e.id, e.created_at, e.status, e.unenrolled_at, e.deleted_at,
+        `SELECT e.id, e.created_at, e.status, e.platform, e.unenrolled_at, e.deleted_at,
                 e.status IN ('ready', 'installed')
                 AND e.unenrolled_at IS NULL
                 AND e.deleted_at IS NULL
@@ -774,15 +794,68 @@ export async function storeRoutes(app: FastifyInstance): Promise<void> {
         entityId: enrollmentId,
         details: { storeId, expiresAt }
       }, client);
-      return { kind: "issued" as const, createdAt: enrollment.created_at as string };
+      return { kind: "issued" as const, createdAt: enrollment.created_at as string, platform: enrollment.platform as string | null };
     });
     if (issued.kind === "missing") return reply.code(404).send({ error: "Enrollment not found" });
     if (issued.kind === "not_current") return reply.code(409).send({ error: "Only the current connected enrollment can be unenrolled" });
+    const urls = await unenrollmentUrls(rawToken);
+    let automatic: {
+      requested: boolean;
+      status: "scheduled" | "failed" | "unavailable";
+      executionId: string | null;
+      platform: "windows" | "unix" | null;
+      error: string | null;
+    } | undefined;
+    if (body.automatic) {
+      const platform = issued.platform === "windows"
+        ? "windows"
+        : issued.platform && ["linux", "darwin", "unix"].includes(issued.platform)
+          ? "unix"
+          : null;
+      const agent = await getCommandAgentConfig(storeId);
+      if (!platform) {
+        automatic = { requested: true, status: "unavailable", executionId: null, platform: null, error: "The connected enrollment platform is unknown" };
+      } else if (!agent || agent.status !== "ready") {
+        automatic = { requested: true, status: "unavailable", executionId: null, platform, error: "The command agent is not ready" };
+      } else {
+        const script = automaticUnenrollmentScript(platform, platform === "windows" ? urls.powershell : urls.shell);
+        const executionId = await createCommandExecution({
+          storeId,
+          enrollmentId,
+          scriptVersionId: null,
+          requestedBy: request.authUser!.id,
+          script,
+          timeoutMs: 30_000,
+          scriptType: "inline",
+          scriptName: "Automatic unenrollment",
+          scriptPlatform: platform,
+          scriptLanguage: platform === "windows" ? "powershell" : "sh",
+          scriptVersion: null
+        });
+        try {
+          const execution = await executeStoreScript(storeId, script, 30_000, executionId);
+          automatic = execution?.success
+            ? { requested: true, status: "scheduled", executionId, platform, error: null }
+            : { requested: true, status: "failed", executionId, platform, error: execution?.stderr || "The command agent did not schedule cleanup" };
+        } catch (error) {
+          automatic = { requested: true, status: "failed", executionId, platform, error: error instanceof Error ? error.message : "Automatic unenrollment failed" };
+        }
+        await writeAudit({
+          actorUserId: request.authUser!.id,
+          action: "enrollment.unenroll_automatic_requested",
+          entityType: "enrollment",
+          entityId: enrollmentId,
+          details: { storeId, executionId, platform, status: automatic.status, error: automatic.error }
+        });
+      }
+    }
     return {
+      storeId,
       enrollmentId,
       createdAt: issued.createdAt,
       expiresAt,
-      urls: await unenrollmentUrls(rawToken)
+      urls,
+      ...(automatic ? { automatic } : {})
     };
   });
 

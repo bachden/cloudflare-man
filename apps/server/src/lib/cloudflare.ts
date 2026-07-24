@@ -235,8 +235,15 @@ export class CloudflareClient {
 
     let ruleset: CloudflareRuleset | undefined;
     if (input.rulesetId) {
-      const candidate = await this.request<CloudflareRuleset>(`/zones/${input.zoneId}/rulesets/${input.rulesetId}`);
-      if (candidate.kind === "zone" && candidate.phase === "http_request_firewall_custom") ruleset = candidate;
+      try {
+        const candidate = await this.request<CloudflareRuleset>(`/zones/${input.zoneId}/rulesets/${input.rulesetId}`);
+        if (candidate.kind === "zone" && candidate.phase === "http_request_firewall_custom") ruleset = candidate;
+      } catch (error) {
+        if (!input.enabled && (error as Error & { status?: number }).status === 404) {
+          return { rulesetId: null, ruleId: null };
+        }
+        throw error;
+      }
     }
     if (!ruleset) {
       const summaries = await this.request<CloudflareRuleset[]>(

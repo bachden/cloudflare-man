@@ -3,7 +3,7 @@ import { ArrowLeft, Check, Network, Store as StoreIcon } from "lucide-react";
 import { useState, type FormEvent } from "react";
 import { toast } from "sonner";
 import { ApiError, api } from "../api";
-import { ConnectivityEditor, connectivityPayload, createDraftPublication, validatePublications, type DraftPublication } from "../components/ConnectivityEditor";
+import { ConnectivityEditor, connectivityPayload, createCommandAgentDraftPublication, validatePublications, type DraftPublication } from "../components/ConnectivityEditor";
 import { FieldHelp } from "../components/FieldHelp";
 import { PageHeader } from "../components/PageHeader";
 import { SearchableSelect } from "../components/SearchableSelect";
@@ -16,7 +16,7 @@ export function OnboardingPage() {
   const [error, setError] = useState("");
   const [storeCode, setStoreCode] = useState("");
   const [zoneId, setZoneId] = useState("");
-  const [publications, setPublications] = useState<DraftPublication[]>([createDraftPublication("http://localhost:8080")]);
+  const [publications, setPublications] = useState<DraftPublication[]>([createCommandAgentDraftPublication()]);
   const { data: accountData } = useQuery({ queryKey: ["accounts"], queryFn: () => api.get<{ accounts: CloudflareAccount[] }>("/api/accounts") });
   const mutation = useMutation({
     mutationFn: async (body: Record<string, unknown>) => {

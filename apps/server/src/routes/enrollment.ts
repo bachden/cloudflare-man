@@ -1,10 +1,11 @@
 import type { FastifyInstance, FastifyReply } from "fastify";
 import { isIP } from "node:net";
+import type { PoolClient } from "pg";
 import { z } from "zod";
 import { config } from "../config.js";
 import { getPublicBaseUrl } from "../lib/app-settings.js";
 import { pool, withTransaction } from "../lib/database.js";
-import { provisionStore } from "../lib/provisioning.js";
+import { deprovisionStore, provisionStore, withStoreCloudflareLock } from "../lib/provisioning.js";
 import { provisionBrowserRdp } from "../lib/rdp.js";
 import { hashToken } from "../lib/security.js";
 import { scheduleStoreVerification } from "../lib/store-verification.js";
@@ -994,32 +995,6 @@ export async function enrollmentRoutes(app: FastifyInstance): Promise<void> {
     }
 
     const scriptPlatform = normalizeScriptPlatform(body.platform)!;
-    if (body.overrideExisting) {
-      await pool.query(
-        `UPDATE enrollments
-            SET status = 'unenrolled', unenrolled_at = COALESCE(unenrolled_at, now()),
-                unenroll_reason = 'override', unenroll_token_hash = null,
-                unenroll_token_expires_at = null, unenroll_requested_at = null,
-                unenroll_last_error = null, updated_at = now()
-          WHERE store_id = $1
-            AND id <> $2
-            AND status IN ('claimed', 'provisioning', 'ready', 'installed')
-            AND unenrolled_at IS NULL
-            AND deleted_at IS NULL`,
-        [enrollment.store_id, enrollment.id]
-      );
-      await pool.query(
-        `UPDATE enrollment_scripts
-            SET status = 'staled_ignored', finished_at = COALESCE(finished_at, now()),
-                last_error = 'Skipped because a new enrollment overrode this instance', updated_at = now()
-          WHERE script_kind = 'unenroll'
-            AND enrollment_id IN (
-              SELECT id FROM enrollments
-               WHERE store_id = $2 AND id <> $1 AND unenroll_reason = 'override'
-            )`,
-        [enrollment.id, enrollment.store_id]
-      );
-    }
     await pool.query(
       `UPDATE enrollment_scripts
           SET status = CASE WHEN platform = $1 THEN 'running' ELSE 'staled_ignored' END,
@@ -1032,7 +1007,54 @@ export async function enrollmentRoutes(app: FastifyInstance): Promise<void> {
     );
 
     try {
-      const provisioned = await provisionStore(enrollment.store_id);
+      const provision = async (lockClient?: PoolClient) => {
+        if (body.overrideExisting) {
+          const previousEnrollments = await pool.query(
+            `SELECT id
+               FROM enrollments
+              WHERE store_id = $1
+                AND id <> $2
+                AND status IN ('claimed', 'provisioning', 'ready', 'installed')
+                AND unenrolled_at IS NULL
+                AND deleted_at IS NULL
+              ORDER BY COALESCE(installed_at, claimed_at, created_at) DESC`,
+            [enrollment.store_id, enrollment.id]
+          );
+          if (previousEnrollments.rowCount) {
+            // Hold the store lock until the replacement tunnel is provisioned,
+            // preventing a late cleanup report from deleting the new tunnel.
+            await deprovisionStore(enrollment.store_id, "override", lockClient);
+          }
+          await pool.query(
+            `UPDATE enrollments
+                SET status = 'unenrolled', unenrolled_at = COALESCE(unenrolled_at, now()),
+                    unenroll_reason = 'override', unenroll_token_hash = null,
+                    unenroll_token_expires_at = null, unenroll_requested_at = null,
+                    unenroll_last_error = null, updated_at = now()
+              WHERE store_id = $1
+                AND id <> $2
+                AND status IN ('claimed', 'provisioning', 'ready', 'installed')
+                AND unenrolled_at IS NULL
+                AND deleted_at IS NULL`,
+            [enrollment.store_id, enrollment.id]
+          );
+          await pool.query(
+            `UPDATE enrollment_scripts
+                SET status = 'staled_ignored', finished_at = COALESCE(finished_at, now()),
+                    last_error = 'Skipped because a new enrollment overrode this instance', updated_at = now()
+              WHERE script_kind = 'unenroll'
+                AND enrollment_id IN (
+                  SELECT id FROM enrollments
+                   WHERE store_id = $2 AND id <> $1 AND unenroll_reason = 'override'
+                )`,
+            [enrollment.id, enrollment.store_id]
+          );
+        }
+        return provisionStore(enrollment.store_id);
+      };
+      const provisioned = body.overrideExisting
+        ? await withStoreCloudflareLock(enrollment.store_id, provision)
+        : await provision();
       const agentToken = await commandAgentToken(enrollment.store_id);
       await pool.query("UPDATE enrollments SET status = 'ready', last_error = null, updated_at = now() WHERE id = $1", [enrollment.id]);
       if (request.headers.accept?.includes("text/plain")) {
@@ -1150,33 +1172,53 @@ export async function enrollmentRoutes(app: FastifyInstance): Promise<void> {
       });
       return { success: false };
     }
-    await withTransaction(async (client) => {
-      await client.query(
-        `UPDATE enrollments
-            SET status = 'unenrolled', unenrolled_at = COALESCE(unenrolled_at, now()), unenroll_reason = 'script', unenroll_last_error = null, updated_at = now()
-          WHERE id = $1`,
-        [enrollment.id]
-      );
-      await client.query(
-        `UPDATE enrollment_scripts
-            SET status = 'completed', finished_at = now(), last_error = null, updated_at = now()
-          WHERE enrollment_id = $1 AND script_kind = 'unenroll' AND platform = $2`,
-        [enrollment.id, body.platform]
-      );
-      await client.query(
-        `UPDATE stores SET tunnel_status = 'inactive', updated_at = now()
-          WHERE id = $1
-            AND NOT EXISTS (
-              SELECT 1 FROM enrollments active
-               WHERE active.store_id = $1
-                 AND active.id <> $2
-               AND active.status IN ('claimed', 'provisioning', 'ready', 'installed')
-               AND active.unenrolled_at IS NULL
-               AND active.deleted_at IS NULL
-            )`,
-        [enrollment.store_id, enrollment.id]
-      );
-    });
+    try {
+      const completed = await withStoreCloudflareLock(enrollment.store_id, async (lockClient) => {
+        const stillCurrent = await pool.query(
+          `SELECT 1
+             FROM enrollments
+            WHERE id = $1 AND store_id = $2 AND unenroll_token_hash = $3
+              AND unenrolled_at IS NULL AND deleted_at IS NULL
+              AND unenroll_token_expires_at > now()`,
+          [enrollment.id, enrollment.store_id, hashToken(body.token)]
+        );
+        if (!stillCurrent.rowCount) return false;
+        // The local script has already stopped its services. The server now
+        // removes DNS, WAF, RDP and tunnel resources before success is stored.
+        await deprovisionStore(enrollment.store_id, "unenroll", lockClient);
+        await withTransaction(async (client) => {
+          await client.query(
+            `UPDATE enrollments
+                SET status = 'unenrolled', unenrolled_at = COALESCE(unenrolled_at, now()), unenroll_reason = 'script', unenroll_last_error = null, updated_at = now()
+              WHERE id = $1`,
+            [enrollment.id]
+          );
+          await client.query(
+            `UPDATE enrollment_scripts
+                SET status = 'completed', finished_at = now(), last_error = null, updated_at = now()
+              WHERE enrollment_id = $1 AND script_kind = 'unenroll' AND platform = $2`,
+            [enrollment.id, body.platform]
+          );
+        });
+        return true;
+      });
+      if (!completed) return reply.code(409).send({ success: false, error: "Unenrollment was superseded by a newer enrollment" });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Cloudflare cleanup failed";
+      await withTransaction(async (client) => {
+        await client.query(
+          `UPDATE enrollments SET unenroll_last_error = $1, updated_at = now() WHERE id = $2`,
+          [message, enrollment.id]
+        );
+        await client.query(
+          `UPDATE enrollment_scripts
+              SET status = 'failed', finished_at = now(), last_error = $1, updated_at = now()
+            WHERE enrollment_id = $2 AND script_kind = 'unenroll' AND platform = $3`,
+          [message, enrollment.id, body.platform]
+        );
+      });
+      return reply.code(502).send({ success: false, error: message });
+    }
     return { success: true };
   });
 

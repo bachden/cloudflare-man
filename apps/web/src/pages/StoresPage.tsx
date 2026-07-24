@@ -91,6 +91,8 @@ export function StoreDrawer({ store, tab, onTabChange, onClose }: { store: Store
   const [enrollment, setEnrollment] = useState<EnrollmentResult | null>(null);
   const [logEnrollment, setLogEnrollment] = useState<StoreEnrollment | null>(null);
   const [unenrollment, setUnenrollment] = useState<UnenrollmentResult | null>(null);
+  const [unenrollTarget, setUnenrollTarget] = useState<StoreEnrollment | null>(null);
+  const [automaticUnenroll, setAutomaticUnenroll] = useState(true);
   const [deleteEnrollmentTarget, setDeleteEnrollmentTarget] = useState<StoreEnrollment | null>(null);
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [deletePreflight, setDeletePreflight] = useState<StoreDeletePreflight | null>(null);
@@ -101,7 +103,8 @@ export function StoreDrawer({ store, tab, onTabChange, onClose }: { store: Store
     queryKey: ["store-detail", store?.id],
     queryFn: () => api.get<{ store: Store }>(`/api/stores/${store!.id}`),
     enabled: Boolean(store),
-    refetchInterval: (query) => query.state.data?.store.commandExecutions?.some((execution) => execution.status === "running") ? 2000 : false
+    refetchInterval: (query) => query.state.data?.store.commandExecutions?.some((execution) => execution.status === "running")
+      || query.state.data?.store.enrollments?.some((item) => item.unenrollStatus === "pending") ? 2000 : false
   });
   const currentStore = detailData?.store ?? store;
   useEffect(() => setEditingConnectivity(false), [store?.id]);
@@ -133,11 +136,17 @@ export function StoreDrawer({ store, tab, onTabChange, onClose }: { store: Store
     onError: (error) => toast.error(error instanceof Error ? error.message : "Unable to delete enrollment")
   });
   const issueUnenrollment = useMutation({
-    mutationFn: (enrollmentId: string) => api.post<UnenrollmentResult>(`/api/stores/${store!.id}/enrollments/${enrollmentId}/unenroll`, { expiresInHours: 24 }),
+    mutationFn: ({ enrollmentId, automatic }: { enrollmentId: string; automatic: boolean }) => api.post<UnenrollmentResult>(`/api/stores/${store!.id}/enrollments/${enrollmentId}/unenroll`, { expiresInHours: 24, automatic }),
     onSuccess: async (result) => {
+      setUnenrollTarget(null);
       setUnenrollment(result);
-      await queryClient.invalidateQueries({ queryKey: ["store-detail", store?.id] });
-      toast.success("Unenrollment command issued");
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["store-detail", store?.id] }),
+        queryClient.invalidateQueries({ queryKey: ["stores"] })
+      ]);
+      if (result.automatic?.status === "scheduled") toast.success("Automatic unenrollment scheduled");
+      else if (result.automatic) toast.warning(`${result.automatic.error ?? "Automatic unenrollment is unavailable"}. Use the manual command.`);
+      else toast.success("Unenrollment command issued");
     },
     onError: (error) => toast.error(error instanceof Error ? error.message : "Unable to issue unenrollment command")
   });
@@ -177,7 +186,11 @@ export function StoreDrawer({ store, tab, onTabChange, onClose }: { store: Store
     setDeleteOpen(true);
     deletePreflightMutation.mutate();
   };
-  const close = () => { setEnrollment(null); setUnenrollment(null); setLogEnrollment(null); setDeleteEnrollmentTarget(null); setDeleteOpen(false); setDeletePreflight(null); setDeleteName(""); setEditingConnectivity(false); setWafRoute(null); onClose(); };
+  const openUnenroll = (target: StoreEnrollment) => {
+    setAutomaticUnenroll(Boolean(currentStore?.commandAgent?.status === "ready" && target.platform));
+    setUnenrollTarget(target);
+  };
+  const close = () => { setEnrollment(null); setUnenrollment(null); setUnenrollTarget(null); setLogEnrollment(null); setDeleteEnrollmentTarget(null); setDeleteOpen(false); setDeletePreflight(null); setDeleteName(""); setEditingConnectivity(false); setWafRoute(null); onClose(); };
   return (
     <>
     <SideDrawer open={Boolean(store)} title={<div className="store-drawer-heading"><strong>{currentStore?.displayName ?? "Store details"}</strong>{currentStore && <div className="store-drawer-statuses"><div><span>Onboarding</span><StatusBadge status={currentStore.onboardingStatus} /></div><div><span>Tunnel</span><StatusBadge status={currentStore.tunnelStatus} /></div><div><span>RDP</span><StatusBadge status={currentStore.rdpStatus} /></div></div>}</div>} onClose={close}>
@@ -197,7 +210,7 @@ export function StoreDrawer({ store, tab, onTabChange, onClose }: { store: Store
               <div><dt>Tunnel ID</dt><dd>{currentStore.tunnelId ? currentStore.cfAccountId ? <a className="mono detail-link" href={`https://dash.cloudflare.com/${encodeURIComponent(currentStore.cfAccountId)}/tunnels/${encodeURIComponent(currentStore.tunnelId)}/overview`} target="_blank" rel="noreferrer" title="Open tunnel details in Cloudflare">{currentStore.tunnelId}</a> : <span className="mono">{currentStore.tunnelId}</span> : "Not provisioned"}</dd></div>
             </dl>
           </section>
-          <EnrollmentHistory enrollments={currentStore.enrollments ?? []} onViewLog={setLogEnrollment} onDelete={(enrollment) => setDeleteEnrollmentTarget(enrollment)} onUnenroll={(enrollment) => issueUnenrollment.mutate(enrollment.id)} deleting={deleteEnrollment.isPending} unenrolling={issueUnenrollment.isPending} />
+          <EnrollmentHistory enrollments={currentStore.enrollments ?? []} onViewLog={setLogEnrollment} onDelete={(enrollment) => setDeleteEnrollmentTarget(enrollment)} onUnenroll={openUnenroll} deleting={deleteEnrollment.isPending} unenrolling={issueUnenrollment.isPending} />
           {unenrollment && <UnenrollmentCommands result={unenrollment} />}
           {enrollment ? <EnrollmentCommands result={enrollment} /> : <div className="detail-actions">
             <button className="button button-primary" onClick={() => mutation.mutate()} disabled={mutation.isPending}><TerminalSquare size={16} />{mutation.isPending ? "Issuing..." : "New enrollment"}</button>
@@ -221,6 +234,7 @@ export function StoreDrawer({ store, tab, onTabChange, onClose }: { store: Store
         </div>}
       </div>}
     </SideDrawer>
+    <UnenrollDialog enrollment={unenrollTarget} commandAgent={currentStore?.commandAgent ?? null} automatic={automaticUnenroll} onAutomaticChange={setAutomaticUnenroll} onClose={() => setUnenrollTarget(null)} onConfirm={() => unenrollTarget && issueUnenrollment.mutate({ enrollmentId: unenrollTarget.id, automatic: automaticUnenroll })} submitting={issueUnenrollment.isPending} />
     <EnrollmentDeleteDialog enrollment={deleteEnrollmentTarget} onClose={() => setDeleteEnrollmentTarget(null)} onConfirm={() => deleteEnrollmentTarget && deleteEnrollment.mutate(deleteEnrollmentTarget.id)} deleting={deleteEnrollment.isPending} />
     <StoreDeleteDialog open={deleteOpen} preflight={deletePreflight} loading={deletePreflightMutation.isPending} confirmationName={deleteName} onConfirmationNameChange={setDeleteName} onClose={() => { setDeleteOpen(false); setDeletePreflight(null); setDeleteName(""); }} onConfirm={() => deleteStore.mutate()} deleting={deleteStore.isPending} />
     <RouteWafDialog store={currentStore} route={wafRoute} onClose={() => setWafRoute(null)} />
@@ -267,6 +281,28 @@ function EnrollmentDeleteDialog({ enrollment, onClose, onConfirm, deleting }: { 
     <div className="enrollment-delete-dialog">
       <div className="inline-alert enrollment-delete-no-logs"><Trash2 size={15} />This permanently deletes the enrollment. Its logs will no longer be available to view.</div>
       <div className="form-actions"><button className="button button-secondary" type="button" onClick={onClose}>Cancel</button><button className="button button-danger" type="button" onClick={onConfirm} disabled={deleting}><Trash2 size={15} />{deleting ? "Deleting..." : "Delete permanently"}</button></div>
+    </div>
+  </Modal>;
+}
+
+function UnenrollDialog({ enrollment, commandAgent, automatic, onAutomaticChange, onClose, onConfirm, submitting }: {
+  enrollment: StoreEnrollment | null;
+  commandAgent: Store["commandAgent"];
+  automatic: boolean;
+  onAutomaticChange: (value: boolean) => void;
+  onClose: () => void;
+  onConfirm: () => void;
+  submitting: boolean;
+}) {
+  const automaticAvailable = Boolean(commandAgent?.status === "ready" && enrollment?.platform);
+  return <Modal open={Boolean(enrollment)} title={enrollment ? <span className="host-identity"><HostPlatformIcon environment={enrollment.environment} platform={enrollment.platform} osName={enrollment.hostInfo.osName} /><span>Unenroll · {enrollmentComputerName(enrollment)}</span></span> : "Unenroll"} onClose={onClose}>
+    <div className="enrollment-delete-dialog">
+      <p>Cloudflare Man will revoke this enrollment only after its local services and all store-owned Cloudflare routes, DNS records, RDP resources, and tunnel have been cleaned up.</p>
+      <label className={`checkbox-field ${automaticAvailable ? "" : "disabled"}`}>
+        <input type="checkbox" checked={automatic && automaticAvailable} disabled={!automaticAvailable} onChange={(event) => onAutomaticChange(event.target.checked)} />
+        <span><strong>Run automatically through command agent</strong><small>{automaticAvailable ? `Send a detached cleanup task to ${commandAgent?.endpoint}. Manual commands remain available as fallback.` : "The connected enrollment needs a ready command agent and a detected platform."}</small></span>
+      </label>
+      <div className="form-actions"><button className="button button-secondary" type="button" onClick={onClose}>Cancel</button><button className="button button-danger" type="button" onClick={onConfirm} disabled={submitting}><Unplug size={15} />{submitting ? "Unenrolling..." : automatic && automaticAvailable ? "Unenroll automatically" : "Issue cleanup command"}</button></div>
     </div>
   </Modal>;
 }
@@ -672,5 +708,10 @@ function UnenrollmentCommands({ result }: { result: UnenrollmentResult }) {
   const powershellUrl = withCurrentBaseUrl(result.urls.powershell);
   const shellUrl = withCurrentBaseUrl(result.urls.shell);
   const command = platform === "windows" ? `irm '${powershellUrl}' | iex` : `curl -fsSL '${shellUrl}' | sudo bash`;
-  return <div className="unenroll-command-panel"><div className="command-note"><ShieldAlert size={14} />Run this cleanup command on the connected store machine. It expires {new Date(result.expiresAt).toLocaleString()}.</div><div className="command-head"><div className="segmented compact"><button type="button" className={platform === "windows" ? "active" : ""} onClick={() => setPlatform("windows")}>PowerShell</button><button type="button" className={platform === "unix" ? "active" : ""} onClick={() => setPlatform("unix")}>Bash</button></div><CopyButton value={command} label="Copy unenroll command" /></div><pre><code>{command}</code></pre>{platform === "windows" && <div className="command-note"><ShieldAlert size={14} />Run PowerShell as Administrator.</div>}</div>;
+  const note = result.automatic?.status === "scheduled"
+    ? "Automatic cleanup was scheduled through the command agent. Use this manual command only if the enrollment does not complete."
+    : result.automatic
+      ? `${result.automatic.error ?? "Automatic cleanup is unavailable"}. Run this cleanup command on the connected store machine.`
+      : "Run this cleanup command on the connected store machine.";
+  return <div className="unenroll-command-panel"><div className="command-note"><ShieldAlert size={14} />{note} It expires {new Date(result.expiresAt).toLocaleString()}.</div><div className="command-head"><div className="segmented compact"><button type="button" className={platform === "windows" ? "active" : ""} onClick={() => setPlatform("windows")}>PowerShell</button><button type="button" className={platform === "unix" ? "active" : ""} onClick={() => setPlatform("unix")}>Bash</button></div><CopyButton value={command} label="Copy unenroll command" /></div><pre><code>{command}</code></pre>{platform === "windows" && <div className="command-note"><ShieldAlert size={14} />Run PowerShell as Administrator.</div>}</div>;
 }

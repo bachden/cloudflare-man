@@ -241,11 +241,19 @@ export type EnrollmentResult = {
 };
 
 export type UnenrollmentResult = {
+  storeId: string;
   enrollmentId: string;
   createdAt: string;
   expiresAt: string;
   urls: {
     shell: string;
     powershell: string;
+  };
+  automatic?: {
+    requested: boolean;
+    status: "scheduled" | "failed" | "unavailable";
+    executionId: string | null;
+    platform: "windows" | "unix" | null;
+    error: string | null;
   };
 };

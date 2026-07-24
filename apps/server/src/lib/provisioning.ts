@@ -1,6 +1,7 @@
 import { writeAudit } from "./audit.js";
+import type { PoolClient } from "pg";
 import { CloudflareClient, type CloudflareIngressRule } from "./cloudflare.js";
-import { pool } from "./database.js";
+import { pool, withTransaction } from "./database.js";
 import { decryptSecret } from "./security.js";
 import { slugifyLabel } from "./stores.js";
 import { COMMAND_AGENT_SERVICE_URL } from "./command-agent.js";
@@ -35,6 +36,22 @@ type ProvisioningResult = {
   tunnelId: string;
   hostname: string;
   providerMode: "live" | "mock";
+};
+
+type DeprovisionRoute = {
+  id: string;
+  hostname: string;
+  path: string;
+  wafRulesetId: string | null;
+  wafRuleId: string | null;
+};
+
+type DeprovisionStore = StoreConnectivity & {
+  rdpRouteId: string | null;
+  rdpTargetId: string | null;
+  rdpVnetId: string | null;
+  publications: Array<{ id: string; dnsRecordId: string | null }>;
+  routes: DeprovisionRoute[];
 };
 
 export function pathPrefixPattern(path: string): string | undefined {
@@ -209,6 +226,174 @@ export async function reconfigureStore(
     await pool.query("UPDATE stores SET last_error = $1, updated_at = now() WHERE id = $2", [message, storeId]);
     throw error;
   }
+}
+
+/**
+ * Remove every Cloudflare resource owned by a store while retaining the
+ * connectivity definitions in Postgres for a future enrollment.
+ *
+ * Every delete is idempotent in CloudflareClient (404 is ignored). We still
+ * attempt all resources after an individual failure so a missing permission
+ * on one API family cannot hide DNS/tunnel resources that can be removed.
+ */
+export async function withStoreCloudflareLock<T>(storeId: string, operation: (lockClient: PoolClient) => Promise<T>): Promise<T> {
+  const lockClient = await pool.connect();
+  const lockKey = `cloudflare-man:cloudflare-store:${storeId}`;
+  try {
+    await lockClient.query("SELECT pg_advisory_lock(hashtextextended($1, 0))", [lockKey]);
+    return await operation(lockClient);
+  } finally {
+    await lockClient.query("SELECT pg_advisory_unlock(hashtextextended($1, 0))", [lockKey]).catch(() => undefined);
+    lockClient.release();
+  }
+}
+
+export async function deprovisionStore(
+  storeId: string,
+  reason: "unenroll" | "override" | "delete" = "unenroll",
+  lockClient?: PoolClient
+): Promise<void> {
+  if (!lockClient) {
+    return withStoreCloudflareLock(storeId, (client) => deprovisionStore(storeId, reason, client));
+  }
+  const result = await pool.query(
+    `SELECT s.id, s.tenant_code, s.store_code, s.tunnel_id,
+            a.id AS account_row_id, a.provider_mode, a.cf_account_id, a.api_token_encrypted,
+            z.cf_zone_id,
+            s.rdp_route_id AS "rdpRouteId", s.rdp_target_id AS "rdpTargetId", s.rdp_vnet_id AS "rdpVnetId"
+       FROM stores s
+       JOIN cloudflare_accounts a ON a.id = s.account_id
+       JOIN zones z ON z.id = s.zone_id
+      WHERE s.id = $1`,
+    [storeId]
+  );
+  const store = result.rows[0] as DeprovisionStore | undefined;
+  if (!store) throw new Error("Store not found");
+
+  const publicationResult = await pool.query(
+    `SELECT p.id, p.dns_record_id AS "dnsRecordId", p.hostname,
+            r.id AS route_id, r.path, r.waf_ruleset_id AS "wafRulesetId", r.waf_rule_id AS "wafRuleId"
+       FROM store_publications p
+       LEFT JOIN store_routes r ON r.publication_id = p.id
+      WHERE p.store_id = $1
+      ORDER BY p.created_at, r.sort_order, r.created_at`,
+    [storeId]
+  );
+  store.publications = [];
+  store.routes = [];
+  const publicationById = new Map<string, { id: string; dnsRecordId: string | null }>();
+  for (const row of publicationResult.rows) {
+    let publication = publicationById.get(row.id);
+    if (!publication) {
+      publication = { id: row.id, dnsRecordId: row.dnsRecordId };
+      publicationById.set(row.id, publication);
+      store.publications.push(publication);
+    }
+    if (row.route_id) {
+      store.routes.push({
+        id: row.route_id,
+        hostname: row.hostname,
+        path: row.path,
+        wafRulesetId: row.wafRulesetId,
+        wafRuleId: row.wafRuleId
+      });
+    }
+  }
+
+  const client = cloudflareClient(store);
+  const failures: string[] = [];
+  const attempt = async (label: string, operation: () => Promise<unknown>) => {
+    try {
+      await operation();
+    } catch (error) {
+      failures.push(`${label}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  };
+
+  const zoneId = store.cf_zone_id ?? "mock-zone";
+  for (const route of store.routes) {
+    if (!route.wafRuleId) continue;
+    if (!store.cf_zone_id && store.provider_mode === "live") {
+      failures.push(`WAF ${route.hostname}${route.path}: Cloudflare zone ID is missing`);
+      continue;
+    }
+    await attempt(`WAF ${route.hostname}${route.path}`, () => client.configureRouteWaf({
+      zoneId,
+      hostname: route.hostname,
+      path: route.path,
+      enabled: false,
+      allowedIps: [],
+      rulesetId: route.wafRulesetId
+    }));
+  }
+
+  const deletedDnsRecords = new Set<string>();
+  for (const publication of store.publications) {
+    if (!publication.dnsRecordId || deletedDnsRecords.has(publication.dnsRecordId)) continue;
+    deletedDnsRecords.add(publication.dnsRecordId);
+    if (!store.cf_zone_id && store.provider_mode === "live") {
+      failures.push(`DNS ${publication.dnsRecordId}: Cloudflare zone ID is missing`);
+      continue;
+    }
+    await attempt(`DNS ${publication.dnsRecordId}`, () => client.deleteDnsRecord(zoneId, publication.dnsRecordId!));
+  }
+  if (store.rdpRouteId) await attempt(`RDP route ${store.rdpRouteId}`, () => client.deleteTunnelRoute(store.rdpRouteId!));
+  if (store.rdpTargetId) await attempt(`RDP target ${store.rdpTargetId}`, () => client.deleteInfrastructureTarget(store.rdpTargetId!));
+  if (store.rdpVnetId) await attempt(`RDP virtual network ${store.rdpVnetId}`, () => client.deleteVirtualNetwork(store.rdpVnetId!));
+  if (store.tunnel_id) {
+    await attempt(`Tunnel connections ${store.tunnel_id}`, () => client.deleteTunnelConnections(store.tunnel_id!));
+    await attempt(`Tunnel ${store.tunnel_id}`, () => client.deleteTunnel(store.tunnel_id!));
+  }
+
+  if (failures.length) {
+    const message = `Cloudflare cleanup failed during ${reason}: ${failures.join("; ")}`;
+    await pool.query("UPDATE stores SET last_error = $1, updated_at = now() WHERE id = $2", [message, storeId]);
+    throw new Error(message);
+  }
+
+  await withTransaction(async (database) => {
+    await database.query(
+      `UPDATE store_publications
+          SET dns_record_id = null, status = 'pending', last_error = null, updated_at = now()
+        WHERE store_id = $1`,
+      [storeId]
+    );
+    await database.query(
+      `UPDATE store_routes r
+          SET waf_ruleset_id = null, waf_rule_id = null, updated_at = now()
+        FROM store_publications p
+        WHERE r.publication_id = p.id AND p.store_id = $1`,
+      [storeId]
+    );
+    await database.query(
+      `UPDATE stores
+          SET tunnel_id = null, tunnel_name = null, dns_record_id = null,
+              tunnel_status = 'not_created', rdp_status = 'pending',
+              rdp_target_ip = null, rdp_target_hostname = null,
+              rdp_vnet_id = null, rdp_route_id = null, rdp_target_id = null,
+              rdp_url = null, rdp_last_error = null, last_error = null, updated_at = now()
+        WHERE id = $1`,
+      [storeId]
+    );
+    await database.query(
+      `UPDATE store_command_agents
+          SET status = 'pending', last_error = null, updated_at = now()
+        WHERE store_id = $1`,
+      [storeId]
+    );
+    await writeAudit({
+      action: "store.cloudflare_deprovisioned",
+      entityType: "store",
+      entityId: storeId,
+      details: {
+        reason,
+        tunnelId: store.tunnel_id,
+        dnsRecordCount: deletedDnsRecords.size,
+        routeCount: store.routes.length,
+        rdpResources: [store.rdpRouteId, store.rdpTargetId, store.rdpVnetId].filter(Boolean).length
+      }
+    }, database);
+  });
 }
 
 export async function provisionStore(storeId: string): Promise<ProvisioningResult> {

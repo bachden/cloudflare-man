@@ -110,6 +110,7 @@ test("enables MCP and exposes structured tools with reusable identifiers", async
   assert.ok(listed.json().result.tools.some((tool: { name: string }) => tool.name === "cfman_delete_script"));
   assert.ok(listed.json().result.tools.some((tool: { name: string }) => tool.name === "cfman_get_store_execution_history"));
   assert.ok(listed.json().result.tools.some((tool: { name: string }) => tool.name === "cfman_update_account_support_email"));
+  assert.ok(listed.json().result.tools.some((tool: { name: string }) => tool.name === "cfman_issue_unenrollment"));
 
   const created = await mcpRequest({
     jsonrpc: "2.0",
@@ -1056,7 +1057,80 @@ test("tracks enrollment history and issues cleanup for a running tunnel", async 
   assert.equal(issued.unenrollCommands[0].enrollmentId, enrollmentId);
   assert.match(issued.unenrollCommands[0].urls.shell, /\/unenroll\.sh$/);
 
-  const cleanupToken = issued.unenrollCommands[0].urls.shell.match(/\/e\/([^/]+)\/unenroll\.sh$/)?.[1];
+  const cloudflareResources = await pool.query(
+    `SELECT tunnel_id, dns_record_id, rdp_route_id, rdp_target_id, rdp_vnet_id
+       FROM stores WHERE id = $1`,
+    [storeId]
+  );
+  assert.ok(cloudflareResources.rows[0].tunnel_id);
+  assert.ok(cloudflareResources.rows[0].dns_record_id);
+  assert.ok(cloudflareResources.rows[0].rdp_route_id);
+  assert.ok(cloudflareResources.rows[0].rdp_target_id);
+  assert.ok(cloudflareResources.rows[0].rdp_vnet_id);
+
+  const rotatedMcp = await app.inject({ method: "POST", url: "/api/settings/mcp/rotate", headers: { cookie: sessionCookie } });
+  assert.equal(rotatedMcp.statusCode, 200, rotatedMcp.body);
+  const originalFetch = globalThis.fetch;
+  let scheduledScript = "";
+  globalThis.fetch = async (input, init) => {
+    assert.equal(String(input), "https://0001-ops.stores-a.example/agent");
+    const payload = JSON.parse(String(init?.body));
+    scheduledScript = payload.script;
+    assert.equal(payload.timeoutMs, 30000);
+    return new Response(JSON.stringify({ success: true, exitCode: 0, stdout: "scheduled\n", stderr: "", durationMs: 5 }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" }
+    });
+  };
+  let automaticUnenrollment: any;
+  try {
+    const automatic = await app.inject({
+      method: "POST",
+      url: "/mcp",
+      headers: {
+        authorization: `Bearer ${rotatedMcp.json().token}`,
+        accept: "application/json, text/event-stream",
+        "mcp-protocol-version": "2025-11-25"
+      },
+      payload: {
+        jsonrpc: "2.0",
+        id: 30,
+        method: "tools/call",
+        params: {
+          name: "cfman_issue_unenrollment",
+          arguments: { storeId, enrollmentId, automatic: true, expiresInHours: 24 }
+        }
+      }
+    });
+    assert.equal(automatic.statusCode, 200, automatic.body);
+    automaticUnenrollment = automatic.json().result.structuredContent.data;
+    assert.equal(automaticUnenrollment.storeId, storeId);
+    assert.equal(automaticUnenrollment.enrollmentId, enrollmentId);
+    assert.equal(automaticUnenrollment.automatic.status, "scheduled");
+    assert.equal(automaticUnenrollment.automatic.platform, "windows");
+    assert.match(automaticUnenrollment.automatic.executionId, /^[0-9a-f-]{36}$/);
+    const references = automatic.json().result.structuredContent.references;
+    assert.ok(references.some((reference: { path: string; value: string }) => reference.path === "response.storeId" && reference.value === storeId));
+    assert.ok(references.some((reference: { path: string; value: string }) => reference.path === "response.automatic.executionId" && reference.value === automaticUnenrollment.automatic.executionId));
+    assert.match(scheduledScript, /Start-Process/);
+    assert.match(scheduledScript, /-EncodedCommand/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+  const automaticExecution = await pool.query(
+    `SELECT store_id, enrollment_id, script_type, script_name, status
+       FROM store_command_executions WHERE id = $1`,
+    [automaticUnenrollment.automatic.executionId]
+  );
+  assert.deepEqual(automaticExecution.rows[0], {
+    store_id: storeId,
+    enrollment_id: enrollmentId,
+    script_type: "inline",
+    script_name: "Automatic unenrollment",
+    status: "succeeded"
+  });
+
+  const cleanupToken = automaticUnenrollment.urls.shell.match(/\/e\/([^/]+)\/unenroll\.sh$/)?.[1];
   assert.ok(cleanupToken);
   const cleanupScript = await app.inject({ method: "GET", url: `/e/${cleanupToken}/unenroll.sh` });
   assert.equal(cleanupScript.statusCode, 200, cleanupScript.body);
@@ -1101,6 +1175,29 @@ test("tracks enrollment history and issues cleanup for a running tunnel", async 
     { platform: "unix", status: "completed" },
     { platform: "windows", status: "staled_ignored" }
   ]);
+  const cleanedStore = await pool.query(
+    `SELECT tunnel_id, tunnel_name, dns_record_id, tunnel_status, rdp_route_id, rdp_target_id, rdp_vnet_id, rdp_url
+       FROM stores WHERE id = $1`,
+    [storeId]
+  );
+  assert.deepEqual(cleanedStore.rows[0], {
+    tunnel_id: null,
+    tunnel_name: null,
+    dns_record_id: null,
+    tunnel_status: "not_created",
+    rdp_route_id: null,
+    rdp_target_id: null,
+    rdp_vnet_id: null,
+    rdp_url: null
+  });
+  const cleanedPublications = await pool.query("SELECT dns_record_id, status FROM store_publications WHERE store_id = $1", [storeId]);
+  assert.ok(cleanedPublications.rows.every((publication) => publication.dns_record_id === null && publication.status === "pending"));
+  const cleanedRoutes = await pool.query(
+    `SELECT waf_ruleset_id, waf_rule_id FROM store_routes
+      WHERE publication_id IN (SELECT id FROM store_publications WHERE store_id = $1)`,
+    [storeId]
+  );
+  assert.ok(cleanedRoutes.rows.every((route) => route.waf_ruleset_id === null && route.waf_rule_id === null));
 
   const logs = await app.inject({
     method: "GET",
@@ -1130,7 +1227,7 @@ test("tracks enrollment history and issues cleanup for a running tunnel", async 
 });
 
 test("preflights and force-deletes a store with explicit name confirmation", async () => {
-  await pool.query("UPDATE stores SET tunnel_status = 'healthy' WHERE id = $1", [storeId]);
+  await pool.query("UPDATE stores SET tunnel_id = '00000000-0000-4000-8000-000000000099', tunnel_status = 'healthy' WHERE id = $1", [storeId]);
   const preflight = await app.inject({
     method: "GET",
     url: `/api/stores/${storeId}/delete-preflight`,
@@ -1167,4 +1264,84 @@ test("preflights and force-deletes a store with explicit name confirmation", asy
   const audit = await pool.query("SELECT details FROM audit_logs WHERE action = 'store.deleted' AND entity_id = $1", [storeId]);
   assert.equal(audit.rowCount, 1);
   assert.equal(audit.rows[0].details.forced, true);
+});
+
+test("deprovisions the previous tunnel before an enrollment override", async () => {
+  const zone = await pool.query("SELECT id FROM zones WHERE account_id = $1 ORDER BY created_at LIMIT 1", [accountId]);
+  const created = await app.inject({
+    method: "POST",
+    url: "/api/stores",
+    headers: { cookie: sessionCookie },
+    payload: {
+      tenantCode: "HLC",
+      storeCode: "OVERRIDE",
+      displayName: "Override Test Store",
+      zoneId: zone.rows[0].id,
+      publications: [{ suffix: "", routes: [{ kind: "command_agent", path: "/exec" }] }]
+    }
+  });
+  assert.equal(created.statusCode, 201, created.body);
+  const overrideStoreId = created.json().store.id as string;
+
+  const firstIssue = await app.inject({ method: "POST", url: `/api/stores/${overrideStoreId}/enrollments`, headers: { cookie: sessionCookie }, payload: { expiresInHours: 24 } });
+  assert.equal(firstIssue.statusCode, 201, firstIssue.body);
+  const firstEnrollmentId = firstIssue.json().id as string;
+  const firstToken = firstIssue.json().urls.shell.match(/\/e\/([^/]+)\/install\.sh$/)?.[1];
+  assert.ok(firstToken);
+  const firstClaim = await app.inject({
+    method: "POST",
+    url: "/api/public/enrollments/claim",
+    payload: { token: firstToken, platform: "linux", machineName: "STORE-OLD", installId: "override-old" }
+  });
+  assert.equal(firstClaim.statusCode, 200, firstClaim.body);
+  const firstReport = await app.inject({
+    method: "POST",
+    url: "/api/public/enrollments/report",
+    payload: { token: firstToken, platform: "unix", status: "installed", agentReady: true, machineName: "STORE-OLD", osName: "Linux" }
+  });
+  assert.equal(firstReport.statusCode, 200, firstReport.body);
+  const firstResources = await pool.query(
+    `SELECT s.tunnel_id, p.dns_record_id
+       FROM stores s JOIN store_publications p ON p.store_id = s.id
+      WHERE s.id = $1`,
+    [overrideStoreId]
+  );
+  assert.ok(firstResources.rows[0].tunnel_id);
+  assert.ok(firstResources.rows[0].dns_record_id);
+
+  const secondIssue = await app.inject({ method: "POST", url: `/api/stores/${overrideStoreId}/enrollments`, headers: { cookie: sessionCookie }, payload: { expiresInHours: 24 } });
+  assert.equal(secondIssue.statusCode, 201, secondIssue.body);
+  const secondToken = secondIssue.json().urls.shell.match(/\/e\/([^/]+)\/install\.sh$/)?.[1];
+  const supersededCleanupToken = secondIssue.json().unenrollCommands[0].urls.shell.match(/\/e\/([^/]+)\/unenroll\.sh$/)?.[1];
+  assert.ok(secondToken);
+  assert.ok(supersededCleanupToken);
+  const secondClaim = await app.inject({
+    method: "POST",
+    url: "/api/public/enrollments/claim",
+    payload: { token: secondToken, platform: "linux", machineName: "STORE-NEW", installId: "override-new", overrideExisting: true }
+  });
+  assert.equal(secondClaim.statusCode, 200, secondClaim.body);
+  const replacedResources = await pool.query(
+    `SELECT s.tunnel_id, p.dns_record_id
+       FROM stores s JOIN store_publications p ON p.store_id = s.id
+      WHERE s.id = $1`,
+    [overrideStoreId]
+  );
+  assert.notEqual(replacedResources.rows[0].tunnel_id, firstResources.rows[0].tunnel_id);
+  assert.notEqual(replacedResources.rows[0].dns_record_id, firstResources.rows[0].dns_record_id);
+  const staleReport = await app.inject({
+    method: "POST",
+    url: "/api/public/enrollments/unenroll/report",
+    payload: { token: supersededCleanupToken, platform: "unix", status: "unenrolled" }
+  });
+  assert.equal(staleReport.statusCode, 404, staleReport.body);
+  const resourcesAfterStaleReport = await pool.query("SELECT tunnel_id FROM stores WHERE id = $1", [overrideStoreId]);
+  assert.equal(resourcesAfterStaleReport.rows[0].tunnel_id, replacedResources.rows[0].tunnel_id);
+  const previousEnrollment = await pool.query("SELECT status, unenroll_reason, unenrolled_at FROM enrollments WHERE id = $1", [firstEnrollmentId]);
+  assert.equal(previousEnrollment.rows[0].status, "unenrolled");
+  assert.equal(previousEnrollment.rows[0].unenroll_reason, "override");
+  assert.ok(previousEnrollment.rows[0].unenrolled_at);
+  const audit = await pool.query("SELECT details FROM audit_logs WHERE action = 'store.cloudflare_deprovisioned' AND entity_id = $1", [overrideStoreId]);
+  assert.equal(audit.rowCount, 1);
+  assert.equal(audit.rows[0].details.reason, "override");
 });
