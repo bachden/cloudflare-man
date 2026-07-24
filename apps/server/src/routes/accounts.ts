@@ -5,6 +5,7 @@ import { writeAudit } from "../lib/audit.js";
 import { requireAuth } from "../lib/auth.js";
 import { CloudflareClient } from "../lib/cloudflare.js";
 import { pool, withTransaction } from "../lib/database.js";
+import { appendNameFilter, nameFilterFields, validateNameFilter } from "../lib/name-filter.js";
 import { decryptSecret, encryptSecret } from "../lib/security.js";
 
 const domainName = z.string().trim().toLowerCase().min(3).max(253).regex(
@@ -55,7 +56,13 @@ const zoneSchema = z.object({
   message: "Soft store limit must not exceed DNS record limit"
 });
 
-async function accountList() {
+const accountListQuerySchema = z.object(nameFilterFields).superRefine(validateNameFilter);
+
+async function accountList(filter: z.infer<typeof accountListQuerySchema>) {
+  const conditions: string[] = [];
+  const values: unknown[] = [];
+  appendNameFilter(conditions, values, "a.name", filter);
+  const where = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
   const result = await pool.query(`
     SELECT a.id, a.name, a.provider_mode AS "providerMode", a.cf_account_id AS "cfAccountId",
            a.status, a.tunnel_limit AS "tunnelLimit", a.soft_tunnel_limit AS "softTunnelLimit",
@@ -76,8 +83,9 @@ async function accountList() {
              FROM zones z WHERE z.account_id = a.id
            ), '[]'::jsonb) AS zones
       FROM cloudflare_accounts a
+      ${where}
      ORDER BY a.created_at ASC
-  `);
+  `, values);
   return result.rows;
 }
 
@@ -139,7 +147,10 @@ async function synchronizeAccount(id: string): Promise<AccountSyncResult> {
 }
 
 export async function accountRoutes(app: FastifyInstance): Promise<void> {
-  app.get("/api/accounts", { preHandler: requireAuth }, async () => ({ accounts: await accountList() }));
+  app.get("/api/accounts", { preHandler: requireAuth }, async (request) => {
+    const query = accountListQuerySchema.parse(request.query);
+    return { accounts: await accountList(query) };
+  });
 
   app.post("/api/accounts/validate-token", {
     preHandler: requireAuth,

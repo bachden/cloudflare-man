@@ -431,7 +431,17 @@ fi
 
 log_message "info" "claim" "Claiming enrollment and provisioning the Cloudflare tunnel"
 CLAIM_BODY="$(printf '{\\"token\\":\\"%s\\",\\"platform\\":\\"%s\\",\\"architecture\\":\\"%s\\",\\"machineName\\":\\"%s\\",\\"osName\\":\\"%s\\",\\"osVersion\\":\\"%s\\",\\"osBuild\\":\\"%s\\",\\"installId\\":\\"%s\\",\\"overrideExisting\\":%s}' "$ENROLLMENT_TOKEN" "$OS_NAME" "$MACHINE_ARCH" "$MACHINE_NAME" "$OS_DISPLAY_NAME" "$OS_VERSION" "$OS_BUILD" "$INSTALL_ID" "$OVERRIDE_EXISTING")"
-CLAIM_RESPONSE="$(curl --silent --show-error --fail --retry 3 --retry-all-errors -X POST "$CLAIM_URL" -H 'Content-Type: application/json' -H 'Accept: text/plain' --data "$CLAIM_BODY")"
+CLAIM_RESPONSE_FILE="$(mktemp)"
+CLAIM_CURL_ERROR=0
+CLAIM_STATUS="$(curl --silent --show-error --retry 3 --retry-all-errors --output "$CLAIM_RESPONSE_FILE" --write-out '%{http_code}' -X POST "$CLAIM_URL" -H 'Content-Type: application/json' -H 'Accept: text/plain' --data "$CLAIM_BODY")" || CLAIM_CURL_ERROR=$?
+CLAIM_RESPONSE="$(cat "$CLAIM_RESPONSE_FILE")"
+rm -f "$CLAIM_RESPONSE_FILE"
+if [ "$CLAIM_CURL_ERROR" -ne 0 ] || [ "$CLAIM_STATUS" -lt 200 ] || [ "$CLAIM_STATUS" -ge 300 ]; then
+  CLAIM_ERROR="Enrollment claim failed with HTTP $CLAIM_STATUS"
+  if [ -n "$CLAIM_RESPONSE" ]; then CLAIM_ERROR="$CLAIM_ERROR: $CLAIM_RESPONSE"; fi
+  log_message "error" "claim" "$CLAIM_ERROR"
+  exit 1
+fi
 TUNNEL_TOKEN="$(printf '%s\\n' "$CLAIM_RESPONSE" | sed -n '1p')"
 CLAIM_AGENT_TOKEN="$(printf '%s\\n' "$CLAIM_RESPONSE" | sed -n '2p')"
 [ -n "$CLAIM_AGENT_TOKEN" ] && AGENT_TOKEN="$CLAIM_AGENT_TOKEN"
@@ -576,6 +586,30 @@ function Send-InstallLog {
   }
 }
 
+function Get-HttpErrorMessage {
+  param([System.Management.Automation.ErrorRecord]$ErrorRecord)
+  $message = $ErrorRecord.Exception.Message
+  try {
+    $response = $ErrorRecord.Exception.Response
+    $body = $null
+    if ($response -and $response.Content) {
+      $body = $response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+    } elseif ($response) {
+      $stream = $response.GetResponseStream()
+      if ($stream) {
+        $reader = New-Object System.IO.StreamReader($stream)
+        try { $body = $reader.ReadToEnd() } finally { $reader.Dispose() }
+      }
+    }
+    if ($body) {
+      $payload = $body | ConvertFrom-Json
+      if ($payload.error) { return [string]$payload.error }
+      return $body
+    }
+  } catch { }
+  return $message
+}
+
 try {
 Send-InstallLog -Level "info" -Step "preflight" -Message "Starting cloudflare-man enrollment for $AssignedHostname"
 
@@ -675,7 +709,13 @@ $claimBody = @{
   installId = $installId
   overrideExisting = $overrideExisting
 } | ConvertTo-Json
-$claim = Invoke-RestMethod -Method Post -Uri $ClaimUrl -ContentType "application/json" -Body $claimBody
+try {
+  $claim = Invoke-RestMethod -Method Post -Uri $ClaimUrl -ContentType "application/json" -Body $claimBody
+} catch {
+  $claimError = Get-HttpErrorMessage -ErrorRecord $_
+  Send-InstallLog -Level "error" -Step "claim" -Message $claimError
+  throw $claimError
+}
 Send-InstallLog -Level "info" -Step "claim" -Message "Enrollment claimed successfully"
 
 Send-InstallLog -Level "info" -Step "service" -Message "Installing the cloudflared service"
@@ -1105,6 +1145,11 @@ export async function enrollmentRoutes(app: FastifyInstance): Promise<void> {
     } catch (error) {
       const message = error instanceof Error ? error.message : "Provisioning failed";
       await pool.query("UPDATE enrollments SET status = 'failed', last_error = $1, updated_at = now() WHERE id = $2", [message, enrollment.id]);
+      await pool.query(
+        `INSERT INTO enrollment_logs(enrollment_id, level, step, message, metadata)
+         VALUES ($1, 'error', 'claim', $2, '{"source":"server"}'::jsonb)`,
+        [enrollment.id, message.slice(0, 4000)]
+      );
       await pool.query(
         `UPDATE enrollment_scripts
             SET status = 'failed', finished_at = now(), last_error = $1, updated_at = now()

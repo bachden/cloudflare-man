@@ -197,6 +197,25 @@ export class CloudflareClient {
     });
   }
 
+  async ensureTunnel(name: string): Promise<CloudflareTunnel> {
+    if (this.mode === "mock") return this.createTunnel(name);
+    const findExisting = async () => {
+      const query = new URLSearchParams({ name, is_deleted: "false", per_page: "100" });
+      const tunnels = await this.request<CloudflareTunnel[]>(`/accounts/${this.accountId}/cfd_tunnel?${query}`);
+      return tunnels.find((tunnel) => tunnel.name === name);
+    };
+    const existing = await findExisting();
+    if (existing) return existing;
+    try {
+      return await this.createTunnel(name);
+    } catch (error) {
+      // Recover when another retry created the tunnel after the initial lookup.
+      const raced = await findExisting().catch(() => undefined);
+      if (raced) return raced;
+      throw error;
+    }
+  }
+
   async getTunnelToken(tunnelId: string): Promise<string> {
     if (this.mode === "mock") return `mock-${tunnelId}`;
     return this.request<string>(`/accounts/${this.accountId}/cfd_tunnel/${tunnelId}/token`);

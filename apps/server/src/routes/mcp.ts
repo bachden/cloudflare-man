@@ -86,6 +86,19 @@ const publicationSchema = z.object({
   suffix: z.string().default("").describe("Subdomain suffix; empty creates the store's primary hostname"),
   routes: z.array(routeSchema).min(1)
 });
+const mcpNameFilterFields = {
+  name: z.string().trim().min(1).max(160).optional().describe("Resource name to match case-insensitively"),
+  nameMatch: z.enum(["exact", "ilike", "regex"]).default("ilike").describe("Name matching mode: whole name, substring ILIKE pattern, or PostgreSQL regular expression")
+};
+
+function setNameFilterParams(
+  params: URLSearchParams,
+  args: { name?: string | undefined; nameMatch: "exact" | "ilike" | "regex" }
+): void {
+  if (!args.name) return;
+  params.set("name", args.name);
+  params.set("nameMatch", args.nameMatch);
+}
 
 function registerApiTool<T extends ToolShape>(
   server: McpServer,
@@ -121,18 +134,26 @@ function createMcpServer(app: FastifyInstance, token: string): McpServer {
 
   registerApiTool(server, app, token, "cfman_get_dashboard", "Read dashboard statistics, account capacity, recent stores, and recent activity.", {}, () => callApi(app, token, "GET", "/api/dashboard"));
   registerApiTool(server, app, token, "cfman_get_settings", "Read public base URL and MCP server metadata without returning the MCP secret.", {}, () => callApi(app, token, "GET", "/api/settings"));
-  registerApiTool(server, app, token, "cfman_list_accounts", "List the Cloudflare account pool, zones, tunnel limits, and allocated stores.", {}, () => callApi(app, token, "GET", "/api/accounts"));
+  registerApiTool(server, app, token, "cfman_list_accounts", "List the Cloudflare account pool, zones, tunnel limits, and allocated stores, optionally filtering account names case-insensitively.", {
+    ...mcpNameFilterFields
+  }, (args) => {
+    const params = new URLSearchParams();
+    setNameFilterParams(params, args);
+    return callApi(app, token, "GET", `/api/accounts?${params}`);
+  });
   registerApiTool(server, app, token, "cfman_validate_cloudflare_token", "Validate a Cloudflare API token before adding or replacing an account.", {
     cfAccountId: z.string().min(1),
     apiToken: z.string().min(1)
   }, (args) => callApi(app, token, "POST", "/api/accounts/validate-token", args));
-  registerApiTool(server, app, token, "cfman_list_stores", "List stores with search, onboarding status filter, and pagination.", {
+  registerApiTool(server, app, token, "cfman_list_stores", "List stores with a display-name filter, broad search, onboarding status filter, and pagination.", {
+    ...mcpNameFilterFields,
     search: z.string().optional(),
     status: z.string().optional(),
     page: z.number().int().min(1).default(1),
     pageSize: z.number().int().min(10).max(100).default(25)
   }, (args) => {
     const params = new URLSearchParams();
+    setNameFilterParams(params, args);
     if (args.search) params.set("search", args.search);
     if (args.status) params.set("status", args.status);
     params.set("page", String(args.page));
@@ -150,14 +171,14 @@ function createMcpServer(app: FastifyInstance, token: string): McpServer {
     enrollmentId: z.string().uuid()
   }, (args) => callApi(app, token, "GET", `/api/stores/${args.storeId}/enrollments/${args.enrollmentId}/logs`));
   registerApiTool(server, app, token, "cfman_list_scripts", "List saved scripts with pagination, execution statistics, and optional platform and case-insensitive name filters.", {
+    ...mcpNameFilterFields,
     platform: z.enum(["windows", "unix"]).optional(),
-    name: z.string().optional(),
     page: z.number().int().min(1).default(1),
     pageSize: z.number().int().min(5).max(100).default(50)
   }, (args) => {
     const params = new URLSearchParams({ page: String(args.page), pageSize: String(args.pageSize) });
+    setNameFilterParams(params, args);
     if (args.platform) params.set("platform", args.platform);
-    if (args.name) params.set("name", args.name);
     return callApi(app, token, "GET", `/api/scripts?${params}`);
   });
   registerApiTool(server, app, token, "cfman_get_script", "Read a saved script and all immutable versions including source content.", {
@@ -178,7 +199,13 @@ function createMcpServer(app: FastifyInstance, token: string): McpServer {
     page: z.number().int().min(1).default(1),
     pageSize: z.number().int().min(5).max(50).default(10)
   }, (args) => callApi(app, token, "GET", `/api/stores/${args.storeId}/command-executions?page=${args.page}&pageSize=${args.pageSize}`));
-  registerApiTool(server, app, token, "cfman_list_audit_logs", "Read the audit trail shown by the Audit page.", {}, () => callApi(app, token, "GET", "/api/audit"));
+  registerApiTool(server, app, token, "cfman_list_audit_logs", "Read the audit trail shown by the Audit page, optionally filtering action names case-insensitively.", {
+    ...mcpNameFilterFields
+  }, (args) => {
+    const params = new URLSearchParams();
+    setNameFilterParams(params, args);
+    return callApi(app, token, "GET", `/api/audit?${params}`);
+  });
   registerApiTool(server, app, token, "cfman_get_route_waf", "Read a route WAF policy, including the resolved default Cloudflare Man source IP.", {
     storeId: z.string().uuid(),
     routeId: z.string().uuid()
@@ -380,6 +407,10 @@ export async function mcpRoutes(app: FastifyInstance): Promise<void> {
     const token = authorization.slice(7).trim();
     const server = createMcpServer(app, token);
     const transport = new StreamableHTTPServerTransport({ enableJsonResponse: true });
+    const socket = request.raw.socket as typeof request.raw.socket & { destroySoon?: () => void };
+    if (typeof socket.destroySoon !== "function") {
+      socket.destroySoon = () => undefined;
+    }
     reply.hijack();
     try {
       await server.connect(transport as Parameters<typeof server.connect>[0]);

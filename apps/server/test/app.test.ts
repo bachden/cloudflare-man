@@ -460,6 +460,8 @@ test("allocates a store and issues bootstrap URLs", async () => {
   assert.match(scriptResponse.body, /osName/);
   assert.match(scriptResponse.body, /osVersion/);
   assert.match(scriptResponse.body, /machineName/);
+  assert.match(scriptResponse.body, /CLAIM_STATUS/);
+  assert.match(scriptResponse.body, /Enrollment claim failed with HTTP/);
 
   const windowsScript = await app.inject({ method: "GET", url: `/e/${enrollmentToken}/install.ps1` });
   assert.equal(windowsScript.statusCode, 200);
@@ -470,6 +472,8 @@ test("allocates a store and issues bootstrap URLs", async () => {
   assert.match(windowsScript.body, /WinStations\\RDP-Tcp/);
   assert.match(windowsScript.body, /https:\/\/cfman\.example\.test\/api\/public\/enrollments\/report/);
   assert.match(windowsScript.body, /Send-InstallLog/);
+  assert.match(windowsScript.body, /Get-HttpErrorMessage/);
+  assert.match(windowsScript.body, /\$payload\.error/);
   assert.match(windowsScript.body, /Read-Host "Cleanup and override/);
   assert.match(windowsScript.body, /overrideExisting/);
   assert.match(windowsScript.body, /CloudflareManCommandAgent/);
@@ -510,6 +514,71 @@ test("paginates and refreshes the visible store list", async () => {
   } finally {
     globalThis.fetch = originalFetch;
   }
+});
+
+test("filters named listing APIs and MCP tools case-insensitively", async () => {
+  for (const [nameMatch, name] of [
+    ["exact", "HIGHLANDS TEST STORE"],
+    ["ilike", "LANDS TEST"],
+    ["regex", "^highlands test store$"]
+  ] as const) {
+    const response = await app.inject({
+      method: "GET",
+      url: `/api/stores?name=${encodeURIComponent(name)}&nameMatch=${nameMatch}&page=1&pageSize=10`,
+      headers: { cookie: sessionCookie }
+    });
+    assert.equal(response.statusCode, 200, response.body);
+    assert.deepEqual(response.json().stores.map((store: { id: string }) => store.id), [storeId]);
+  }
+  const invalidRegex = await app.inject({
+    method: "GET",
+    url: "/api/stores?name=%5B&nameMatch=regex&page=1&pageSize=10",
+    headers: { cookie: sessionCookie }
+  });
+  assert.equal(invalidRegex.statusCode, 400, invalidRegex.body);
+
+  await app.inject({
+    method: "PATCH",
+    url: "/api/settings/mcp",
+    headers: { cookie: sessionCookie },
+    payload: { enabled: true }
+  });
+  const rotated = await app.inject({ method: "POST", url: "/api/settings/mcp/rotate", headers: { cookie: sessionCookie } });
+  assert.equal(rotated.statusCode, 200, rotated.body);
+  const token = rotated.json().token as string;
+  const callTool = async (id: number, name: string, args: Record<string, unknown>) => {
+    const response = await app.inject({
+      method: "POST",
+      url: "/mcp",
+      headers: {
+        authorization: `Bearer ${token}`,
+        accept: "application/json, text/event-stream",
+        "mcp-protocol-version": "2025-11-25"
+      },
+      payload: { jsonrpc: "2.0", id, method: "tools/call", params: { name, arguments: args } }
+    });
+    assert.equal(response.statusCode, 200, response.body);
+    assert.equal(response.json().result.isError, undefined, response.body);
+    return response.json().result.structuredContent;
+  };
+
+  const accounts = await callTool(40, "cfman_list_accounts", { name: "test account a", nameMatch: "exact" });
+  assert.deepEqual(accounts.data.accounts.map((account: { id: string }) => account.id), [accountId]);
+  assert.ok(accounts.references.some((reference: { value: string }) => reference.value === accountId));
+
+  const stores = await callTool(41, "cfman_list_stores", { name: "highlands.*store", nameMatch: "regex", page: 1, pageSize: 10 });
+  assert.deepEqual(stores.data.stores.map((store: { id: string }) => store.id), [storeId]);
+  assert.ok(stores.references.some((reference: { value: string }) => reference.value === storeId));
+
+  const scripts = await callTool(42, "cfman_list_scripts", { name: "READINESS", nameMatch: "ilike", page: 1, pageSize: 10 });
+  assert.equal(scripts.data.scripts.length, 1);
+  assert.equal(scripts.data.scripts[0].name, "Store readiness check");
+  assert.ok(scripts.references.some((reference: { value: string }) => reference.value === scripts.data.scripts[0].id));
+
+  const audit = await callTool(43, "cfman_list_audit_logs", { name: "^STORE\\.CREATED$", nameMatch: "regex" });
+  assert.ok(audit.data.entries.length >= 1);
+  assert.ok(audit.data.entries.every((entry: { action: string }) => entry.action === "store.created"));
+  assert.ok(audit.references.some((reference: { value: string }) => reference.value === storeId));
 });
 
 test("manages a source-IP WAF policy for each ingress route", async () => {
@@ -606,6 +675,8 @@ test("claim is atomic and provisions a tunnel once", async () => {
   assert.equal(claimResponse.statusCode, 200, claimResponse.body);
   assert.match(claimResponse.json().tunnelToken, /^mock-/);
   assert.match(claimResponse.json().agentToken, /^[A-Za-z0-9_-]{40,}$/);
+  const provisionedStore = await pool.query("SELECT tunnel_name FROM stores WHERE id = $1", [storeId]);
+  assert.equal(provisionedStore.rows[0].tunnel_name, `dcorp-hlc-0001-${storeId.slice(0, 8)}`);
 
   const retryClaim = await app.inject({
     method: "POST",

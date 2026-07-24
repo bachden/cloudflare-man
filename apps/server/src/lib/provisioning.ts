@@ -426,8 +426,8 @@ export async function provisionStore(storeId: string): Promise<ProvisioningResul
     let tunnelId = store.tunnel_id as string | null;
     let tunnelToken: string;
     if (!tunnelId) {
-      const tunnelName = `dcorp-${slugifyLabel(`${store.tenant_code}-${store.store_code}`)}`;
-      const tunnel = await client.createTunnel(tunnelName);
+      const tunnelName = slugifyLabel(`dcorp-${store.tenant_code}-${store.store_code}-${store.id.slice(0, 8)}`);
+      const tunnel = await client.ensureTunnel(tunnelName);
       tunnelId = tunnel.id;
       tunnelToken = tunnel.token ?? await client.getTunnelToken(tunnel.id);
       await pool.query(

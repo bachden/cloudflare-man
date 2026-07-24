@@ -6,6 +6,7 @@ import { getPublicBaseUrl } from "../lib/app-settings.js";
 import { requireAuth } from "../lib/auth.js";
 import { CloudflareClient } from "../lib/cloudflare.js";
 import { pool, withTransaction } from "../lib/database.js";
+import { appendNameFilter, nameFilterFields, validateNameFilter } from "../lib/name-filter.js";
 import { decryptSecret } from "../lib/security.js";
 import { reconfigureStore } from "../lib/provisioning.js";
 import { isValidIpOrCidr, resolveWafAllowedIps } from "../lib/route-waf.js";
@@ -86,11 +87,12 @@ const routeWafSchema = z.object({
 });
 
 const listQuerySchema = z.object({
+  ...nameFilterFields,
   search: z.string().trim().max(120).optional(),
   status: z.string().trim().max(40).optional(),
   page: z.coerce.number().int().min(1).default(1),
   pageSize: z.coerce.number().int().min(10).max(100).default(25)
-});
+}).superRefine(validateNameFilter);
 
 const refreshStoresSchema = z.object({
   storeIds: z.array(z.string().uuid()).min(1).max(100)
@@ -515,6 +517,7 @@ export async function storeRoutes(app: FastifyInstance): Promise<void> {
     const query = listQuerySchema.parse(request.query);
     const values: unknown[] = [];
     const conditions: string[] = [];
+    appendNameFilter(conditions, values, "s.display_name", query);
     if (query.search) {
       values.push(`%${query.search}%`);
       conditions.push(`(s.store_code ILIKE $${values.length} OR s.tenant_code ILIKE $${values.length} OR s.display_name ILIKE $${values.length} OR s.hostname ILIKE $${values.length} OR EXISTS (SELECT 1 FROM store_publications p WHERE p.store_id = s.id AND p.hostname ILIKE $${values.length}))`);

@@ -3,6 +3,7 @@ import { z } from "zod";
 import { writeAudit } from "../lib/audit.js";
 import { requireAuth } from "../lib/auth.js";
 import { pool, withTransaction } from "../lib/database.js";
+import { appendNameFilter, nameFilterFields, validateNameFilter } from "../lib/name-filter.js";
 
 const platformSchema = z.enum(["windows", "unix"]);
 const languageSchema = z.enum(["powershell", "bash", "sh"]);
@@ -25,6 +26,12 @@ const executionHistorySchema = z.object({
   page: z.coerce.number().int().min(1).default(1),
   pageSize: z.coerce.number().int().min(5).max(50).default(10)
 });
+const scriptListQuerySchema = z.object({
+  ...nameFilterFields,
+  platform: platformSchema.optional(),
+  page: z.coerce.number().int().min(1).default(1),
+  pageSize: z.coerce.number().int().min(5).max(100).default(100)
+}).superRefine(validateNameFilter);
 
 function validateLanguage(platform: "windows" | "unix", language: "powershell" | "bash" | "sh"): string | null {
   if (platform === "windows" && language !== "powershell") return "Windows scripts must use PowerShell";
@@ -54,13 +61,19 @@ const scriptSummary = `jsonb_build_object(
 
 export async function scriptRoutes(app: FastifyInstance): Promise<void> {
   app.get("/api/scripts", { preHandler: requireAuth }, async (request) => {
-    const query = z.object({
-      platform: platformSchema.optional(),
-      name: z.string().trim().max(120).optional(),
-      page: z.coerce.number().int().min(1).default(1),
-      pageSize: z.coerce.number().int().min(5).max(100).default(100)
-    }).parse(request.query);
+    const query = scriptListQuerySchema.parse(request.query);
+    const conditions: string[] = [];
+    const values: unknown[] = [];
+    if (query.platform) {
+      values.push(query.platform);
+      conditions.push(`s.platform = $${values.length}`);
+    }
+    appendNameFilter(conditions, values, "s.name", query);
+    const where = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
     const offset = (query.page - 1) * query.pageSize;
+    const pageValues = [...values, query.pageSize, offset];
+    const limitParameter = values.length + 1;
+    const offsetParameter = values.length + 2;
     const [result, countResult] = await Promise.all([
       pool.query(
         `SELECT ${scriptSummary} AS script
@@ -83,18 +96,16 @@ export async function scriptRoutes(app: FastifyInstance): Promise<void> {
              LEFT JOIN managed_script_versions saved_version ON saved_version.id = ce.saved_script_version_id
             WHERE executed_version.script_id = s.id OR saved_version.script_id = s.id
          ) execution_stats ON true
-        WHERE ($1::text IS NULL OR s.platform = $1)
-          AND ($2::text IS NULL OR s.name ILIKE '%' || $2 || '%')
+        ${where}
         ORDER BY s.name, s.platform
-        LIMIT $3 OFFSET $4`,
-        [query.platform ?? null, query.name || null, query.pageSize, offset]
+        LIMIT $${limitParameter} OFFSET $${offsetParameter}`,
+        pageValues
       ),
       pool.query(
         `SELECT count(*)::int AS total
            FROM managed_scripts s
-          WHERE ($1::text IS NULL OR s.platform = $1)
-            AND ($2::text IS NULL OR s.name ILIKE '%' || $2 || '%')`,
-        [query.platform ?? null, query.name || null]
+          ${where}`,
+        values
       )
     ]);
     const total = countResult.rows[0].total as number;

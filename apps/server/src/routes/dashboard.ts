@@ -1,6 +1,10 @@
 import type { FastifyInstance } from "fastify";
+import { z } from "zod";
 import { requireAuth } from "../lib/auth.js";
 import { pool } from "../lib/database.js";
+import { appendNameFilter, nameFilterFields, validateNameFilter } from "../lib/name-filter.js";
+
+const auditListQuerySchema = z.object(nameFilterFields).superRefine(validateNameFilter);
 
 export async function dashboardRoutes(app: FastifyInstance): Promise<void> {
   app.get("/api/dashboard", { preHandler: requireAuth }, async () => {
@@ -38,13 +42,19 @@ export async function dashboardRoutes(app: FastifyInstance): Promise<void> {
     };
   });
 
-  app.get("/api/audit", { preHandler: requireAuth }, async () => {
+  app.get("/api/audit", { preHandler: requireAuth }, async (request) => {
+    const query = auditListQuerySchema.parse(request.query);
+    const conditions: string[] = [];
+    const values: unknown[] = [];
+    appendNameFilter(conditions, values, "l.action", query);
+    const where = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
     const result = await pool.query(`
       SELECT l.id, l.action, l.entity_type AS "entityType", l.entity_id AS "entityId", l.details,
              l.ip_address AS "ipAddress", l.created_at AS "createdAt", u.username
         FROM audit_logs l LEFT JOIN users u ON u.id = l.actor_user_id
+       ${where}
        ORDER BY l.created_at DESC LIMIT 250
-    `);
+    `, values);
     return { entries: result.rows };
   });
 }
